@@ -1,0 +1,15 @@
+[package]
+name = "whereti-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+clap = { version = "4.6.7", features = ["derive"] }
+whereti-ntfs = { version = "0.0.1", path = "../whereti-ntfs" }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_ProcessStatus", "Win32_System_Threading"] }
+
+[[bin]]
+name = "wt"
+path = "src/main.rs"

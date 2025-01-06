@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/whereti/whereti"
+
+[profile.release]
+debug = 1
+lto = "thin"
+codegen-units = 1
+panic = "abort"
