@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::mft::MftEntry;
+use crate::mft::MftScan;
 use crate::parse::FRN_MASK;
 use crate::usn_enum::UsnEntry;
 
@@ -58,18 +58,18 @@ type RawLinks<'a> = (u16, Vec<(u64, &'a str)>);
 /// `scan_start_usn`: journal position read just before the direct scan. API
 /// records with a newer USN changed during the scan and are reported apart.
 pub fn compare(
-    raw: &[MftEntry],
+    raw: &MftScan,
     usn: &[UsnEntry],
     scan_start_usn: Option<i64>,
     max_samples: usize,
 ) -> CompareReport {
-    let mut by_record: HashMap<u64, RawLinks> = HashMap::with_capacity(raw.len());
-    for e in raw {
+    let mut by_record: HashMap<u64, RawLinks> = HashMap::with_capacity(raw.entries.len());
+    for e in &raw.entries {
         by_record
             .entry(e.record)
             .or_insert_with(|| (e.seq, Vec::new()))
             .1
-            .push((e.parent, e.name.as_str()));
+            .push((e.parent, raw.name(e)));
     }
 
     let mut r = CompareReport {
@@ -134,18 +134,14 @@ pub fn compare(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mft::MftEntry;
 
-    fn raw(record: u64, seq: u16, parent: u64, name: &str) -> MftEntry {
-        MftEntry {
-            record,
-            seq,
-            parent,
-            name: name.into(),
-            is_dir: false,
-            attributes: 0,
-            size: 0,
-            modified: 0,
+    fn raw(items: &[(u64, u16, u64, &str)]) -> MftScan {
+        let mut scan = MftScan::default();
+        for &(record, seq, parent, name) in items {
+            scan.push(MftEntry { record, seq, parent, ..Default::default() }, name);
         }
+        scan
     }
 
     fn api(record: u64, seq: u16, parent: u64, name: &str) -> UsnEntry {
@@ -160,15 +156,15 @@ mod tests {
 
     #[test]
     fn detects_every_kind_of_difference() {
-        let raw = vec![
-            raw(10, 1, 5, "ok.txt"),
-            raw(11, 1, 5, "a.txt"),
-            raw(11, 1, 7, "hardlink.txt"),
-            raw(12, 2, 5, "renamed.txt"),
-            raw(13, 1, 5, "moved.txt"),
-            raw(14, 1, 5, "metafile"),
-            raw(15, 3, 5, "reused.txt"),
-        ];
+        let raw = raw(&[
+            (10, 1, 5, "ok.txt"),
+            (11, 1, 5, "a.txt"),
+            (11, 1, 7, "hardlink.txt"),
+            (12, 2, 5, "renamed.txt"),
+            (13, 1, 5, "moved.txt"),
+            (14, 1, 5, "metafile"),
+            (15, 3, 5, "reused.txt"),
+        ]);
         let usn = vec![
             api(10, 1, 5, "ok.txt"),
             api(11, 1, 7, "hardlink.txt"),
@@ -190,7 +186,7 @@ mod tests {
     #[test]
     fn hard_links_with_the_same_name_in_different_folders_match() {
         // C:\Windows\System32\x.dll and C:\Windows\WinSxS\...\x.dll are one record.
-        let raw = vec![raw(20, 1, 100, "x.dll"), raw(20, 1, 200, "x.dll")];
+        let raw = raw(&[(20, 1, 100, "x.dll"), (20, 1, 200, "x.dll")]);
         let usn = vec![api(20, 1, 200, "x.dll")];
         let r = compare(&raw, &usn, None, 10);
         assert_eq!(r.matched, 1);
@@ -199,7 +195,7 @@ mod tests {
 
     #[test]
     fn files_changed_during_the_scan_are_not_errors() {
-        let raw = vec![raw(10, 1, 5, "ok.txt")];
+        let raw = raw(&[(10, 1, 5, "ok.txt")]);
         let mut new_file = api(30, 1, 5, "qBittorrent-data.ini");
         new_file.usn = 500;
         let usn = vec![api(10, 1, 5, "ok.txt"), new_file];

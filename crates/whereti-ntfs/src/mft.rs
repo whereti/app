@@ -2,30 +2,36 @@
 //! attributes. One thread reads large sequential chunks; worker threads parse
 //! them in parallel. The channel is bounded, so memory stays flat however big
 //! the MFT is.
+//!
+//! Output is compact: fixed-size entries plus one shared UTF-8 name buffer,
+//! with no allocation per file.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::parse::{self, ParseOutcome, RecordInfo, Run, FRN_MASK, NS_DOS};
+use crate::parse::{self, FileName, ParseOutcome, RecordInfo, Run, FRN_MASK, NS_DOS};
 use crate::volume::{AlignedBuf, Volume};
 
 const CHUNK_BYTES: usize = 4 << 20;
 
-#[derive(Debug, Clone)]
+/// One name of one file or folder (a hard link has one entry per name).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MftEntry {
     pub record: u64,
-    pub seq: u16,
     /// Parent record number (sequence stripped).
     pub parent: u64,
-    pub name: String,
-    pub is_dir: bool,
-    pub attributes: u32,
     /// Logical size of the unnamed data stream (0 for directories).
     pub size: u64,
     /// Last write time, FILETIME.
     pub modified: u64,
+    pub attributes: u32,
+    /// Byte range of the UTF-8 name in [`MftScan::names`].
+    pub name_off: u32,
+    pub name_len: u16,
+    pub seq: u16,
+    pub is_dir: bool,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -44,9 +50,40 @@ pub struct MftStats {
     pub threads: usize,
 }
 
+#[derive(Debug, Default)]
 pub struct MftScan {
     pub entries: Vec<MftEntry>,
+    /// All names, UTF-8, back to back.
+    pub names: Vec<u8>,
     pub stats: MftStats,
+}
+
+impl MftScan {
+    pub fn name(&self, e: &MftEntry) -> &str {
+        let b = &self.names[e.name_off as usize..e.name_off as usize + e.name_len as usize];
+        // Names are written from `String`s only, so they are valid UTF-8.
+        std::str::from_utf8(b).unwrap_or("")
+    }
+
+    /// Appends one entry. Used by the scanner and by tests that build trees.
+    pub fn push(&mut self, mut e: MftEntry, name: &str) {
+        let name = truncate_utf8(name, u16::MAX as usize);
+        e.name_off = self.names.len() as u32;
+        e.name_len = name.len() as u16;
+        self.names.extend_from_slice(name.as_bytes());
+        self.entries.push(e);
+    }
+}
+
+fn truncate_utf8(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }
 
 struct Chunk {
@@ -57,9 +94,12 @@ struct Chunk {
 #[derive(Default)]
 struct ChunkResult {
     first_record: u64,
-    records: Vec<RecordInfo>,
+    scan: MftScan,
+    extensions: Vec<RecordInfo>,
+    base_records: u64,
     corrupt: u64,
     unused: u64,
+    without_name: u64,
 }
 
 pub fn scan(vol: &Volume, threads: usize) -> io::Result<MftScan> {
@@ -102,7 +142,7 @@ pub fn scan(vol: &Volume, threads: usize) -> io::Result<MftScan> {
     // 2. Pipeline: reader (this thread) -> bounded channel -> parsers.
     let chunk_bytes = (CHUNK_BYTES / rs) * rs;
     let (tx, rx) = crossbeam_channel::bounded::<Chunk>(threads * 2);
-    let results: Vec<ChunkResult> = thread::scope(|s| -> io::Result<Vec<ChunkResult>> {
+    let mut results: Vec<ChunkResult> = thread::scope(|s| -> io::Result<Vec<ChunkResult>> {
         let workers: Vec<_> = (0..threads)
             .map(|_| {
                 let rx = rx.clone();
@@ -130,76 +170,69 @@ pub fn scan(vol: &Volume, threads: usize) -> io::Result<MftScan> {
         Ok(all)
     })?;
 
-    // 3. Merge results in record order; fold extension records into their base.
-    let mut results = results;
+    // 3. Concatenate chunk results in record order.
     results.sort_unstable_by_key(|r| r.first_record);
-    let mut bases: Vec<RecordInfo> = Vec::new();
-    let mut extensions: Vec<RecordInfo> = Vec::new();
+    let total_entries: usize = results.iter().map(|r| r.scan.entries.len()).sum();
+    let total_names: usize = results.iter().map(|r| r.scan.names.len()).sum();
+    let mut out = MftScan {
+        entries: Vec::with_capacity(total_entries),
+        names: Vec::with_capacity(total_names),
+        stats: MftStats::default(),
+    };
+    let mut extensions = Vec::new();
     for r in results {
         stats.corrupt_records += r.corrupt;
         stats.unused_records += r.unused;
-        for info in r.records {
-            if info.is_base() {
-                bases.push(info);
-            } else {
-                extensions.push(info);
-            }
-        }
+        stats.base_records += r.base_records;
+        stats.records_without_name += r.without_name;
+        let base = out.names.len() as u32;
+        out.names.extend_from_slice(&r.scan.names);
+        out.entries.extend(r.scan.entries.into_iter().map(|mut e| {
+            e.name_off += base;
+            e
+        }));
+        extensions.extend(r.extensions);
     }
-    stats.base_records = bases.len() as u64;
     stats.extension_records = extensions.len() as u64;
     stats.in_use = stats.base_records + stats.extension_records;
 
+    // 4. Names stored in extension records (files with many hard links) become
+    //    extra entries of their base record.
     if !extensions.is_empty() {
-        let pos: HashMap<u64, usize> = bases.iter().enumerate().map(|(i, b)| (b.index, i)).collect();
-        for ext in extensions {
-            if let Some(&i) = pos.get(&ext.base) {
-                let base = &mut bases[i];
-                base.names.extend(ext.names);
-                if base.data_size.is_none() {
-                    base.data_size = ext.data_size;
-                }
-                if base.std.is_none() {
-                    base.std = ext.std;
-                }
-            }
-        }
+        merge_extensions(&mut out, extensions);
     }
+    out.stats = stats;
+    Ok(out)
+}
 
-    // 4. One entry per name (hard links appear in every folder they live in).
-    let mut entries = Vec::with_capacity(bases.len());
-    for b in bases {
-        let has_long_name = b.names.iter().any(|n| n.namespace != NS_DOS);
-        let mut any = false;
-        for n in &b.names {
-            if has_long_name && n.namespace == NS_DOS {
-                continue;
-            }
-            // The same link can be listed twice when it also appears in an
-            // extension record; keep one copy.
-            if entries.last().is_some_and(|e: &MftEntry| {
-                e.record == b.index && e.name == n.name && e.parent == n.parent_ref & FRN_MASK
-            }) {
-                continue;
-            }
-            any = true;
-            let std = b.std.unwrap_or_default();
-            entries.push(MftEntry {
-                record: b.index,
-                seq: b.seq,
-                parent: n.parent_ref & FRN_MASK,
-                name: n.name.clone(),
-                is_dir: b.is_dir(),
-                attributes: std.attributes,
-                size: if b.is_dir() { 0 } else { b.data_size.unwrap_or(0) },
-                modified: std.modified,
-            });
-        }
-        if !any {
-            stats.records_without_name += 1;
+fn merge_extensions(out: &mut MftScan, extensions: Vec<RecordInfo>) {
+    let wanted: HashSet<u64> = extensions.iter().map(|e| e.base).collect();
+    let mut first: HashMap<u64, usize> = HashMap::with_capacity(wanted.len());
+    for (i, e) in out.entries.iter().enumerate() {
+        if wanted.contains(&e.record) {
+            first.entry(e.record).or_insert(i);
         }
     }
-    Ok(MftScan { entries, stats })
+    let mut existing: HashSet<(u64, u64, Vec<u8>)> = HashSet::new();
+    for e in out.entries.iter().filter(|e| wanted.contains(&e.record)) {
+        existing.insert((e.record, e.parent, out.name(e).as_bytes().to_vec()));
+    }
+    for ext in extensions {
+        let Some(&bi) = first.get(&ext.base) else { continue };
+        let template = out.entries[bi];
+        for n in ext.names.iter().filter(|n| n.namespace != NS_DOS) {
+            let parent = n.parent_ref & FRN_MASK;
+            if !existing.insert((ext.base, parent, n.name.as_bytes().to_vec())) {
+                continue;
+            }
+            let mut e = template;
+            e.parent = parent;
+            if template.size == 0 && !template.is_dir {
+                e.size = ext.data_size.unwrap_or(0);
+            }
+            out.push(e, &n.name);
+        }
+    }
 }
 
 /// Streams the MFT as fixed-size chunks of whole records. Returns bytes read.
@@ -270,14 +303,53 @@ fn read_mft(
 
 fn parse_chunk(chunk: &mut Chunk, rs: usize) -> ChunkResult {
     let mut res = ChunkResult { first_record: chunk.first_record, ..Default::default() };
+    res.scan.names.reserve(chunk.data.len() / rs * 24);
     for (i, rec) in chunk.data.chunks_exact_mut(rs).enumerate() {
         match parse::parse_record(chunk.first_record + i as u64, rec, false) {
-            ParseOutcome::Record(info) => res.records.push(info),
+            ParseOutcome::Record(info) if info.is_base() => {
+                res.base_records += 1;
+                if !push_base(&mut res.scan, &info) {
+                    res.without_name += 1;
+                }
+            }
+            ParseOutcome::Record(info) => res.extensions.push(info),
             ParseOutcome::Unused => res.unused += 1,
             ParseOutcome::Corrupt => res.corrupt += 1,
         }
     }
     res
+}
+
+/// Adds one entry per long name of a base record. Returns false if it has none.
+fn push_base(scan: &mut MftScan, info: &RecordInfo) -> bool {
+    let has_long_name = info.names.iter().any(|n| n.namespace != NS_DOS);
+    let std = info.std.unwrap_or_default();
+    let mut any = false;
+    let mut seen: Vec<&FileName> = Vec::new();
+    for n in &info.names {
+        if has_long_name && n.namespace == NS_DOS {
+            continue;
+        }
+        if seen.iter().any(|s| s.name == n.name && s.parent_ref == n.parent_ref) {
+            continue;
+        }
+        seen.push(n);
+        any = true;
+        scan.push(
+            MftEntry {
+                record: info.index,
+                seq: info.seq,
+                parent: n.parent_ref & FRN_MASK,
+                is_dir: info.is_dir(),
+                attributes: std.attributes,
+                size: if info.is_dir() { 0 } else { info.data_size.unwrap_or(0) },
+                modified: std.modified,
+                ..Default::default()
+            },
+            &n.name,
+        );
+    }
+    any
 }
 
 fn round_up(n: usize, to: usize) -> usize {
@@ -286,4 +358,61 @@ fn round_up(n: usize, to: usize) -> usize {
 
 fn invalid(msg: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parse::NS_WIN32;
+
+    fn name(parent: u64, ns: u8, s: &str) -> FileName {
+        FileName { parent_ref: (1 << 48) | parent, namespace: ns, name: s.into() }
+    }
+
+    #[test]
+    fn base_record_skips_dos_names_and_duplicates() {
+        let info = RecordInfo {
+            index: 40,
+            base: 40,
+            seq: 2,
+            names: vec![
+                name(5, NS_DOS, "RAPORT~1.PDF"),
+                name(5, NS_WIN32, "Raport.pdf"),
+                name(9, NS_WIN32, "Raport.pdf"),
+                name(9, NS_WIN32, "Raport.pdf"),
+            ],
+            data_size: Some(10),
+            ..Default::default()
+        };
+        let mut scan = MftScan::default();
+        assert!(push_base(&mut scan, &info));
+        assert_eq!(scan.entries.len(), 2);
+        assert_eq!(scan.name(&scan.entries[1]), "Raport.pdf");
+        assert_eq!(scan.entries[1].parent, 9);
+        assert_eq!(scan.entries[0].size, 10);
+    }
+
+    #[test]
+    fn extension_names_become_hard_links_of_the_base() {
+        let mut scan = MftScan::default();
+        scan.push(MftEntry { record: 7, parent: 5, size: 99, ..Default::default() }, "a.dll");
+        let ext = RecordInfo {
+            index: 300,
+            base: 7,
+            names: vec![name(5, NS_WIN32, "a.dll"), name(12, NS_WIN32, "a.dll")],
+            ..Default::default()
+        };
+        merge_extensions(&mut scan, vec![ext]);
+        assert_eq!(scan.entries.len(), 2);
+        assert_eq!(scan.entries[1].parent, 12);
+        assert_eq!(scan.entries[1].size, 99);
+    }
+
+    #[test]
+    fn long_names_are_truncated_on_a_char_boundary() {
+        let s = "ș".repeat(40_000); // 80.000 bytes
+        let t = truncate_utf8(&s, u16::MAX as usize);
+        assert!(t.len() <= u16::MAX as usize);
+        assert!(t.chars().all(|c| c == 'ș'));
+    }
 }

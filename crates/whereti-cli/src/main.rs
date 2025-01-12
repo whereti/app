@@ -8,8 +8,11 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
+
+mod index_cmd;
+mod search_cmd;
 use whereti_ntfs::compare::{self, Diff};
-use whereti_ntfs::mft::{self, MftEntry};
+use whereti_ntfs::mft::{self, MftScan};
 use whereti_ntfs::parse::ROOT_RECORD;
 use whereti_ntfs::{usn_enum, Volume};
 
@@ -24,6 +27,10 @@ struct Cli {
 enum Cmd {
     /// Read an NTFS volume, report speed and memory, and cross-check both readers
     Scan(ScanArgs),
+    /// Scan volumes and save the name index (needs an Administrator terminal)
+    Index(index_cmd::IndexArgs),
+    /// Search the saved index
+    Search(search_cmd::SearchArgs),
 }
 
 #[derive(Args)]
@@ -55,6 +62,8 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.cmd {
         Cmd::Scan(args) => scan(args),
+        Cmd::Index(args) => index_cmd::run(args).map(|_| ExitCode::SUCCESS),
+        Cmd::Search(args) => search_cmd::run(args).map(|_| ExitCode::SUCCESS),
     };
     match result {
         Ok(code) => code,
@@ -66,14 +75,7 @@ fn main() -> ExitCode {
 }
 
 fn scan(args: ScanArgs) -> Result<ExitCode, String> {
-    let letter = args
-        .volume
-        .trim_end_matches(['\\', '/'])
-        .trim_end_matches(':')
-        .chars()
-        .next()
-        .filter(|c| c.is_ascii_alphabetic() && args.volume.trim_end_matches(['\\', '/', ':']).len() == 1)
-        .ok_or_else(|| format!("invalid volume \"{}\" (expected e.g. C:)", args.volume))?;
+    let letter = parse_letter(&args.volume)?;
 
     let t = Instant::now();
     let vol = Volume::open(letter, !args.buffered).map_err(|e| open_error(letter, e))?;
@@ -102,7 +104,7 @@ fn scan(args: ScanArgs) -> Result<ExitCode, String> {
     }
     println!();
 
-    let mut raw: Option<Vec<MftEntry>> = None;
+    let mut raw: Option<MftScan> = None;
     let mut scan_start_usn = None;
     let mut ok = true;
 
@@ -143,12 +145,12 @@ fn scan(args: ScanArgs) -> Result<ExitCode, String> {
                     num((scan.entries.len() - files) as u64),
                     bytes(total_size)
                 );
-                print_index_estimate(&scan.entries, s.total_records);
+                print_index_estimate(&scan, s.total_records);
                 println!();
                 if s.corrupt_records > 0 {
                     ok = false;
                 }
-                raw = Some(scan.entries);
+                raw = Some(scan);
             }
             Err(e) => {
                 println!("[direct MFT]  FAILED: {e}");
@@ -200,6 +202,16 @@ fn scan(args: ScanArgs) -> Result<ExitCode, String> {
     Ok(if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE })
 }
 
+/// "C:", "c", "C:\\" -> 'C'.
+fn parse_letter(v: &str) -> Result<char, String> {
+    let t = v.trim_end_matches(['\\', '/', ':']);
+    let mut chars = t.chars();
+    match (chars.next(), chars.next()) {
+        (Some(c), None) if c.is_ascii_alphabetic() => Ok(c.to_ascii_uppercase()),
+        _ => Err(format!("invalid volume \"{v}\" (expected e.g. C:)")),
+    }
+}
+
 fn open_error(letter: char, e: std::io::Error) -> String {
     if e.raw_os_error() == Some(5) {
         format!("access denied to {letter}: — run wt from an Administrator terminal")
@@ -209,9 +221,10 @@ fn open_error(letter: char, e: std::io::Error) -> String {
 }
 
 /// Memory the compact index from PLAN.md §4.2 would need for this volume.
-fn print_index_estimate(entries: &[MftEntry], total_records: u64) {
+fn print_index_estimate(scan: &MftScan, total_records: u64) {
+    let entries = &scan.entries;
     const FIXED_PER_ENTRY: u64 = 4 + 2 + 4 + 2 + 2 + 8 + 4 + 8; // off, len, parent, flags, ext, size, mtime, 2 sort orders
-    let names: u64 = entries.iter().map(|e| e.name.len() as u64).sum();
+    let names = scan.names.len() as u64;
     let n = entries.len().max(1) as u64;
     let total = names + n * FIXED_PER_ENTRY + total_records * 4;
     println!(
@@ -222,15 +235,16 @@ fn print_index_estimate(entries: &[MftEntry], total_records: u64) {
     );
 }
 
-fn print_sample_paths(letter: char, raw: &[MftEntry], samples: usize) {
+fn print_sample_paths(letter: char, scan: &MftScan, samples: usize) {
+    let raw = &scan.entries;
     if samples == 0 || raw.is_empty() {
         return;
     }
-    let parents: HashMap<u64, (u64, &str)> = raw.iter().map(|e| (e.record, (e.parent, e.name.as_str()))).collect();
+    let parents: HashMap<u64, (u64, &str)> = raw.iter().map(|e| (e.record, (e.parent, scan.name(e)))).collect();
     println!("[sample paths]");
     let step = (raw.len() / samples).max(1);
     for e in raw.iter().step_by(step).take(samples) {
-        let mut parts = vec![e.name.as_str()];
+        let mut parts = vec![scan.name(e)];
         let mut cur = e.parent;
         let mut complete = false;
         for _ in 0..1024 {
