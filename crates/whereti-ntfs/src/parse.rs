@@ -161,6 +161,10 @@ pub struct RecordInfo {
     pub data_size: Option<u64>,
     pub data_runs: Option<DataRuns>,
     pub has_attribute_list: bool,
+    /// Extension records listed by a resident `$ATTRIBUTE_LIST`.
+    pub ext_records: Vec<u64>,
+    /// The attribute list is non-resident (not parsed): names may be missing.
+    pub attr_list_nonresident: bool,
 }
 
 impl RecordInfo {
@@ -184,6 +188,16 @@ pub enum ParseOutcome {
 /// Parses one FILE record (already sized to `BytesPerFileRecordSegment`).
 /// Fixups are applied in place.
 pub fn parse_record(index: u64, rec: &mut [u8], want_runs: bool) -> ParseOutcome {
+    parse_record_impl(index, rec, want_runs, true)
+}
+
+/// Parses a record whose update-sequence fixups were already applied
+/// (some FSCTLs return records that way).
+pub fn parse_record_fixed(index: u64, rec: &mut [u8]) -> ParseOutcome {
+    parse_record_impl(index, rec, false, false)
+}
+
+fn parse_record_impl(index: u64, rec: &mut [u8], want_runs: bool, fixup: bool) -> ParseOutcome {
     match rec.get(0..4) {
         Some(b"FILE") => {}
         Some(b"BAAD") => return ParseOutcome::Corrupt,
@@ -195,7 +209,7 @@ pub fn parse_record(index: u64, rec: &mut [u8], want_runs: bool) -> ParseOutcome
     if flags & RECORD_IN_USE == 0 {
         return ParseOutcome::Unused;
     }
-    if !apply_fixup(rec) {
+    if fixup && !apply_fixup(rec) {
         return ParseOutcome::Corrupt;
     }
     let (Some(seq), Some(first_attr), Some(in_use), Some(base_ref)) = (
@@ -270,12 +284,35 @@ pub fn parse_record(index: u64, rec: &mut [u8], want_runs: bool) -> ParseOutcome
                     }
                 }
             }
-            ATTR_ATTRIBUTE_LIST => info.has_attribute_list = true,
+            ATTR_ATTRIBUTE_LIST => {
+                info.has_attribute_list = true;
+                match resident_value(attr).filter(|_| !non_resident) {
+                    Some(list) => collect_ext_records(list, index, &mut info.ext_records),
+                    None => info.attr_list_nonresident = true,
+                }
+            }
             _ => {}
         }
         pos += len;
     }
     ParseOutcome::Record(info)
+}
+
+/// Attribute-list entries: type (4), length (2), …, segment reference at 0x10.
+fn collect_ext_records(list: &[u8], index: u64, out: &mut Vec<u64>) {
+    let mut pos = 0usize;
+    while pos + 0x18 <= list.len() {
+        let Some(len) = u16_at(list, pos + 4) else { break };
+        let Some(seg) = u64_at(list, pos + 0x10) else { break };
+        let seg = seg & FRN_MASK;
+        if seg != index && !out.contains(&seg) {
+            out.push(seg);
+        }
+        if len < 0x18 {
+            break;
+        }
+        pos += len as usize;
+    }
 }
 
 fn resident_value(attr: &[u8]) -> Option<&[u8]> {
@@ -452,6 +489,33 @@ mod tests {
         assert_eq!(runs.runs, vec![Run { lcn: Some(0x100), clusters: 16 }]);
         assert_eq!(runs.expected_clusters, 16);
         assert_eq!(info.data_size, Some(16 * 4096));
+    }
+
+    #[test]
+    fn attribute_list_points_to_extension_records() {
+        let entry = |ty: u32, seg: u64| {
+            let mut e = vec![0u8; 0x20];
+            e[0..4].copy_from_slice(&ty.to_le_bytes());
+            e[4..6].copy_from_slice(&0x20u16.to_le_bytes());
+            e[0x10..0x18].copy_from_slice(&((2u64 << 48) | seg).to_le_bytes());
+            e
+        };
+        let mut list = entry(ATTR_STANDARD_INFORMATION, 991);
+        list.extend(entry(ATTR_FILE_NAME, 991));
+        list.extend(entry(ATTR_FILE_NAME, 4000));
+        list.extend(entry(ATTR_DATA, 4001));
+        list.extend(entry(ATTR_FILE_NAME, 4000));
+        let mut r = build_record(
+            RECORD_IN_USE | RECORD_IS_DIRECTORY,
+            0,
+            &[resident_attr(ATTR_ATTRIBUTE_LIST, 0, &list), file_name(545, NS_DOS, "CUSTOM~1")],
+        );
+        let ParseOutcome::Record(info) = parse_record(991, &mut r, false) else {
+            panic!("expected a record");
+        };
+        assert!(info.has_attribute_list);
+        assert!(!info.attr_list_nonresident);
+        assert_eq!(info.ext_records, vec![4000, 4001]);
     }
 
     #[test]

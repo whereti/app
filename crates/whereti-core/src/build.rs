@@ -58,7 +58,7 @@ impl Exclusions {
     }
 
     /// Rules for one volume, each as folded path components.
-    fn for_volume(&self, letter: char) -> Vec<Vec<String>> {
+    pub(crate) fn for_volume(&self, letter: char) -> Vec<Vec<String>> {
         let mut out = Vec::new();
         for p in &self.paths {
             let p = p.replace('/', "\\");
@@ -89,6 +89,7 @@ pub fn build(volumes: Vec<VolumeScan>, exclusions: &Exclusions) -> (NameIndex, B
         exts: vec![String::new()],
         name_off: vec![0],
         alt_off: vec![0],
+        exclusions: exclusions.paths.clone(),
         ..Default::default()
     };
     let mut ext_ids: HashMap<String, u16> = HashMap::new();
@@ -177,6 +178,7 @@ fn add_volume(
             stats.excluded += 1;
         }
     }
+    let vol_no = idx.volumes.len() as u8;
     let mut folded = String::new();
     for i in 0..n {
         if state[i] != 2 {
@@ -185,21 +187,9 @@ fn add_volume(
         let e = &scan.entries[i];
         let name = scan.name(e);
         let is_root = i as u32 == root;
-        let mut flags = 0u16;
-        if e.is_dir || is_root {
-            flags |= FLAG_DIR;
-        }
+        let mut flags = attr_flags(e.attributes, e.is_dir || is_root);
         if is_root {
             flags |= FLAG_ROOT;
-        }
-        if e.attributes & ATTR_HIDDEN != 0 {
-            flags |= FLAG_HIDDEN;
-        }
-        if e.attributes & ATTR_SYSTEM != 0 {
-            flags |= FLAG_SYSTEM;
-        }
-        if e.attributes & (ATTR_OFFLINE | ATTR_RECALL_ON_OPEN | ATTR_RECALL_ON_DATA_ACCESS) != 0 {
-            flags |= FLAG_CLOUD;
         }
         if !name.is_ascii() {
             flags |= FLAG_NON_ASCII;
@@ -226,10 +216,23 @@ fn add_volume(
         idx.ext.push(if e.is_dir { 0 } else { ext_id(ext_ids, &mut idx.exts, name) });
         idx.size.push(e.size);
         idx.mtime.push(filetime_to_minutes(e.modified));
+        idx.volume.push(vol_no);
     }
 
-    let rec_start = idx.rec_map.len() as u64;
-    idx.rec_map.extend(rec_first.iter().map(|&f| if f == NO_PARENT { NO_PARENT } else { new_idx[f as usize] }));
+    // record -> kept entries (a hard link can be kept while another is excluded)
+    let mut rec_map = vec![NO_PARENT; max_rec];
+    for i in 0..n {
+        if state[i] != 2 {
+            continue;
+        }
+        let r = scan.entries[i].record as usize;
+        if rec_map[r] == NO_PARENT {
+            rec_map[r] = new_idx[i];
+        } else {
+            idx.links.entry(rec_map[r]).or_default().push(new_idx[i]);
+        }
+    }
+    idx.rec_maps.push(rec_map);
     idx.volumes.push(VolumeInfo {
         letter: vs.letter as u32,
         root: if root == NO_PARENT { NO_PARENT } else { new_idx[root as usize] },
@@ -238,7 +241,8 @@ fn add_volume(
         serial: vs.serial,
         journal_id: vs.journal_id,
         next_usn: vs.next_usn,
-        rec_start,
+        // where this volume's record map starts when the maps are stored back to back
+        rec_start: idx.rec_maps.iter().rev().skip(1).map(|m| m.len() as u64).sum(),
         rec_len: max_rec as u64,
     });
 }
@@ -285,7 +289,25 @@ fn resolve_paths(
     found
 }
 
-fn ext_id(ids: &mut HashMap<String, u16>, exts: &mut Vec<String>, name: &str) -> u16 {
+/// Index flags for NTFS file attributes.
+pub(crate) fn attr_flags(attributes: u32, is_dir: bool) -> u16 {
+    let mut flags = 0u16;
+    if is_dir {
+        flags |= FLAG_DIR;
+    }
+    if attributes & ATTR_HIDDEN != 0 {
+        flags |= FLAG_HIDDEN;
+    }
+    if attributes & ATTR_SYSTEM != 0 {
+        flags |= FLAG_SYSTEM;
+    }
+    if attributes & (ATTR_OFFLINE | ATTR_RECALL_ON_OPEN | ATTR_RECALL_ON_DATA_ACCESS) != 0 {
+        flags |= FLAG_CLOUD;
+    }
+    flags
+}
+
+pub(crate) fn ext_id(ids: &mut HashMap<String, u16>, exts: &mut Vec<String>, name: &str) -> u16 {
     let Some(dot) = name.rfind('.') else { return 0 };
     let ext = &name[dot + 1..];
     if ext.is_empty() || ext.len() > 16 || ext.contains(' ') {
@@ -318,7 +340,7 @@ pub(crate) fn sort_key(idx: &NameIndex, i: u32) -> &[u8] {
     }
 }
 
-fn compute_name_rank(idx: &NameIndex) -> Vec<u32> {
+pub(crate) fn compute_name_rank(idx: &NameIndex) -> Vec<u32> {
     let mut order: Vec<u32> = (0..idx.len() as u32).collect();
     order.par_sort_unstable_by(|&a, &b| {
         let (ka, kb) = (sort_key(idx, a), sort_key(idx, b));
@@ -336,7 +358,7 @@ fn compute_name_rank(idx: &NameIndex) -> Vec<u32> {
 }
 
 /// Folders sorted by depth, so parents always come first.
-fn compute_dir_order(idx: &NameIndex) -> Vec<u32> {
+pub(crate) fn compute_dir_order(idx: &NameIndex) -> Vec<u32> {
     let n = idx.len();
     let mut depth = vec![u16::MAX; n];
     let mut chain = Vec::new();
@@ -375,6 +397,10 @@ const NOISE_DIRS: &[&str] = &[
     "obj", ".turbo", ".next", ".codex", ".vscode-server",
 ];
 
+pub(crate) fn is_noise_dir(folded_name: &str) -> bool {
+    NOISE_DIRS.contains(&folded_name)
+}
+
 /// Sets FLAG_NOISE on noise folders and everything below them.
 fn mark_noise(idx: &mut NameIndex) {
     let mut folded = String::new();
@@ -383,7 +409,7 @@ fn mark_noise(idx: &mut NameIndex) {
         let parent_noise = idx.parent(d).is_some_and(|p| idx.flags[p as usize] & FLAG_NOISE != 0);
         folded.clear();
         whereti_query::fold_into(idx.name(d), &mut folded);
-        if parent_noise || NOISE_DIRS.contains(&folded.as_str()) {
+        if parent_noise || is_noise_dir(&folded) {
             idx.flags[d as usize] |= FLAG_NOISE;
         }
     }

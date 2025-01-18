@@ -1,0 +1,574 @@
+//! Live updates (PLAN.md §4.4, §7.2).
+//!
+//! The USN journal only tells us *which* MFT records changed. For each one we
+//! read its *current* state (all names, parents, size, date) and make the index
+//! match it. Applying a record twice, or applying records in a different order,
+//! gives the same result, so missed or duplicated journal events cannot drift
+//! the index away from the disk.
+//!
+//! - A file or folder moved somewhere the index does not cover (Recycle Bin,
+//!   an excluded folder) is *detached*: hidden with everything under it, but
+//!   kept, so a restore brings it all back.
+//! - A folder that appears from outside the index (not created now, not
+//!   detached before) may contain files we have never seen: the caller must
+//!   rescan the volume (`ApplyStats::needs_rescan`).
+
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::io;
+
+use whereti_ntfs::mft::{MftEntry, MftScan};
+use whereti_query::fold;
+
+use crate::build::{
+    attr_flags, build, compute_dir_order, ext_id, filetime_to_minutes, is_noise_dir, Exclusions, VolumeScan,
+};
+use crate::index::*;
+
+const ROOT_RECORD: u64 = 5;
+const FIRST_USER_RECORD: u64 = 16;
+const KEEP_FLAGS: u16 = FLAG_ROOT | FLAG_NON_ASCII | FLAG_TAIL | FLAG_DELETED | FLAG_DETACHED | FLAG_GONE;
+
+/// Current on-disk state of one MFT record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordState {
+    pub is_dir: bool,
+    pub attributes: u32,
+    pub size: u64,
+    /// Last write, FILETIME.
+    pub modified: u64,
+    /// (parent record, name) of every hard link.
+    pub links: Vec<(u64, String)>,
+    /// False when some names may be stored in extension records that were not
+    /// read; links missing from `links` are then kept instead of removed.
+    pub complete: bool,
+}
+
+/// Where current record states come from: the volume (FSCTL_GET_NTFS_FILE_RECORD)
+/// in production, a model file system in tests.
+pub trait RecordSource {
+    /// Current state of `record`, or `None` if the record is not in use.
+    fn record(&mut self, record: u64) -> io::Result<Option<RecordState>>;
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ApplyStats {
+    pub records: usize,
+    pub added: usize,
+    pub updated: usize,
+    pub removed: usize,
+    /// A folder came in from outside the index; rescan the volume.
+    pub needs_rescan: bool,
+}
+
+#[derive(Default)]
+struct Pass {
+    /// Folder deleted, detached, reattached or turned into a file.
+    structural: bool,
+    /// Folder moved or created out of parent-first order.
+    dirs_reordered: bool,
+    touched: Vec<u32>,
+}
+
+impl NameIndex {
+    pub fn volume_index(&self, letter: char) -> Option<usize> {
+        self.volumes.iter().position(|v| v.letter().eq_ignore_ascii_case(&letter))
+    }
+
+    /// Records how far the index is up to date with the volume's journal.
+    pub fn set_journal_position(&mut self, vol: usize, journal_id: u64, next_usn: i64) {
+        self.volumes[vol].journal_id = journal_id;
+        self.volumes[vol].next_usn = next_usn;
+    }
+
+    /// Makes the index match the current state of `records` on volume `vol`.
+    /// `created`: records whose journal events include a creation.
+    pub fn apply(
+        &mut self,
+        vol: usize,
+        records: &[u64],
+        created: &HashSet<u64>,
+        src: &mut dyn RecordSource,
+    ) -> io::Result<ApplyStats> {
+        let mut stats = ApplyStats::default();
+        let mut pass = Pass::default();
+        let rules = Exclusions { paths: self.exclusions.clone() }.for_volume(self.volumes[vol].letter());
+        let mut ext_ids: HashMap<String, u16> =
+            self.exts.iter().enumerate().map(|(i, e)| (e.clone(), i as u16)).collect();
+
+        // Read every state once, then process parents before children: a file
+        // created in a new folder must find that folder already in the index.
+        let mut order: Vec<u64> = Vec::new();
+        let mut seen = HashSet::new();
+        for &r in records {
+            if seen.insert(r) && !(r < FIRST_USER_RECORD && r != ROOT_RECORD) {
+                order.push(r);
+            }
+        }
+        let mut states: HashMap<u64, Option<RecordState>> = HashMap::with_capacity(order.len());
+        for &r in &order {
+            states.insert(r, src.record(r)?);
+        }
+        let mut pending: Vec<u64> = order;
+        while !pending.is_empty() {
+            let waiting: HashSet<u64> = pending.iter().copied().collect();
+            let ready = |r: &u64| match &states[r] {
+                Some(st) => st.links.iter().all(|(p, _)| *p == *r || !waiting.contains(p)),
+                None => true,
+            };
+            let (now, later): (Vec<u64>, Vec<u64>) = pending.iter().partition(|r| ready(r));
+            // No progress means a cycle in what we read (a move raced the reads):
+            // process everything in order; the next batch fixes any leftover.
+            let (now, later) = if now.is_empty() { (later, Vec::new()) } else { (now, later) };
+            for r in now {
+                let st = states[&r].clone();
+                self.apply_record(vol, r, st, created.contains(&r), &rules, &mut ext_ids, &mut stats, &mut pass);
+                stats.records += 1;
+            }
+            pending = later;
+        }
+
+        if pass.dirs_reordered {
+            self.dir_order = compute_dir_order(self);
+        }
+        if pass.structural || pass.dirs_reordered {
+            self.recompute_gone();
+        } else {
+            for e in pass.touched {
+                self.update_gone(e);
+            }
+        }
+        Ok(stats)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn apply_record(
+        &mut self,
+        vol: usize,
+        r: u64,
+        state: Option<RecordState>,
+        created: bool,
+        rules: &[Vec<String>],
+        ext_ids: &mut HashMap<String, u16>,
+        stats: &mut ApplyStats,
+        pass: &mut Pass,
+    ) {
+        let existing: Vec<u32> = self
+            .entries_of(vol, r)
+            .into_iter()
+            .filter(|&e| self.flags[e as usize] & FLAG_DELETED == 0)
+            .collect();
+
+        let Some(st) = state else {
+            for &e in &existing {
+                self.mark_deleted(e, pass);
+                stats.removed += 1;
+            }
+            self.set_entries_of(vol, r, &[]);
+            return;
+        };
+
+        if r == ROOT_RECORD {
+            for &e in &existing {
+                self.mtime[e as usize] = filetime_to_minutes(st.modified);
+            }
+            return;
+        }
+
+        // Where each link should be: an indexed, non-excluded folder, or nowhere.
+        let desired: Vec<(Option<u32>, &str)> = st
+            .links
+            .iter()
+            .map(|(p, name)| {
+                let pe = self.live_dir(vol, *p).filter(|&pe| !self.is_excluded_child(pe, name, rules));
+                (pe, name.as_str())
+            })
+            .collect();
+
+        // Keep entries that are already right, reuse the others for renames/moves.
+        let mut used = vec![false; existing.len()];
+        let mut assign: Vec<Option<usize>> = vec![None; desired.len()];
+        for (d, (pe, name)) in desired.iter().enumerate() {
+            if let Some(k) = (0..existing.len()).find(|&k| !used[k] && self.is_at(existing[k], *pe, name)) {
+                used[k] = true;
+                assign[d] = Some(k);
+            }
+        }
+        for slot in assign.iter_mut().filter(|a| a.is_none()) {
+            if let Some(k) = (0..existing.len()).find(|&k| !used[k]) {
+                used[k] = true;
+                *slot = Some(k);
+            }
+        }
+
+        let mut result = Vec::with_capacity(desired.len());
+        for (d, (pe, name)) in desired.iter().enumerate() {
+            match assign[d] {
+                Some(k) => {
+                    let e = existing[k];
+                    if st.is_dir && !self.is_dir(e) && !created {
+                        stats.needs_rescan = true; // a file record became a folder we never saw
+                    }
+                    self.place(e, *pe, name, &st, ext_ids, pass);
+                    result.push(e);
+                    stats.updated += 1;
+                }
+                None => {
+                    let Some(p) = *pe else { continue }; // outside the index: nothing to add
+                    if st.is_dir && !created {
+                        stats.needs_rescan = true; // its contents were never indexed
+                    }
+                    let e = self.push_entry(vol, p, name, &st, ext_ids, pass);
+                    result.push(e);
+                    stats.added += 1;
+                }
+            }
+        }
+        for (k, &e) in existing.iter().enumerate() {
+            if used[k] {
+                continue;
+            }
+            if st.complete {
+                self.mark_deleted(e, pass);
+                stats.removed += 1;
+            } else {
+                result.push(e); // its name may be in an extension record we did not read
+            }
+        }
+        self.set_entries_of(vol, r, &result);
+    }
+
+    /// The live folder entry of a record, if indexed.
+    fn live_dir(&self, vol: usize, record: u64) -> Option<u32> {
+        self.entries_of(vol, record)
+            .into_iter()
+            .find(|&e| self.flags[e as usize] & (FLAG_DIR | FLAG_DELETED) == FLAG_DIR)
+    }
+
+    fn is_at(&self, e: u32, pe: Option<u32>, name: &str) -> bool {
+        let detached = self.flags[e as usize] & FLAG_DETACHED != 0;
+        let place_ok = match pe {
+            None => detached,
+            Some(p) => !detached && self.parent[e as usize] == p,
+        };
+        place_ok && self.name(e) == name
+    }
+
+    /// True when `parent\name` is one of the exclusion paths.
+    fn is_excluded_child(&self, parent: u32, name: &str, rules: &[Vec<String>]) -> bool {
+        if rules.is_empty() {
+            return false;
+        }
+        let mut comps = vec![fold(name)];
+        let mut cur = parent;
+        for _ in 0..4096 {
+            if self.flags[cur as usize] & FLAG_ROOT != 0 {
+                break;
+            }
+            comps.push(fold(self.name(cur)));
+            match self.parent(cur) {
+                Some(p) => cur = p,
+                None => return false,
+            }
+        }
+        comps.reverse();
+        rules.contains(&comps)
+    }
+
+    fn place(
+        &mut self,
+        e: u32,
+        pe: Option<u32>,
+        name: &str,
+        st: &RecordState,
+        ext_ids: &mut HashMap<String, u16>,
+        pass: &mut Pass,
+    ) {
+        let i = e as usize;
+        let was_dir = self.flags[i] & FLAG_DIR != 0;
+        if self.name(e) != name {
+            self.set_tail_name(e, name);
+            self.ext[i] = if st.is_dir { 0 } else { ext_id(ext_ids, &mut self.exts, name) };
+            self.name_rank[i] = u32::MAX; // exact order restored by the next compaction
+        }
+        match pe {
+            None => {
+                if self.flags[i] & FLAG_DETACHED == 0 {
+                    self.removed += 1;
+                    self.flags[i] |= FLAG_DETACHED;
+                    self.parent[i] = NO_PARENT;
+                    pass.structural |= was_dir;
+                }
+            }
+            Some(p) => {
+                if self.flags[i] & FLAG_DETACHED != 0 {
+                    self.flags[i] &= !FLAG_DETACHED;
+                    self.removed = self.removed.saturating_sub(1);
+                    pass.structural |= was_dir;
+                }
+                if self.parent[i] != p {
+                    self.parent[i] = p;
+                    pass.dirs_reordered |= was_dir;
+                }
+            }
+        }
+        let keep = self.flags[i] & KEEP_FLAGS;
+        self.flags[i] = keep | attr_flags(st.attributes, st.is_dir) | self.noise_for(pe, name, st.is_dir);
+        if was_dir != st.is_dir {
+            pass.structural = true;
+            pass.dirs_reordered = true;
+        }
+        self.size[i] = if st.is_dir { 0 } else { st.size };
+        self.mtime[i] = filetime_to_minutes(st.modified);
+        pass.touched.push(e);
+    }
+
+    fn push_entry(
+        &mut self,
+        vol: usize,
+        parent: u32,
+        name: &str,
+        st: &RecordState,
+        ext_ids: &mut HashMap<String, u16>,
+        pass: &mut Pass,
+    ) -> u32 {
+        let e = self.len() as u32;
+        self.parent.push(parent);
+        self.flags.push(attr_flags(st.attributes, st.is_dir) | self.noise_for(Some(parent), name, st.is_dir));
+        self.ext.push(if st.is_dir { 0 } else { ext_id(ext_ids, &mut self.exts, name) });
+        self.size.push(if st.is_dir { 0 } else { st.size });
+        self.mtime.push(filetime_to_minutes(st.modified));
+        self.volume.push(vol as u8);
+        self.name_rank.push(u32::MAX);
+        self.set_tail_name(e, name);
+        if st.is_dir {
+            self.dir_order.push(e); // its parent is already in the index, so it comes earlier
+        }
+        pass.touched.push(e);
+        e
+    }
+
+    fn noise_for(&self, parent: Option<u32>, name: &str, is_dir: bool) -> u16 {
+        let parent_noise = parent.is_some_and(|p| self.flags[p as usize] & FLAG_NOISE != 0);
+        if parent_noise || (is_dir && is_noise_dir(&fold(name))) {
+            FLAG_NOISE
+        } else {
+            0
+        }
+    }
+
+    fn set_tail_name(&mut self, e: u32, name: &str) {
+        let k = self.tail_names.len() as u32;
+        self.tail_names.push(name.to_string());
+        self.tail_entry.push(e);
+        self.tail_of.insert(e, k);
+        self.flags[e as usize] |= FLAG_TAIL;
+    }
+
+    fn mark_deleted(&mut self, e: u32, pass: &mut Pass) {
+        let f = &mut self.flags[e as usize];
+        if *f & (FLAG_DELETED | FLAG_DETACHED) == 0 {
+            self.removed += 1;
+        }
+        if *f & FLAG_DIR != 0 {
+            pass.structural = true;
+        }
+        *f |= FLAG_DELETED | FLAG_GONE;
+    }
+
+    fn update_gone(&mut self, e: u32) {
+        let i = e as usize;
+        let own = self.flags[i] & (FLAG_DELETED | FLAG_DETACHED) != 0;
+        let parent_gone = self.parent(e).is_some_and(|p| self.flags[p as usize] & FLAG_GONE != 0);
+        if own || parent_gone {
+            self.flags[i] |= FLAG_GONE;
+        } else {
+            self.flags[i] &= !FLAG_GONE;
+        }
+    }
+
+    /// Recomputes FLAG_GONE for everything (folders parents-first, then files).
+    fn recompute_gone(&mut self) {
+        for k in 0..self.dir_order.len() {
+            let d = self.dir_order[k];
+            self.update_gone(d);
+        }
+        for e in 0..self.len() as u32 {
+            if self.flags[e as usize] & FLAG_DIR == 0 {
+                self.update_gone(e);
+            }
+        }
+    }
+
+    pub(crate) fn entries_of(&self, vol: usize, record: u64) -> Vec<u32> {
+        let Some(&first) = self.rec_maps[vol].get(record as usize) else { return Vec::new() };
+        if first == NO_PARENT {
+            return Vec::new();
+        }
+        let mut out = vec![first];
+        if let Some(more) = self.links.get(&first) {
+            out.extend_from_slice(more);
+        }
+        out
+    }
+
+    fn set_entries_of(&mut self, vol: usize, record: u64, list: &[u32]) {
+        let r = record as usize;
+        let map = &mut self.rec_maps[vol];
+        if map.len() <= r {
+            map.resize(r + 1, NO_PARENT);
+        }
+        let old = map[r];
+        if old != NO_PARENT {
+            self.links.remove(&old);
+        }
+        match list {
+            [] => self.rec_maps[vol][r] = NO_PARENT,
+            [first, rest @ ..] => {
+                self.rec_maps[vol][r] = *first;
+                if !rest.is_empty() {
+                    self.links.insert(*first, rest.to_vec());
+                }
+            }
+        }
+    }
+
+    /// Rebuilds a clean index (no overlay, exact sort order) from the current
+    /// state. Detached subtrees are dropped; restoring one later triggers a rescan.
+    pub fn compact(&mut self) {
+        if self.is_compact() {
+            return;
+        }
+        let exclusions = Exclusions { paths: self.exclusions.clone() };
+        let scans = self.to_scans();
+        *self = build(scans, &exclusions).0;
+    }
+
+    /// A clean index where the given volumes come from fresh scans and the
+    /// others from this index (used when a volume's journal cannot be replayed).
+    pub fn rebuild_with(&self, fresh: Vec<VolumeScan>) -> NameIndex {
+        let exclusions = Exclusions { paths: self.exclusions.clone() };
+        let mut scans: Vec<VolumeScan> = self
+            .to_scans()
+            .into_iter()
+            .filter(|s| !fresh.iter().any(|f| f.letter.eq_ignore_ascii_case(&s.letter)))
+            .collect();
+        scans.extend(fresh);
+        scans.sort_by_key(|s| s.letter.to_ascii_uppercase());
+        build(scans, &exclusions).0
+    }
+
+    /// Converts the live entries back into per-volume scans.
+    fn to_scans(&self) -> Vec<VolumeScan> {
+        let mut rec_of = vec![u64::MAX; self.len()];
+        for map in &self.rec_maps {
+            for (r, &f) in map.iter().enumerate() {
+                if f == NO_PARENT {
+                    continue;
+                }
+                rec_of[f as usize] = r as u64;
+                if let Some(more) = self.links.get(&f) {
+                    for &l in more {
+                        rec_of[l as usize] = r as u64;
+                    }
+                }
+            }
+        }
+        let mut scans: Vec<VolumeScan> = self
+            .volumes
+            .iter()
+            .map(|v| VolumeScan {
+                letter: v.letter(),
+                serial: v.serial,
+                journal_id: v.journal_id,
+                next_usn: v.next_usn,
+                scan: MftScan::default(),
+            })
+            .collect();
+        for i in 0..self.len() as u32 {
+            let f = self.flags[i as usize];
+            let record = rec_of[i as usize];
+            if f & FLAG_GONE != 0 || record == u64::MAX {
+                continue;
+            }
+            let is_root = f & FLAG_ROOT != 0;
+            let parent = if is_root {
+                ROOT_RECORD
+            } else {
+                match self.parent(i).map(|p| rec_of[p as usize]) {
+                    Some(p) if p != u64::MAX => p,
+                    _ => continue,
+                }
+            };
+            let mut attributes = 0;
+            if f & FLAG_HIDDEN != 0 {
+                attributes |= 0x2;
+            }
+            if f & FLAG_SYSTEM != 0 {
+                attributes |= 0x4;
+            }
+            if f & FLAG_CLOUD != 0 {
+                attributes |= 0x0040_0000;
+            }
+            scans[self.volume[i as usize] as usize].scan.push(
+                MftEntry {
+                    record,
+                    parent,
+                    size: self.size[i as usize],
+                    modified: self.mtime[i as usize] as u64 * 600_000_000,
+                    attributes,
+                    is_dir: f & FLAG_DIR != 0,
+                    ..Default::default()
+                },
+                if is_root { "." } else { self.name(i) },
+            );
+        }
+        scans
+    }
+
+    /// Entries (any state) of one MFT record, for diagnostics.
+    pub fn entries_for_record(&self, vol: usize, record: u64) -> Vec<u32> {
+        self.entries_of(vol, record)
+    }
+
+    /// (volume, MFT record) of the live entries whose full path is in `paths`.
+    /// Slow (builds every path); meant for diagnostics such as `wt verify`.
+    pub fn records_for_paths(&self, paths: &HashSet<String>) -> Vec<(usize, u64)> {
+        let mut wanted: HashSet<u32> = HashSet::new();
+        for i in 0..self.len() as u32 {
+            if self.flags[i as usize] & HIDDEN_FROM_SEARCH == 0 && paths.contains(&self.full_path(i)) {
+                wanted.insert(i);
+            }
+        }
+        let mut out = Vec::new();
+        for (v, map) in self.rec_maps.iter().enumerate() {
+            for (r, &f) in map.iter().enumerate() {
+                if f == NO_PARENT {
+                    continue;
+                }
+                let hit = wanted.contains(&f) || self.links.get(&f).is_some_and(|l| l.iter().any(|e| wanted.contains(e)));
+                if hit {
+                    out.push((v, r as u64));
+                }
+            }
+        }
+        out
+    }
+
+    /// Everything a search can see, in a form two indexes can be compared by:
+    /// (path, is folder, size, minutes, hidden/system/cloud flags).
+    pub fn canonical(&self) -> BTreeSet<(String, bool, u64, u32, u16)> {
+        (0..self.len() as u32)
+            .filter(|&i| self.flags[i as usize] & HIDDEN_FROM_SEARCH == 0)
+            .map(|i| {
+                let f = self.flags[i as usize];
+                (
+                    self.full_path(i),
+                    f & FLAG_DIR != 0,
+                    self.size[i as usize],
+                    self.mtime[i as usize],
+                    f & (FLAG_HIDDEN | FLAG_SYSTEM | FLAG_CLOUD),
+                )
+            })
+            .collect()
+    }
+}

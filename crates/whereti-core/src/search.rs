@@ -131,7 +131,7 @@ impl NameIndex {
                 .into_par_iter()
                 .with_min_len(8192)
                 .map_init(Scratch::default, |s, i| {
-                    (self.flags[i as usize] & FLAG_ROOT == 0 && self.eval(&clauses, i, s)).then_some(i)
+                    (self.flags[i as usize] & HIDDEN_FROM_SEARCH == 0 && self.eval(&clauses, i, s)).then_some(i)
                 })
                 .flatten_iter()
                 .collect(),
@@ -204,8 +204,15 @@ impl NameIndex {
     }
 
     /// Folded name: the `alt` copy for non-ASCII names, lowercase on the fly otherwise.
-    fn folded_name<'a>(&'a self, i: u32, scratch: &'a mut Vec<u8>) -> &'a [u8] {
-        if self.flags[i as usize] & FLAG_NON_ASCII != 0 {
+    pub(crate) fn folded_name<'a>(&'a self, i: u32, scratch: &'a mut Vec<u8>) -> &'a [u8] {
+        let f = self.flags[i as usize];
+        if f & FLAG_TAIL != 0 {
+            let mut folded = String::new();
+            whereti_query::fold_into(self.tail_name(i), &mut folded);
+            scratch.clear();
+            scratch.extend_from_slice(folded.as_bytes());
+            scratch
+        } else if f & FLAG_NON_ASCII != 0 {
             self.alt_name(i)
         } else {
             scratch.clear();
@@ -216,7 +223,10 @@ impl NameIndex {
 
     /// Every entry whose folded name contains `needle`, in index order.
     fn scan_names(&self, needle: &str) -> Vec<u32> {
-        let n = self.len();
+        // Entries added by live updates have no base name; they are in the tail.
+        let n = self.name_off.len() - 1;
+        const SKIP_BASE: u16 = FLAG_NON_ASCII | FLAG_TAIL | HIDDEN_FROM_SEARCH;
+        const SKIP_ALT: u16 = FLAG_TAIL | HIDDEN_FROM_SEARCH;
         let parts = (rayon::current_num_threads() * 8).max(1);
         let per = n.div_ceil(parts).max(1);
         let ranges: Vec<(usize, usize)> = (0..n).step_by(per).map(|a| (a, (a + per).min(n))).collect();
@@ -239,7 +249,7 @@ impl NameIndex {
                         while self.name_off[e + 1] as usize <= m.start() {
                             e += 1;
                         }
-                        if self.flags[e] & (FLAG_NON_ASCII | FLAG_ROOT) == 0 {
+                        if self.flags[e] & SKIP_BASE == 0 {
                             out.push(e as u32);
                         }
                         pos = self.name_off[e + 1] as usize; // next name
@@ -273,7 +283,10 @@ impl NameIndex {
                         while self.alt_off[k + 1] as usize <= at {
                             k += 1;
                         }
-                        out.push(self.alt_entry[k]);
+                        let e = self.alt_entry[k];
+                        if self.flags[e as usize] & SKIP_ALT == 0 {
+                            out.push(e);
+                        }
                         pos = self.alt_off[k + 1] as usize;
                     }
                     out
@@ -281,7 +294,28 @@ impl NameIndex {
                 .collect::<Vec<_>>()
                 .concat()
         };
-        merge_sorted(primary, alt)
+        let mut hits = merge_sorted(primary, alt);
+
+        // Names renamed or added by live updates (a small list).
+        if !self.tail_entry.is_empty() {
+            let mut folded = String::new();
+            let mut extra: Vec<u32> = Vec::new();
+            for (k, &e) in self.tail_entry.iter().enumerate() {
+                if self.tail_of.get(&e) != Some(&(k as u32))
+                    || self.flags[e as usize] & HIDDEN_FROM_SEARCH != 0
+                {
+                    continue;
+                }
+                folded.clear();
+                whereti_query::fold_into(&self.tail_names[k], &mut folded);
+                if finder.find(folded.as_bytes()).is_some() {
+                    extra.push(e);
+                }
+            }
+            extra.sort_unstable();
+            hits = merge_sorted(hits, extra);
+        }
+        hits
     }
 
     /// Ranks all hits and returns the best `opts.limit`, in order.

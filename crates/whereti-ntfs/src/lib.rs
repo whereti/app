@@ -9,6 +9,7 @@
 #![cfg(windows)]
 
 pub mod compare;
+pub mod journal;
 pub mod mft;
 pub mod parse;
 pub mod usn_enum;

@@ -10,6 +10,8 @@ use std::time::{Duration, Instant};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 mod index_cmd;
+mod inspect_cmd;
+mod live_cmd;
 mod search_cmd;
 use whereti_ntfs::compare::{self, Diff};
 use whereti_ntfs::mft::{self, MftScan};
@@ -31,6 +33,14 @@ enum Cmd {
     Index(index_cmd::IndexArgs),
     /// Search the saved index
     Search(search_cmd::SearchArgs),
+    /// Bring the saved index up to date from the USN journal (Administrator)
+    Update(live_cmd::UpdateArgs),
+    /// Follow file changes live and keep the index current (Administrator)
+    Watch(live_cmd::WatchArgs),
+    /// Check that saved index + journal replay equals a fresh scan (Administrator)
+    Verify(live_cmd::VerifyArgs),
+    /// Show what Windows, the MFT and the index say about one path (Administrator)
+    Inspect(inspect_cmd::InspectArgs),
 }
 
 #[derive(Args)]
@@ -64,6 +74,10 @@ fn main() -> ExitCode {
         Cmd::Scan(args) => scan(args),
         Cmd::Index(args) => index_cmd::run(args).map(|_| ExitCode::SUCCESS),
         Cmd::Search(args) => search_cmd::run(args).map(|_| ExitCode::SUCCESS),
+        Cmd::Update(args) => live_cmd::update(args).map(|_| ExitCode::SUCCESS),
+        Cmd::Watch(args) => live_cmd::watch(args).map(|_| ExitCode::SUCCESS),
+        Cmd::Verify(args) => live_cmd::verify(args).map(|_| ExitCode::SUCCESS),
+        Cmd::Inspect(args) => inspect_cmd::run(args).map(|_| ExitCode::SUCCESS),
     };
     match result {
         Ok(code) => code,

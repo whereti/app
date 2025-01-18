@@ -36,38 +36,15 @@ pub fn run(args: IndexArgs) -> Result<(), String> {
     if letters.is_empty() {
         return Err("no volumes to index".into());
     }
-    let threads = args
-        .threads
-        .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(8));
+    let threads = args.threads.unwrap_or_else(default_threads);
     let path = args.index.unwrap_or_else(default_index_path);
     let total = Instant::now();
 
     let mut scans = Vec::new();
     for letter in letters {
-        let vol = match Volume::open(letter, true) {
-            Ok(v) => v,
-            Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
-                println!("  {letter}:  skipped ({e})");
-                continue;
-            }
-            Err(e) => return Err(open_error(letter, e)),
-        };
-        // Journal position BEFORE the scan: replay starts here (PLAN.md §4.1).
-        let journal = vol.query_usn_journal().ok();
-        let t = Instant::now();
-        let scan = mft::scan(&vol, threads).map_err(|e| format!("{letter}: scan failed: {e}"))?;
-        println!(
-            "  {letter}:  scanned {} entries in {}",
-            num(scan.entries.len() as u64),
-            dur(t.elapsed())
-        );
-        scans.push(VolumeScan {
-            letter,
-            serial: vol.ntfs.volume_serial_number as u64,
-            journal_id: journal.map(|j| j.usn_journal_id).unwrap_or(0),
-            next_usn: journal.map(|j| j.next_usn).unwrap_or(0),
-            scan,
-        });
+        if let Some(scan) = scan_volume(letter, threads)? {
+            scans.push(scan);
+        }
     }
 
     let windows_dir = (!args.include_windows).then(|| std::env::var("SystemRoot").ok()).flatten();
@@ -94,6 +71,34 @@ pub fn run(args: IndexArgs) -> Result<(), String> {
     println!("  total    {}", dur(total.elapsed()));
     print_memory();
     Ok(())
+}
+
+/// Full MFT scan of one volume. `Ok(None)` if it is not NTFS.
+pub(crate) fn scan_volume(letter: char, threads: usize) -> Result<Option<VolumeScan>, String> {
+    let vol = match Volume::open(letter, true) {
+        Ok(v) => v,
+        Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
+            println!("  {letter}:  skipped ({e})");
+            return Ok(None);
+        }
+        Err(e) => return Err(open_error(letter, e)),
+    };
+    // Journal position BEFORE the scan: replay starts here (PLAN.md §4.1).
+    let journal = vol.query_usn_journal().ok();
+    let t = Instant::now();
+    let scan = mft::scan(&vol, threads).map_err(|e| format!("{letter}: scan failed: {e}"))?;
+    println!("  {letter}:  scanned {} entries in {}", num(scan.entries.len() as u64), dur(t.elapsed()));
+    Ok(Some(VolumeScan {
+        letter,
+        serial: vol.ntfs.volume_serial_number as u64,
+        journal_id: journal.map(|j| j.usn_journal_id).unwrap_or(0),
+        next_usn: journal.map(|j| j.next_usn).unwrap_or(0),
+        scan,
+    }))
+}
+
+pub(crate) fn default_threads() -> usize {
+    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(8)
 }
 
 pub fn default_index_path() -> PathBuf {

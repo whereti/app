@@ -32,6 +32,8 @@ pub struct MftEntry {
     pub name_len: u16,
     pub seq: u16,
     pub is_dir: bool,
+    /// This entry is a DOS 8.3 name (kept only when no long name exists).
+    pub dos_name: bool,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -96,10 +98,11 @@ struct ChunkResult {
     first_record: u64,
     scan: MftScan,
     extensions: Vec<RecordInfo>,
+    /// Base records whose names are all in extension records.
+    nameless: Vec<RecordInfo>,
     base_records: u64,
     corrupt: u64,
     unused: u64,
-    without_name: u64,
 }
 
 pub fn scan(vol: &Volume, threads: usize) -> io::Result<MftScan> {
@@ -180,11 +183,12 @@ pub fn scan(vol: &Volume, threads: usize) -> io::Result<MftScan> {
         stats: MftStats::default(),
     };
     let mut extensions = Vec::new();
+    let mut nameless = Vec::new();
     for r in results {
         stats.corrupt_records += r.corrupt;
         stats.unused_records += r.unused;
         stats.base_records += r.base_records;
-        stats.records_without_name += r.without_name;
+        nameless.extend(r.nameless);
         let base = out.names.len() as u32;
         out.names.extend_from_slice(&r.scan.names);
         out.entries.extend(r.scan.entries.into_iter().map(|mut e| {
@@ -198,14 +202,14 @@ pub fn scan(vol: &Volume, threads: usize) -> io::Result<MftScan> {
 
     // 4. Names stored in extension records (files with many hard links) become
     //    extra entries of their base record.
-    if !extensions.is_empty() {
-        merge_extensions(&mut out, extensions);
-    }
+    stats.records_without_name = merge_extensions(&mut out, extensions, &nameless);
     out.stats = stats;
     Ok(out)
 }
 
-fn merge_extensions(out: &mut MftScan, extensions: Vec<RecordInfo>) {
+/// Adds names stored in extension records. Returns how many base records
+/// still have no name at all.
+fn merge_extensions(out: &mut MftScan, extensions: Vec<RecordInfo>, nameless: &[RecordInfo]) -> u64 {
     let wanted: HashSet<u64> = extensions.iter().map(|e| e.base).collect();
     let mut first: HashMap<u64, usize> = HashMap::with_capacity(wanted.len());
     for (i, e) in out.entries.iter().enumerate() {
@@ -217,10 +221,41 @@ fn merge_extensions(out: &mut MftScan, extensions: Vec<RecordInfo>) {
     for e in out.entries.iter().filter(|e| wanted.contains(&e.record)) {
         existing.insert((e.record, e.parent, out.name(e).as_bytes().to_vec()));
     }
+    // Records whose long name lives in an extension record: their base held
+    // only the DOS 8.3 name, which must not appear as a second entry.
+    let mut has_long: HashSet<u64> = HashSet::new();
+    // Base records with no name of their own (all names in extension records).
+    let orphans: HashMap<u64, MftEntry> = nameless
+        .iter()
+        .map(|b| {
+            let std = b.std.unwrap_or_default();
+            let e = MftEntry {
+                record: b.index,
+                seq: b.seq,
+                is_dir: b.is_dir(),
+                attributes: std.attributes,
+                size: if b.is_dir() { 0 } else { b.data_size.unwrap_or(0) },
+                modified: std.modified,
+                ..Default::default()
+            };
+            (b.index, e)
+        })
+        .collect();
+    let mut named_orphans: HashSet<u64> = HashSet::new();
     for ext in extensions {
-        let Some(&bi) = first.get(&ext.base) else { continue };
-        let template = out.entries[bi];
+        let mut template = match first.get(&ext.base) {
+            Some(&bi) => out.entries[bi],
+            None => match orphans.get(&ext.base) {
+                Some(t) => {
+                    named_orphans.insert(ext.base);
+                    *t
+                }
+                None => continue,
+            },
+        };
+        template.dos_name = false;
         for n in ext.names.iter().filter(|n| n.namespace != NS_DOS) {
+            has_long.insert(ext.base);
             let parent = n.parent_ref & FRN_MASK;
             if !existing.insert((ext.base, parent, n.name.as_bytes().to_vec())) {
                 continue;
@@ -233,6 +268,10 @@ fn merge_extensions(out: &mut MftScan, extensions: Vec<RecordInfo>) {
             out.push(e, &n.name);
         }
     }
+    if !has_long.is_empty() {
+        out.entries.retain(|e| !(e.dos_name && has_long.contains(&e.record)));
+    }
+    (orphans.len() - named_orphans.len()) as u64
 }
 
 /// Streams the MFT as fixed-size chunks of whole records. Returns bytes read.
@@ -309,7 +348,7 @@ fn parse_chunk(chunk: &mut Chunk, rs: usize) -> ChunkResult {
             ParseOutcome::Record(info) if info.is_base() => {
                 res.base_records += 1;
                 if !push_base(&mut res.scan, &info) {
-                    res.without_name += 1;
+                    res.nameless.push(info);
                 }
             }
             ParseOutcome::Record(info) => res.extensions.push(info),
@@ -341,6 +380,7 @@ fn push_base(scan: &mut MftScan, info: &RecordInfo) -> bool {
                 seq: info.seq,
                 parent: n.parent_ref & FRN_MASK,
                 is_dir: info.is_dir(),
+                dos_name: n.namespace == NS_DOS,
                 attributes: std.attributes,
                 size: if info.is_dir() { 0 } else { info.data_size.unwrap_or(0) },
                 modified: std.modified,
@@ -402,10 +442,47 @@ mod tests {
             names: vec![name(5, NS_WIN32, "a.dll"), name(12, NS_WIN32, "a.dll")],
             ..Default::default()
         };
-        merge_extensions(&mut scan, vec![ext]);
+        merge_extensions(&mut scan, vec![ext], &[]);
         assert_eq!(scan.entries.len(), 2);
         assert_eq!(scan.entries[1].parent, 12);
         assert_eq!(scan.entries[1].size, 99);
+    }
+
+    #[test]
+    fn long_name_in_extension_replaces_the_dos_name() {
+        // Base record has only "CUSTOM~1"; the long name is in an extension record.
+        let base = RecordInfo { index: 991, base: 991, names: vec![name(545, NS_DOS, "CUSTOM~1")], ..Default::default() };
+        let mut scan = MftScan::default();
+        assert!(push_base(&mut scan, &base));
+        let ext = RecordInfo { index: 4000, base: 991, names: vec![name(545, NS_WIN32, "CustomDestinations")], ..Default::default() };
+        merge_extensions(&mut scan, vec![ext], &[]);
+        let names: Vec<&str> = scan.entries.iter().map(|e| scan.name(e)).collect();
+        assert_eq!(names, vec!["CustomDestinations"]);
+    }
+
+    #[test]
+    fn base_without_names_gets_them_from_extensions() {
+        // Many hard links: every name lives in extension records.
+        let base = RecordInfo {
+            index: 70,
+            base: 70,
+            data_size: Some(1234),
+            std: Some(crate::parse::StdInfo { modified: 99, attributes: 0x20 }),
+            ..Default::default()
+        };
+        let mut scan = MftScan::default();
+        assert!(!push_base(&mut scan, &base));
+        let ext = RecordInfo {
+            index: 900,
+            base: 70,
+            names: vec![name(10, NS_WIN32, "icon.png"), name(11, NS_WIN32, "icon.png")],
+            ..Default::default()
+        };
+        let unresolved = merge_extensions(&mut scan, vec![ext], &[base]);
+        assert_eq!(unresolved, 0);
+        assert_eq!(scan.entries.len(), 2);
+        assert_eq!(scan.entries[0].size, 1234);
+        assert_eq!(scan.entries[1].modified, 99);
     }
 
     #[test]
