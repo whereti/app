@@ -19,7 +19,7 @@ const RECYCLE: u64 = 40;
 const PROTECTED: [u64; 4] = [ROOT, WINDOWS, RECYCLE, USERS];
 
 #[derive(Clone, Debug)]
-struct Rec {
+pub(crate) struct Rec {
     is_dir: bool,
     size: u64,
     modified: u64,
@@ -27,12 +27,12 @@ struct Rec {
     links: Vec<(u64, String)>,
 }
 
-struct Model {
-    recs: BTreeMap<u64, Rec>,
+pub(crate) struct Model {
+    pub(crate) recs: BTreeMap<u64, Rec>,
     next: u64,
     rng: u64,
-    changed: Vec<u64>,
-    created: HashSet<u64>,
+    pub(crate) changed: Vec<u64>,
+    pub(crate) created: HashSet<u64>,
     log: Vec<String>,
 }
 
@@ -52,7 +52,7 @@ impl RecordSource for Model {
 const MINUTE: u64 = 600_000_000;
 
 impl Model {
-    fn new(seed: u64) -> Self {
+    pub(crate) fn new(seed: u64) -> Self {
         let mut m = Model {
             recs: BTreeMap::new(),
             next: 100,
@@ -77,7 +77,7 @@ impl Model {
         m
     }
 
-    fn rand(&mut self, n: usize) -> usize {
+    pub(crate) fn rand(&mut self, n: usize) -> usize {
         self.rng ^= self.rng << 13;
         self.rng ^= self.rng >> 7;
         self.rng ^= self.rng << 17;
@@ -160,7 +160,7 @@ impl Model {
         self.changed.push(r);
     }
 
-    fn step(&mut self) {
+    pub(crate) fn step(&mut self) {
         let op = self.rand(11);
         match op {
             0 | 1 => {
@@ -273,7 +273,7 @@ fn exclusions() -> Exclusions {
     Exclusions::defaults(Some(r"C:\Windows"))
 }
 
-fn fresh(model: &Model) -> NameIndex {
+pub(crate) fn fresh(model: &Model) -> NameIndex {
     build(vec![VolumeScan { letter: 'C', serial: 1, journal_id: 1, next_usn: 0, scan: model.scan() }], &exclusions()).0
 }
 

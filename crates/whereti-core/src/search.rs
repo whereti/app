@@ -68,15 +68,15 @@ struct Clause {
     any: Vec<Matcher>,
 }
 
-/// Scratch buffers reused across entries by one thread.
+/// Scratch buffer reused across entries by one thread.
 #[derive(Default)]
 struct Scratch {
     name: Vec<u8>,
-    path: Vec<u8>,
 }
 
 impl NameIndex {
     pub fn search(&self, query: &Query, opts: &SearchOptions) -> SearchResults {
+        let t0 = std::time::Instant::now();
         let mut warnings = Vec::new();
         let mut clauses: Vec<Clause> = query
             .clauses
@@ -110,6 +110,7 @@ impl NameIndex {
             _ => None,
         });
 
+        let t_compile = t0.elapsed();
         let candidates: Option<Vec<u32>> = driver.as_ref().map(|(ci, needle, covered)| {
             if *covered {
                 clauses.remove(*ci);
@@ -117,8 +118,10 @@ impl NameIndex {
             self.scan_names(needle)
         });
 
-        let hits: Vec<u32> = match &candidates {
-            Some(c) if clauses.is_empty() => c.clone(),
+        let t_scan = t0.elapsed();
+        let candidate_count = candidates.as_ref().map_or(0, Vec::len);
+        let hits: Vec<u32> = match candidates {
+            Some(c) if clauses.is_empty() => c,
             Some(c) => c
                 .par_chunks(8192)
                 .map(|chunk| {
@@ -137,8 +140,21 @@ impl NameIndex {
                 .collect(),
         };
 
+        let t_eval = t0.elapsed();
         let total = hits.len();
         let hits = self.top(hits, opts, rank_needle.as_deref());
+        if trace_enabled() {
+            let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+            eprintln!(
+                "[trace] compile {:.2} ms · scan {:.2} ms ({} candidates) · filter {:.2} ms · rank {:.2} ms · {} hits",
+                ms(t_compile),
+                ms(t_scan - t_compile),
+                candidate_count,
+                ms(t_eval - t_scan),
+                ms(t0.elapsed() - t_eval),
+                total
+            );
+        }
         SearchResults { total, hits, warnings }
     }
 
@@ -189,11 +205,7 @@ impl NameIndex {
             }
             Matcher::Regex(re) => re.is_match(self.name(i)),
             Matcher::Ext(table) => table.get(self.ext[iu] as usize).copied().unwrap_or(false),
-            Matcher::Path(p) => {
-                let Scratch { name, path } = s;
-                let folded = self.folded_name(i, name);
-                p.matches(self, i, folded, path)
-            }
+            Matcher::Path(p) => p.matches(self, i, &mut s.name),
             Matcher::Size(lo, hi) => !self.is_dir(i) && (*lo..=*hi).contains(&self.size[iu]),
             Matcher::Modified(lo, hi) => (*lo..=*hi).contains(&self.mtime[iu]),
             Matcher::Folders => self.is_dir(i),
@@ -324,20 +336,70 @@ impl NameIndex {
         if limit == 0 {
             return Vec::new();
         }
-        let needle = needle.map(str::as_bytes);
-        let mut keyed: Vec<(u64, u32, u32)> = hits
-            .par_iter()
-            .with_min_len(4096)
-            .map_init(Vec::new, |scratch, &i| {
-                let primary = match opts.sort {
-                    SortBy::Relevance => self.relevance(i, needle, scratch),
-                    SortBy::Name => 0,
-                    SortBy::Size => u64::MAX - self.size[i as usize],
-                    SortBy::Modified => (u32::MAX - self.mtime[i as usize]) as u64,
+        let rank = |i: u32| self.name_rank[i as usize];
+        let mut keyed: Vec<(u64, u32, u32)> = match opts.sort {
+            SortBy::Relevance | SortBy::Name => {
+                // The order is (score, alphabetical rank). Put every hit in a
+                // bucket by score and by the top bits of its rank, count the
+                // buckets, and fully order only the hits in the buckets that
+                // can reach the top `limit` — thousands, not millions.
+                let needle = needle.map(str::as_bytes);
+                let relevance = opts.sort == SortBy::Relevance;
+                let shift = (32 - (self.len().max(1) as u32).leading_zeros()).saturating_sub(8);
+                let bucket = |i: u32| -> u16 {
+                    let score = if relevance { self.relevance(i, needle) as u16 } else { 0 };
+                    (score << 8) | (rank(i) >> shift).min(255) as u16
                 };
-                (primary, self.name_rank[i as usize], i)
-            })
-            .collect();
+                let buckets: Vec<u16> = hits.par_iter().with_min_len(8192).map(|&i| bucket(i)).collect();
+                let count = buckets
+                    .par_chunks(1 << 16)
+                    .map(|c| {
+                        let mut h = vec![0u32; 1 << 16];
+                        for &b in c {
+                            h[b as usize] += 1;
+                        }
+                        h
+                    })
+                    .reduce(|| vec![0u32; 1 << 16], |mut a, b| {
+                        a.iter_mut().zip(b).for_each(|(x, y)| *x += y);
+                        a
+                    });
+                let mut cutoff = u16::MAX;
+                let mut acc = 0usize;
+                for (b, &c) in count.iter().enumerate() {
+                    acc += c as usize;
+                    if acc >= limit {
+                        cutoff = b as u16;
+                        break;
+                    }
+                }
+                hits.iter()
+                    .zip(&buckets)
+                    .filter(|(_, &b)| b <= cutoff)
+                    .map(|(&i, &b)| ((b >> 8) as u64, rank(i), i))
+                    .collect()
+            }
+            SortBy::Size | SortBy::Modified => {
+                // Largest / newest first. Find the key of the limit-th hit on a
+                // compact list of keys, then order only the hits up to it.
+                let key = |i: u32| match opts.sort {
+                    SortBy::Size => u64::MAX - self.size[i as usize],
+                    _ => (u32::MAX - self.mtime[i as usize]) as u64,
+                };
+                let keys: Vec<u64> = hits.par_iter().with_min_len(8192).map(|&i| key(i)).collect();
+                let threshold = if keys.len() > limit {
+                    let mut tmp = keys.clone();
+                    *tmp.select_nth_unstable(limit - 1).1
+                } else {
+                    u64::MAX
+                };
+                hits.iter()
+                    .zip(&keys)
+                    .filter(|(_, &k)| k <= threshold)
+                    .map(|(&i, &k)| (k, rank(i), i))
+                    .collect()
+            }
+        };
         if keyed.len() > limit {
             keyed.select_nth_unstable(limit - 1);
             keyed.truncate(limit);
@@ -346,18 +408,32 @@ impl NameIndex {
         keyed.into_iter().map(|(_, _, i)| i).collect()
     }
 
-    fn relevance(&self, i: u32, needle: Option<&[u8]>, scratch: &mut Vec<u8>) -> u64 {
+    /// 0 = exact name, 1 = name starts with the word, 2 = a word in the name
+    /// starts with it, 3 = anywhere; +4 hidden/system, +8 cache/build folder.
+    /// Compares in place (no copy): the needle is folded, ASCII names are
+    /// compared ignoring case, other names through their folded copy.
+    fn relevance(&self, i: u32, needle: Option<&[u8]>) -> u8 {
         let f = self.flags[i as usize];
         let hidden = if f & (FLAG_HIDDEN | FLAG_SYSTEM) != 0 { 4 } else { 0 };
         let noise = if f & FLAG_NOISE != 0 { 8 } else { 0 };
         let penalty = hidden + noise;
         let Some(needle) = needle else { return penalty };
-        let name = self.folded_name(i, scratch);
-        let score = if name == needle {
+        let mut scratch = Vec::new();
+        let name: &[u8] = if f & FLAG_TAIL != 0 {
+            self.folded_name(i, &mut scratch)
+        } else if f & FLAG_NON_ASCII != 0 {
+            self.alt_name(i)
+        } else {
+            self.base_name(i)
+        };
+        let n = needle.len();
+        let score = if name.eq_ignore_ascii_case(needle) {
             0
-        } else if name.starts_with(needle) {
+        } else if name.len() >= n && name[..n].eq_ignore_ascii_case(needle) {
             1
-        } else if memchr::memmem::find_iter(name, needle).any(|p| !name[p - 1].is_ascii_alphanumeric()) {
+        } else if (1..name.len().saturating_sub(n) + 1)
+            .any(|p| !name[p - 1].is_ascii_alphanumeric() && name[p..p + n].eq_ignore_ascii_case(needle))
+        {
             2
         } else {
             3
@@ -366,64 +442,112 @@ impl NameIndex {
     }
 }
 
+/// Set `WT_TRACE=1` to print how long each search phase takes.
+fn trace_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("WT_TRACE").is_some())
+}
+
 /// `path:` matching without building paths (PLAN.md §4.3).
 ///
 /// For every folder (parents first) we keep only whether its path already
 /// matched and the last `k = len(pattern) - 1` bytes of its path. A match
 /// either lies inside the parent's path or crosses into this name, and the
 /// crossing part is at most `k` bytes of the parent's path.
+///
+/// Folders of one tree level depend only on the level above, so each level is
+/// computed in parallel. Files need no string work at all: a file matches if
+/// its folder matched, or (pattern `head\last`) if its folder's path ends with
+/// `head` and its name starts with `last`.
 struct PathMatcher {
     finder: Finder<'static>,
-    k: usize,
+    /// Pattern before its last `\`, and after it. `head` is None without a `\`.
+    head: Option<Vec<u8>>,
+    last: Vec<u8>,
     slot: Vec<u32>,
     hit: Vec<bool>,
-    tails: Vec<u8>,
-    tail_len: Vec<u16>,
+    ends_head: Vec<bool>,
 }
 
 impl PathMatcher {
     fn new(idx: &NameIndex, pattern: &str) -> Self {
-        let k = pattern.len().saturating_sub(1).min(u16::MAX as usize);
-        let dirs = idx.dir_order.len();
-        let mut pm = PathMatcher {
-            finder: Finder::new(pattern.as_bytes()).into_owned(),
-            k,
-            slot: vec![u32::MAX; idx.len()],
-            hit: vec![false; dirs],
-            tails: vec![0; dirs * k],
-            tail_len: vec![0; dirs],
+        let p = pattern.as_bytes();
+        // bytes of each folder's path kept while walking the tree
+        let stride = p.len().saturating_sub(1).clamp(1, u16::MAX as usize);
+        let (head, last) = match p.iter().rposition(|&b| b == b'\\') {
+            Some(at) => (Some(p[..at].to_vec()), p[at + 1..].to_vec()),
+            None => (None, p.to_vec()),
         };
-        let mut buf = Vec::new();
-        let mut name = Vec::new();
-        for (s, &d) in idx.dir_order.iter().enumerate() {
-            pm.slot[d as usize] = s as u32;
-            buf.clear();
-            let mut parent_hit = false;
-            if idx.flags[d as usize] & FLAG_ROOT != 0 {
-                buf.extend(fold(&idx.volume_of(d).letter().to_string()).bytes());
-                buf.push(b':');
-            } else {
-                if let Some(ps) = idx.parent(d).map(|p| pm.slot[p as usize]).filter(|&ps| ps != u32::MAX) {
-                    buf.extend_from_slice(pm.tail(ps));
-                    parent_hit = pm.hit[ps as usize];
-                }
-                buf.push(b'\\');
-                buf.extend_from_slice(idx.folded_name(d, &mut name));
-            }
-            pm.hit[s] = parent_hit || pm.finder.find(&buf).is_some();
-            let t = &buf[buf.len().saturating_sub(k)..];
-            pm.tails[s * k..s * k + t.len()].copy_from_slice(t);
-            pm.tail_len[s] = t.len() as u16;
+        let order = &idx.dir_order;
+        let dirs = order.len();
+        let mut slot = vec![u32::MAX; idx.len()];
+        for (s, &d) in order.iter().enumerate() {
+            slot[d as usize] = s as u32;
         }
-        pm
+        // Level boundaries: a new level starts at the first folder whose parent
+        // is in the current level, so every parent is in an earlier level.
+        let mut levels = vec![0usize];
+        for (s, &d) in order.iter().enumerate() {
+            let ps = idx.parent(d).map_or(u32::MAX, |p| slot[p as usize]);
+            if ps != u32::MAX && ps as usize >= *levels.last().unwrap() {
+                levels.push(s);
+            }
+        }
+        levels.push(dirs);
+
+        let finder = Finder::new(p).into_owned();
+        let mut hit = vec![false; dirs];
+        let mut ends_head = vec![false; dirs];
+        let mut tails = vec![0u8; dirs * stride];
+        let mut tail_len = vec![0u16; dirs];
+        for w in levels.windows(2) {
+            let (lo, hi) = (w[0], w[1]);
+            if lo == hi {
+                continue;
+            }
+            let (done_hit, cur_hit) = hit.split_at_mut(lo);
+            let (_, cur_ends) = ends_head.split_at_mut(lo);
+            let (done_tails, cur_tails) = tails.split_at_mut(lo * stride);
+            let (done_len, cur_len) = tail_len.split_at_mut(lo);
+            let (done_hit, done_tails, done_len) = (&*done_hit, &*done_tails, &*done_len);
+            cur_tails[..(hi - lo) * stride]
+                .par_chunks_mut(stride)
+                .zip(cur_hit[..hi - lo].par_iter_mut())
+                .zip(cur_ends[..hi - lo].par_iter_mut())
+                .zip(cur_len[..hi - lo].par_iter_mut())
+                .enumerate()
+                .with_min_len(256)
+                .for_each_init(
+                    || (Vec::new(), Vec::new()),
+                    |(buf, name), (j, (((tail, h), e), len))| {
+                        let d = order[lo + j];
+                        buf.clear();
+                        let mut parent_hit = false;
+                        if idx.flags[d as usize] & FLAG_ROOT != 0 {
+                            buf.extend(fold(&idx.volume_of(d).letter().to_string()).bytes());
+                            buf.push(b':');
+                        } else {
+                            let ps = idx.parent(d).map_or(u32::MAX, |p| slot[p as usize]);
+                            if ps != u32::MAX {
+                                let ps = ps as usize;
+                                buf.extend_from_slice(&done_tails[ps * stride..ps * stride + done_len[ps] as usize]);
+                                parent_hit = done_hit[ps];
+                            }
+                            buf.push(b'\\');
+                            buf.extend_from_slice(idx.folded_name(d, name));
+                        }
+                        *h = parent_hit || finder.find(buf).is_some();
+                        *e = head.as_ref().is_some_and(|hd| buf.ends_with(hd));
+                        let t = &buf[buf.len().saturating_sub(stride)..];
+                        tail[..t.len()].copy_from_slice(t);
+                        *len = t.len() as u16;
+                    },
+                );
+        }
+        PathMatcher { finder, head, last, slot, hit, ends_head }
     }
 
-    fn tail(&self, s: u32) -> &[u8] {
-        let s = s as usize;
-        &self.tails[s * self.k..s * self.k + self.tail_len[s] as usize]
-    }
-
-    fn matches(&self, idx: &NameIndex, i: u32, folded_name: &[u8], buf: &mut Vec<u8>) -> bool {
+    fn matches(&self, idx: &NameIndex, i: u32, scratch: &mut Vec<u8>) -> bool {
         if idx.is_dir(i) {
             let s = self.slot[i as usize];
             return s != u32::MAX && self.hit[s as usize];
@@ -431,14 +555,25 @@ impl PathMatcher {
         let Some(ps) = idx.parent(i).map(|p| self.slot[p as usize]).filter(|&s| s != u32::MAX) else {
             return false;
         };
-        if self.hit[ps as usize] {
+        let ps = ps as usize;
+        if self.hit[ps] {
             return true;
         }
-        buf.clear();
-        buf.extend_from_slice(self.tail(ps));
-        buf.push(b'\\');
-        buf.extend_from_slice(folded_name);
-        self.finder.find(buf).is_some()
+        match &self.head {
+            // the match crosses from the folder's path into the file name
+            Some(_) => self.ends_head[ps] && idx.folded_name(i, scratch).starts_with(&self.last),
+            // no `\` in the pattern: it is inside the folder path or inside the name
+            None => self.finder.find(idx.folded_name(i, scratch)).is_some(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl PathMatcher {
+    /// Reference implementation: build the full folded path and search it.
+    fn slow_matches(idx: &NameIndex, i: u32, pattern: &str) -> bool {
+        let path = fold(&idx.full_path(i));
+        path.contains(pattern)
     }
 }
 
@@ -464,4 +599,132 @@ fn merge_sorted(a: Vec<u32>, b: Vec<u32>) -> Vec<u32> {
     out.extend_from_slice(&b[j..]);
     out.dedup();
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tests_live::{fresh, Model};
+
+    /// An index that went through random live updates: renamed names in the
+    /// tail list, folders appended to `dir_order`, detached subtrees.
+    fn churned(seed: u64, batches: usize) -> NameIndex {
+        let mut m = Model::new(seed);
+        let mut idx = fresh(&m);
+        for _ in 0..batches {
+            for _ in 0..1 + m.rand(6) {
+                m.step();
+            }
+            let changed = std::mem::take(&mut m.changed);
+            let created = std::mem::take(&mut m.created);
+            if idx.apply(0, &changed, &created, &mut m).unwrap().needs_rescan {
+                idx = fresh(&m);
+            }
+        }
+        idx
+    }
+
+    fn searchable(idx: &NameIndex) -> Vec<u32> {
+        (0..idx.len() as u32).filter(|&i| idx.flags[i as usize] & HIDDEN_FROM_SEARCH == 0).collect()
+    }
+
+    #[test]
+    fn fast_path_matching_equals_building_every_path() {
+        let mut checked = 0;
+        for seed in 1..=25 {
+            let mut m = Model::new(seed * 7919);
+            let idx = churned(seed, 60);
+            let live = searchable(&idx);
+            for _ in 0..40 {
+                // a random piece of a real path, often crossing folder boundaries
+                let e = live[m.rand(live.len())];
+                let path: Vec<char> = fold(&idx.full_path(e)).chars().collect();
+                let a = m.rand(path.len());
+                let b = (a + 1 + m.rand(24)).min(path.len());
+                let pattern: String = path[a..b].iter().collect();
+                let pm = PathMatcher::new(&idx, &pattern);
+                let mut scratch = Vec::new();
+                for &i in &live {
+                    assert_eq!(
+                        pm.matches(&idx, i, &mut scratch),
+                        PathMatcher::slow_matches(&idx, i, &pattern),
+                        "seed {seed}, pattern {pattern:?}, entry {}",
+                        idx.full_path(i)
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 10_000);
+    }
+
+    /// The scoring as first written: fold a copy of the name, then compare.
+    fn reference_relevance(idx: &NameIndex, i: u32, needle: &[u8]) -> u8 {
+        let f = idx.flags[i as usize];
+        let penalty = if f & (FLAG_HIDDEN | FLAG_SYSTEM) != 0 { 4 } else { 0 } + if f & FLAG_NOISE != 0 { 8 } else { 0 };
+        let mut scratch = Vec::new();
+        let name = idx.folded_name(i, &mut scratch).to_vec();
+        let score = if name == needle {
+            0
+        } else if name.starts_with(needle) {
+            1
+        } else if memchr::memmem::find_iter(&name, needle).any(|p| p > 0 && !name[p - 1].is_ascii_alphanumeric()) {
+            2
+        } else {
+            3
+        };
+        score + penalty
+    }
+
+    #[test]
+    fn top_n_equals_a_full_sort() {
+        for seed in 1..=10 {
+            let idx = churned(seed, 120);
+            for needle in ["a", "ra", "raport", "masina", "data", ".txt", "(1)", "s"] {
+                let hits = idx.scan_names(needle);
+                let mut all: Vec<(u64, u32, u32)> = hits
+                    .iter()
+                    .map(|&i| {
+                        let sc = idx.relevance(i, Some(needle.as_bytes()));
+                        assert_eq!(sc, reference_relevance(&idx, i, needle.as_bytes()), "score of {}", idx.name(i));
+                        (sc as u64, idx.name_rank[i as usize], i)
+                    })
+                    .collect();
+                all.sort_unstable();
+                for limit in [1, 2, 3, 7, 50, 100_000] {
+                    let want: Vec<u32> = all.iter().take(limit).map(|k| k.2).collect();
+                    let opts = SearchOptions { limit, sort: SortBy::Relevance };
+                    assert_eq!(idx.top(hits.clone(), &opts, Some(needle)), want, "seed {seed}, {needle:?}, limit {limit}");
+                }
+            }
+            // no word to rank by (e.g. a path or ext: query), and alphabetical order
+            let hits = searchable(&idx);
+            for (sort, needle) in [
+                (SortBy::Relevance, None),
+                (SortBy::Name, None),
+                (SortBy::Name, Some("a")),
+                (SortBy::Size, None),
+                (SortBy::Modified, None),
+            ] {
+                let mut all: Vec<(u64, u32, u32)> = hits
+                    .iter()
+                    .map(|&i| {
+                        let k = match sort {
+                            SortBy::Relevance => idx.relevance(i, None) as u64,
+                            SortBy::Name => 0,
+                            SortBy::Size => u64::MAX - idx.size[i as usize],
+                            SortBy::Modified => (u32::MAX - idx.mtime[i as usize]) as u64,
+                        };
+                        (k, idx.name_rank[i as usize], i)
+                    })
+                    .collect();
+                all.sort_unstable();
+                for limit in [1, 5, 33, 100_000] {
+                    let want: Vec<u32> = all.iter().take(limit).map(|k| k.2).collect();
+                    let opts = SearchOptions { limit, sort };
+                    assert_eq!(idx.top(hits.clone(), &opts, needle), want, "seed {seed}, {sort:?}, limit {limit}");
+                }
+            }
+        }
+    }
 }
