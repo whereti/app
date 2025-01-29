@@ -35,8 +35,10 @@ enum Cmd {
     Search(search_cmd::SearchArgs),
     /// Bring the saved index up to date from the USN journal (Administrator)
     Update(live_cmd::UpdateArgs),
-    /// Follow file changes live and keep the index current (Administrator)
-    Watch(live_cmd::WatchArgs),
+    /// Run the index engine in the foreground and answer searches (Administrator)
+    Serve(ServeArgs),
+    /// Show what the whereti service is doing
+    Status(search_cmd::StatusArgs),
     /// Check that saved index + journal replay equals a fresh scan (Administrator)
     Verify(live_cmd::VerifyArgs),
     /// Show what Windows, the MFT and the index say about one path (Administrator)
@@ -68,6 +70,38 @@ enum Method {
     Usn,
 }
 
+#[derive(Args)]
+struct ServeArgs {
+    /// Index file (default: %ProgramData%\whereti\names.idx)
+    #[arg(long)]
+    index: Option<std::path::PathBuf>,
+    /// Stop after this many seconds (default: run until closed)
+    #[arg(long)]
+    seconds: Option<u64>,
+    /// Longest time between saves, in seconds, while something changes
+    /// (also saved on exit and when the journal moved a quarter of its size)
+    #[arg(long, default_value_t = 6 * 3600)]
+    save_every: u64,
+    /// Run the daily full-rescan check this often, in seconds (default: once a day)
+    #[arg(long)]
+    reconcile_every: Option<u64>,
+    /// Print every applied journal batch
+    #[arg(long)]
+    verbose: bool,
+}
+
+fn serve(args: ServeArgs) -> Result<(), String> {
+    let mut cfg = whereti_engine::Config { verbose: args.verbose, ..Default::default() };
+    if let Some(p) = args.index {
+        cfg.index_path = p;
+    }
+    cfg.save_every = Duration::from_secs(args.save_every.max(5));
+    if let Some(r) = args.reconcile_every {
+        cfg.reconcile_every = Some(Duration::from_secs(r.max(10)));
+    }
+    whereti_engine::run_foreground(cfg, args.seconds)
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.cmd {
@@ -75,7 +109,8 @@ fn main() -> ExitCode {
         Cmd::Index(args) => index_cmd::run(args).map(|_| ExitCode::SUCCESS),
         Cmd::Search(args) => search_cmd::run(args).map(|_| ExitCode::SUCCESS),
         Cmd::Update(args) => live_cmd::update(args).map(|_| ExitCode::SUCCESS),
-        Cmd::Watch(args) => live_cmd::watch(args).map(|_| ExitCode::SUCCESS),
+        Cmd::Serve(args) => serve(args).map(|_| ExitCode::SUCCESS),
+        Cmd::Status(args) => search_cmd::status(args).map(|_| ExitCode::SUCCESS),
         Cmd::Verify(args) => live_cmd::verify(args).map(|_| ExitCode::SUCCESS),
         Cmd::Inspect(args) => inspect_cmd::run(args).map(|_| ExitCode::SUCCESS),
     };

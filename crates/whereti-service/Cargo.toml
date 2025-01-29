@@ -1,0 +1,11 @@
+[package]
+name = "whereti-service"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+whereti-engine = { version = "0.0.1", path = "../whereti-engine" }
+whereti-ipc = { version = "0.0.1", path = "../whereti-ipc" }
+windows-service = "0.8.1"

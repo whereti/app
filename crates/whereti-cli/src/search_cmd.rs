@@ -1,11 +1,17 @@
-//! `wt search` — load the saved index (no admin rights needed) and search it.
+//! `wt search` and `wt status`.
+//!
+//! `wt search` asks the whereti service (named pipe, no admin rights needed).
+//! When the service is not running, or with `--index`, it loads the saved
+//! index itself.
 
 use std::path::PathBuf;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use clap::{Args, ValueEnum};
 use whereti_core::{snapshot, NameIndex, SearchOptions, SortBy};
-use whereti_query::{civil_from_day, parse, DateCtx};
+use whereti_engine::system::date_ctx;
+use whereti_ipc::{Client, Request, Response, Row, SearchRequest};
+use whereti_query::{civil_from_day, parse};
 
 use crate::index_cmd::default_index_path;
 use crate::{bytes, dur, num};
@@ -15,7 +21,7 @@ pub struct SearchArgs {
     /// What to look for, e.g. raport ext:pdf, "nume exact", *.jpg dm:today
     #[arg(required = true, num_args = 1..)]
     query: Vec<String>,
-    /// Index file (default: %LOCALAPPDATA%\whereti\names.idx)
+    /// Search this index file directly instead of asking the service
     #[arg(long)]
     index: Option<PathBuf>,
     /// How many results to show
@@ -37,20 +43,90 @@ enum Sort {
 }
 
 pub fn run(args: SearchArgs) -> Result<(), String> {
-    let path = args.index.unwrap_or_else(default_index_path);
-    let t = Instant::now();
-    let index = snapshot::load(&path).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            format!("no index at {} — run `wt index` from an Administrator terminal first", path.display())
-        } else {
-            format!("cannot load {}: {e} — run `wt index` again", path.display())
+    if args.index.is_none() {
+        match Client::connect(Duration::from_millis(500)) {
+            Ok(client) => return run_via_service(client, &args),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {} // service not running
+            Err(e) => return Err(format!("cannot talk to the whereti service: {e}")),
         }
+    }
+    run_local(&args)
+}
+
+fn run_via_service(mut client: Client, args: &SearchArgs) -> Result<(), String> {
+    let req = Request::Search(SearchRequest {
+        query: args.query.join(" "),
+        limit: args.limit as u32,
+        sort: match args.sort {
+            Sort::Relevance => whereti_ipc::Sort::Relevance,
+            Sort::Name => whereti_ipc::Sort::Name,
+            Sort::Size => whereti_ipc::Sort::Size,
+            Sort::Date => whereti_ipc::Sort::Modified,
+        },
+    });
+    let t = Instant::now();
+    let reply = match client.call(&req).map_err(|e| e.to_string())? {
+        Response::Search(r) => r,
+        Response::Error(e) => return Err(e),
+        other => return Err(format!("unexpected reply: {other:?}")),
+    };
+    let round_trip = t.elapsed();
+    let tz = date_ctx().tz_offset;
+    for w in &reply.warnings {
+        println!("note: {w}");
+    }
+    for r in &reply.rows {
+        print_row(r, tz);
+    }
+    println!();
+    println!(
+        "{} results · {} in the service, {} round trip (via the whereti service)",
+        num(reply.total),
+        dur_fine(Duration::from_micros(reply.micros)),
+        dur_fine(round_trip)
+    );
+    if let Some(n) = args.bench {
+        let mut service = Vec::new();
+        let mut total = Vec::new();
+        for _ in 0..n.max(1) {
+            let t = Instant::now();
+            if let Response::Search(r) = client.call(&req).map_err(|e| e.to_string())? {
+                service.push(Duration::from_micros(r.micros));
+            }
+            total.push(t.elapsed());
+        }
+        print_percentiles(&format!("bench ×{n} in service"), service);
+        print_percentiles(&format!("bench ×{n} round trip"), total);
+    }
+    Ok(())
+}
+
+fn print_row(r: &Row, tz: i32) {
+    let size = if r.is_dir { "<dir>".to_string() } else { bytes(r.size) };
+    println!("{size:>10}  {}  {}", local_time(r.modified, tz), r.path);
+}
+
+fn run_local(args: &SearchArgs) -> Result<(), String> {
+    let path = args.index.clone().unwrap_or_else(default_index_path);
+    let t = Instant::now();
+    let index = snapshot::load(&path).map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => {
+            format!("no index at {} — run `wt index` from an Administrator terminal first", path.display())
+        }
+        std::io::ErrorKind::PermissionDenied if args.index.is_some() => {
+            format!("{} is readable only by administrators", path.display())
+        }
+        std::io::ErrorKind::PermissionDenied => format!(
+            "the whereti service is not running, and {} is readable only by administrators — \
+             start the service (`whereti-service start`) or run `wt serve` as Administrator",
+            path.display()
+        ),
+        _ => format!("cannot load {}: {e} — run `wt index` again", path.display()),
     })?;
     let load_time = t.elapsed();
 
     let ctx = date_ctx();
-    let text = args.query.join(" ");
-    let query = parse(&text, &ctx);
+    let query = parse(&args.query.join(" "), &ctx);
     let opts = SearchOptions {
         limit: args.limit,
         sort: match args.sort {
@@ -69,8 +145,14 @@ pub fn run(args: SearchArgs) -> Result<(), String> {
         println!("note: {w}");
     }
     for &i in &results.hits {
-        let size = if index.is_dir(i) { "<dir>".to_string() } else { bytes(index.size(i)) };
-        println!("{size:>10}  {}  {}", local_time(index.modified(i), ctx.tz_offset), index.full_path(i));
+        let row = Row {
+            path: index.full_path(i),
+            is_dir: index.is_dir(i),
+            size: index.size(i),
+            modified: index.modified(i),
+            flags: index.flags(i),
+        };
+        print_row(&row, ctx.tz_offset);
     }
     println!();
     println!(
@@ -88,7 +170,7 @@ pub fn run(args: SearchArgs) -> Result<(), String> {
 }
 
 fn bench(index: &NameIndex, query: &whereti_query::Query, opts: &SearchOptions, n: usize) {
-    let mut times: Vec<Duration> = (0..n)
+    let times: Vec<Duration> = (0..n)
         .map(|_| {
             let t = Instant::now();
             let r = index.search(query, opts);
@@ -96,10 +178,17 @@ fn bench(index: &NameIndex, query: &whereti_query::Query, opts: &SearchOptions, 
             t.elapsed()
         })
         .collect();
+    print_percentiles(&format!("bench ×{n}"), times);
+}
+
+fn print_percentiles(label: &str, mut times: Vec<Duration>) {
+    if times.is_empty() {
+        return;
+    }
     times.sort_unstable();
     let pct = |p: f64| times[((times.len() - 1) as f64 * p).round() as usize];
     println!(
-        "bench ×{n}: min {} · p50 {} · p99 {} · max {}",
+        "{label}: min {} · p50 {} · p99 {} · max {}",
         dur_fine(times[0]),
         dur_fine(pct(0.5)),
         dur_fine(pct(0.99)),
@@ -107,17 +196,46 @@ fn bench(index: &NameIndex, query: &whereti_query::Query, opts: &SearchOptions, 
     );
 }
 
-/// Now and the local UTC offset, for `dm:today` & co.
-fn date_ctx() -> DateCtx {
-    use windows_sys::Win32::System::Time::{GetTimeZoneInformation, TIME_ZONE_INFORMATION};
-    const TIME_ZONE_ID_DAYLIGHT: u32 = 2;
-    let unix_min = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() / 60).unwrap_or(0);
-    let now = (unix_min + 134_774 * 1440) as u32;
-    // SAFETY: zeroed POD out-parameter.
-    let mut tz: TIME_ZONE_INFORMATION = unsafe { std::mem::zeroed() };
-    let id = unsafe { GetTimeZoneInformation(&mut tz) };
-    let bias = tz.Bias + if id == TIME_ZONE_ID_DAYLIGHT { tz.DaylightBias } else { tz.StandardBias };
-    DateCtx { now, tz_offset: -bias }
+#[derive(Args)]
+pub struct StatusArgs {
+    /// Also print the service's recent log lines
+    #[arg(long)]
+    log: bool,
+}
+
+/// `wt status` — what the service is doing.
+pub fn status(args: StatusArgs) -> Result<(), String> {
+    let mut client = Client::connect(Duration::from_millis(500)).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            "the whereti service is not running".to_string()
+        } else {
+            e.to_string()
+        }
+    })?;
+    let s = match client.call(&Request::Status).map_err(|e| e.to_string())? {
+        Response::Status(s) => s,
+        other => return Err(format!("unexpected reply: {other:?}")),
+    };
+    println!("state          {}", s.state);
+    println!("entries        {}", num(s.entries));
+    for v in &s.volumes {
+        println!("volume         {}:  journal position {}", v.letter, num(v.next_usn as u64));
+    }
+    println!("last change    {}", s.last_change_secs.map_or("none yet".into(), |x| format!("{x} s ago")));
+    println!("open files     {} (re-read every 30 s until closed)", num(s.open_files));
+    println!(
+        "uptime         {} s · CPU used {} · memory {}",
+        s.uptime_secs,
+        dur(Duration::from_millis(s.cpu_ms)),
+        bytes(s.private_bytes)
+    );
+    if args.log {
+        println!();
+        for line in &s.recent_log {
+            println!("{line}");
+        }
+    }
+    Ok(())
 }
 
 fn local_time(minutes_utc: u32, tz_offset: i32) -> String {
