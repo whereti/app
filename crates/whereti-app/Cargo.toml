@@ -1,0 +1,18 @@
+[package]
+name = "whereti-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+eframe = { version = "0.37.0", default-features = false, features = ["accesskit", "clipboard", "default_fonts", "glow"] }
+global-hotkey = "0.9.0"
+tray-icon = "0.26.1"
+whereti-ipc = { version = "0.0.1", path = "../whereti-ipc" }
+whereti-query = { version = "0.0.1", path = "../whereti-query" }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_System_Time", "Win32_System_Threading"] }
+
+[[bin]]
+name = "whereti"
+path = "src/main.rs"
