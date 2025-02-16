@@ -39,6 +39,8 @@ enum Cmd {
     Serve(ServeArgs),
     /// Show what the whereti service is doing
     Status(search_cmd::StatusArgs),
+    /// List, add or remove paths the index leaves out (through the service)
+    Exclusions(search_cmd::ExclusionsArgs),
     /// Check that saved index + journal replay equals a fresh scan (Administrator)
     Verify(live_cmd::VerifyArgs),
     /// Show what Windows, the MFT and the index say about one path (Administrator)
@@ -111,6 +113,7 @@ fn main() -> ExitCode {
         Cmd::Update(args) => live_cmd::update(args).map(|_| ExitCode::SUCCESS),
         Cmd::Serve(args) => serve(args).map(|_| ExitCode::SUCCESS),
         Cmd::Status(args) => search_cmd::status(args).map(|_| ExitCode::SUCCESS),
+        Cmd::Exclusions(args) => search_cmd::exclusions(args).map(|_| ExitCode::SUCCESS),
         Cmd::Verify(args) => live_cmd::verify(args).map(|_| ExitCode::SUCCESS),
         Cmd::Inspect(args) => inspect_cmd::run(args).map(|_| ExitCode::SUCCESS),
     };

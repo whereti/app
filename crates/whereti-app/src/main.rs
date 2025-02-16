@@ -7,8 +7,11 @@
 
 mod app;
 mod searcher;
+mod settings;
 mod shell;
+mod theme;
 mod tray;
+mod win;
 
 use std::sync::Arc;
 
@@ -26,10 +29,11 @@ fn main() -> eframe::Result<()> {
         renderer: eframe::Renderer::Glow,
         viewport: egui::ViewportBuilder::default()
             .with_title("whereti")
-            .with_inner_size([940.0, 620.0])
-            .with_min_inner_size([520.0, 320.0])
+            .with_inner_size([900.0, 620.0])
+            .with_min_inner_size([620.0, 380.0])
             .with_visible(visible)
             .with_icon(Arc::new(icon)),
+        centered: true,
         ..Default::default()
     };
     eframe::run_native(
@@ -50,7 +54,8 @@ fn main() -> eframe::Result<()> {
                     wake();
                 });
             }
-            let tray = tray::install(requests.clone(), wake).ok();
+            let preferred = settings::SettingsState::load().hotkey;
+            let tray = tray::install(requests.clone(), wake, preferred.as_deref()).ok();
             Ok(Box::new(app::WheretiApp::new(&ctx, requests, tray, visible)))
         }),
     )
@@ -71,6 +76,7 @@ fn setup_fonts(ctx: &egui::Context) {
     };
     let regular = load("segoe", "segoeui.ttf");
     let bold = load("segoe-bold", "segoeuib.ttf");
+    let semibold = load("segoe-semibold", "seguisb.ttf");
     if regular {
         fonts.families.entry(FontFamily::Proportional).or_default().insert(0, "segoe".into());
     }
@@ -80,5 +86,11 @@ fn setup_fonts(ctx: &egui::Context) {
     }
     bold_family.extend(fonts.families.get(&FontFamily::Proportional).cloned().unwrap_or_default());
     fonts.families.insert(FontFamily::Name("bold".into()), bold_family);
+    let mut semibold_family = Vec::new();
+    if semibold {
+        semibold_family.push("segoe-semibold".to_string());
+    }
+    semibold_family.extend(fonts.families.get(&FontFamily::Proportional).cloned().unwrap_or_default());
+    fonts.families.insert(FontFamily::Name("semibold".into()), semibold_family);
     ctx.set_fonts(fonts);
 }

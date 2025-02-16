@@ -256,3 +256,58 @@ fn dur_fine(d: Duration) -> String {
         dur(d)
     }
 }
+
+#[derive(Args)]
+pub struct ExclusionsArgs {
+    /// list (default), add or remove
+    #[arg(default_value = "list")]
+    action: String,
+    /// Path to add or remove: C:\Folder, \Folder (every drive) or **\name (anywhere)
+    path: Option<String>,
+}
+
+/// `wt exclusions [list|add|remove] [PATH]` — what the index leaves out.
+pub fn exclusions(args: ExclusionsArgs) -> Result<(), String> {
+    let mut client = Client::connect(Duration::from_millis(500)).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            "the whereti service is not running".to_string()
+        } else {
+            e.to_string()
+        }
+    })?;
+    let cfg = match client.call(&Request::GetConfig).map_err(|e| e.to_string())? {
+        Response::Config(c) => c,
+        other => return Err(format!("unexpected reply: {other:?}")),
+    };
+    let mut paths = cfg.exclusions.clone();
+    match (args.action.as_str(), args.path) {
+        ("list", _) => {
+            for p in &paths {
+                println!("{p}");
+            }
+            return Ok(());
+        }
+        ("add", Some(p)) => {
+            if paths.iter().any(|x| x.eq_ignore_ascii_case(&p)) {
+                return Err(format!("{p} is already excluded"));
+            }
+            paths.push(p);
+        }
+        ("remove", Some(p)) => {
+            let before = paths.len();
+            paths.retain(|x| !x.eq_ignore_ascii_case(&p));
+            if paths.len() == before {
+                return Err(format!("{p} is not in the list"));
+            }
+        }
+        _ => return Err("usage: wt exclusions [list | add PATH | remove PATH]".into()),
+    }
+    match client.call(&Request::SetExclusions { paths }).map_err(|e| e.to_string())? {
+        Response::Ok => {
+            println!("saved — the service is rebuilding the index (a few seconds); `wt status` shows progress");
+            Ok(())
+        }
+        Response::Error(e) => Err(e),
+        other => Err(format!("unexpected reply: {other:?}")),
+    }
+}

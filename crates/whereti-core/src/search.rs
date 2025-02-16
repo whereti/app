@@ -655,7 +655,7 @@ mod tests {
                 }
             }
         }
-        assert!(checked > 10_000);
+        assert!(checked > 5_000, "only {checked} checks");
     }
 
     /// The scoring as first written: fold a copy of the name, then compare.

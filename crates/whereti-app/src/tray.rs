@@ -26,33 +26,74 @@ impl Requests {
     }
 }
 
+/// Shortcuts offered in Settings. The first free one is used by default.
+pub const HOTKEYS: [(&str, Modifiers, Code); 4] = [
+    ("Ctrl+Alt+Space", Modifiers::CONTROL.union(Modifiers::ALT), Code::Space),
+    ("Ctrl+Shift+Space", Modifiers::CONTROL.union(Modifiers::SHIFT), Code::Space),
+    ("Alt+Shift+Space", Modifiers::ALT.union(Modifiers::SHIFT), Code::Space),
+    ("Ctrl+Alt+W", Modifiers::CONTROL.union(Modifiers::ALT), Code::KeyW),
+];
+pub const PREFERRED_HOTKEY: &str = HOTKEYS[0].0;
+
 pub struct Tray {
     pub icon: TrayIcon,
-    _hotkeys: Option<GlobalHotKeyManager>,
+    open_item: MenuItem,
+    manager: Option<GlobalHotKeyManager>,
+    registered: Option<HotKey>,
     /// The shortcut in use, e.g. "Ctrl+Alt+Space"; `None` if none could be registered.
     pub hotkey: Option<&'static str>,
 }
 
-/// Preferred shortcut first; the next ones are used if it is taken.
-const HOTKEYS: [(&str, Modifiers, Code); 2] = [
-    ("Ctrl+Alt+Space", Modifiers::CONTROL.union(Modifiers::ALT), Code::Space),
-    ("Ctrl+Shift+Space", Modifiers::CONTROL.union(Modifiers::SHIFT), Code::Space),
-];
-pub const PREFERRED_HOTKEY: &str = HOTKEYS[0].0;
+impl Tray {
+    /// Switches to another shortcut; keeps the old one if the new one is taken.
+    pub fn set_hotkey(&mut self, label: &str) -> Result<&'static str, String> {
+        let Some(m) = &self.manager else { return Err("tastele rapide nu sunt disponibile".into()) };
+        let Some(&(name, mods, code)) = HOTKEYS.iter().find(|h| h.0 == label) else {
+            return Err(format!("tastă necunoscută: {label}"));
+        };
+        let new = HotKey::new(Some(mods), code);
+        if let Some(old) = self.registered {
+            let _ = m.unregister(old);
+        }
+        match m.register(new) {
+            Ok(()) => {
+                self.registered = Some(new);
+                self.hotkey = Some(name);
+                self.open_item.set_text(format!("Caută…   {name}"));
+                Ok(name)
+            }
+            Err(_) => {
+                if let Some(old) = self.registered {
+                    let _ = m.register(old);
+                }
+                Err(format!("{name} e folosită de altă aplicație"))
+            }
+        }
+    }
+}
 
-pub fn install(requests: Arc<Requests>, wake: impl Fn() + Send + Sync + Clone + 'static) -> Result<Tray, String> {
-    // The shortcut toggles the window from any application.
+pub fn install(
+    requests: Arc<Requests>,
+    wake: impl Fn() + Send + Sync + Clone + 'static,
+    preferred: Option<&str>,
+) -> Result<Tray, String> {
+    // The shortcut toggles the window from any application: the saved
+    // choice first, then the defaults in order.
     let manager = GlobalHotKeyManager::new().ok();
-    let mut hotkey = None;
+    let (mut hotkey, mut registered) = (None, None);
     if let Some(m) = &manager {
-        for (label, mods, code) in HOTKEYS {
-            if m.register(HotKey::new(Some(mods), code)).is_ok() {
-                hotkey = Some(label);
+        let order = preferred.into_iter().chain(HOTKEYS.iter().map(|h| h.0));
+        for label in order {
+            let Some(&(name, mods, code)) = HOTKEYS.iter().find(|h| h.0 == label) else { continue };
+            let key = HotKey::new(Some(mods), code);
+            if m.register(key).is_ok() {
+                hotkey = Some(name);
+                registered = Some(key);
                 break;
             }
         }
     }
-    if hotkey.is_some() {
+    {
         let (requests, wake) = (requests.clone(), wake.clone());
         GlobalHotKeyEvent::set_event_handler(Some(move |e: GlobalHotKeyEvent| {
             if e.state == HotKeyState::Pressed {
@@ -67,10 +108,10 @@ pub fn install(requests: Arc<Requests>, wake: impl Fn() + Send + Sync + Clone + 
         Some(k) => format!("Caută…   {k}"),
         None => "Caută…".to_string(),
     };
-    let open = MenuItem::new(open_label, true, None);
+    let open_item = MenuItem::new(open_label, true, None);
     let quit = MenuItem::new("Ieșire", true, None);
-    menu.append_items(&[&open, &PredefinedMenuItem::separator(), &quit]).map_err(|e| e.to_string())?;
-    let (open_id, quit_id) = (open.id().clone(), quit.id().clone());
+    menu.append_items(&[&open_item, &PredefinedMenuItem::separator(), &quit]).map_err(|e| e.to_string())?;
+    let (open_id, quit_id) = (open_item.id().clone(), quit.id().clone());
 
     let icon = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
@@ -97,7 +138,7 @@ pub fn install(requests: Arc<Requests>, wake: impl Fn() + Send + Sync + Clone + 
             wake();
         }
     }));
-    Ok(Tray { icon, _hotkeys: manager, hotkey })
+    Ok(Tray { icon, open_item, manager, registered, hotkey })
 }
 
 /// A 32×32 magnifying glass, drawn in code (no image files to ship).

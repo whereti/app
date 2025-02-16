@@ -270,7 +270,9 @@ impl Model {
 }
 
 fn exclusions() -> Exclusions {
-    Exclusions::defaults(Some(r"C:\Windows"))
+    let mut e = Exclusions::defaults(Some(r"C:\Windows"));
+    e.paths.push(r"**\node_modules".into()); // the model creates folders with this name
+    e
 }
 
 pub(crate) fn fresh(model: &Model) -> NameIndex {

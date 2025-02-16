@@ -28,7 +28,7 @@ use windows_sys::Win32::System::Pipes::{
 };
 
 pub const PIPE_NAME: &str = r"\\.\pipe\whereti";
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 const MAX_MESSAGE: usize = 64 << 20;
 
 /// The account that created the pipe (OW), SYSTEM and Administrators: full
@@ -59,6 +59,20 @@ pub enum Request {
     Hello { version: u32 },
     Search(SearchRequest),
     Status,
+    /// What the index covers and leaves out.
+    GetConfig,
+    /// Replace the exclusion paths; the service rebuilds the index (seconds).
+    SetExclusions { paths: Vec<String> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ConfigReply {
+    /// Indexed drive letters.
+    pub volumes: Vec<char>,
+    /// Paths left out of the index (`C:\Windows`, or `\Folder` on every drive).
+    pub exclusions: Vec<String>,
+    /// The exclusions a fresh install uses.
+    pub default_exclusions: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -105,6 +119,8 @@ pub enum Response {
     Hello { version: u32, server: String },
     Search(SearchReply),
     Status(StatusReply),
+    Config(ConfigReply),
+    Ok,
     Error(String),
 }
 
@@ -329,7 +345,7 @@ mod tests {
         let handler: Handler = Arc::new(|req| match req {
             Request::Hello { .. } => Response::Hello { version: PROTOCOL_VERSION, server: "test".into() },
             Request::Search(s) => Response::Search(SearchReply { total: s.limit as u64, ..Default::default() }),
-            Request::Status => Response::Error("no status".into()),
+            other => Response::Error(format!("unsupported in this test: {other:?}")),
         });
         let server = Server::start_named(&name, handler.clone()).unwrap();
         // the name is taken: a second server must not start

@@ -258,7 +258,11 @@ impl NameIndex {
         if rules.is_empty() {
             return false;
         }
-        let mut comps = vec![fold(name)];
+        let folded = fold(name);
+        if rules.iter().any(|r| r[0] == crate::build::ANY_DEPTH && r[1] == folded) {
+            return true; // `**\name`: this name anywhere
+        }
+        let mut comps = vec![folded];
         let mut cur = parent;
         for _ in 0..4096 {
             if self.flags[cur as usize] & FLAG_ROOT != 0 {

@@ -18,7 +18,9 @@ use std::time::{Duration, Instant};
 
 use parking_lot::{Mutex, RwLock};
 use whereti_core::{build, snapshot, ApplyStats, Exclusions, NameIndex, SearchOptions, SortBy};
-use whereti_ipc::{Request, Response, Row, SearchReply, Sort, StatusReply, VolumeStatus, PROTOCOL_VERSION};
+use whereti_ipc::{
+    ConfigReply, Request, Response, Row, SearchReply, Sort, StatusReply, VolumeStatus, PROTOCOL_VERSION,
+};
 use whereti_ntfs::Volume;
 
 use crate::log::Logger;
@@ -69,6 +71,8 @@ impl Default for Config {
 
 pub enum Msg {
     Journal(JournalMsg),
+    /// New exclusion paths: rebuild the index with them.
+    Reconfigure(Vec<String>),
     Stop,
 }
 
@@ -180,6 +184,22 @@ impl Engine {
                     micros: t.elapsed().as_micros() as u64,
                 })
             }
+            Request::GetConfig => {
+                let guard = self.shared.index.read();
+                let (volumes, exclusions) = match guard.as_ref() {
+                    Some(idx) => (idx.volumes().iter().map(|v| v.letter()).collect(), idx.exclusions().to_vec()),
+                    None => (Vec::new(), Vec::new()),
+                };
+                Response::Config(ConfigReply { volumes, exclusions, default_exclusions: default_exclusions(false) })
+            }
+            Request::SetExclusions { paths } => match validate_exclusions(&paths) {
+                Ok(paths) => {
+                    self.log(format!("exclusions changed by a client: {}", paths.join(" · ")));
+                    let _ = self.tx.send(Msg::Reconfigure(paths));
+                    Response::Ok
+                }
+                Err(e) => Response::Error(e),
+            },
             Request::Status => {
                 let guard = self.shared.index.read();
                 let (entries, volumes) = match guard.as_ref() {
@@ -259,12 +279,22 @@ impl Worker {
         while !stopping {
             match rx.recv_timeout(Duration::from_millis(500)) {
                 Ok(Msg::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Ok(Msg::Reconfigure(paths)) => {
+                    if let Err(e) = self.reconfigure(paths) {
+                        self.log(format!("error: {e}"));
+                    }
+                }
                 Ok(Msg::Journal(first)) => {
                     let mut msgs = vec![first];
                     let deadline = Instant::now() + BATCH_WINDOW;
                     while let Some(left) = deadline.checked_duration_since(Instant::now()) {
                         match rx.recv_timeout(left) {
                             Ok(Msg::Journal(m)) => msgs.push(m),
+                            Ok(Msg::Reconfigure(paths)) => {
+                                // apply the pending journal batch first, then rebuild
+                                let _ = self.tx.send(Msg::Reconfigure(paths));
+                                break;
+                            }
                             Ok(Msg::Stop) => {
                                 stopping = true;
                                 break;
@@ -545,6 +575,40 @@ impl Worker {
         Ok(())
     }
 
+    /// Rebuilds the whole index with new exclusion paths (from Settings).
+    fn reconfigure(&mut self, paths: Vec<String>) -> Result<(), String> {
+        let _bg = Background::begin();
+        let t = Instant::now();
+        self.shared.set_state("reindexing");
+        let letters: Vec<char> = {
+            let guard = self.shared.index.read();
+            guard.as_ref().expect("index").volumes().iter().map(|v| v.letter()).collect()
+        };
+        let mut scans = Vec::new();
+        for &l in &letters {
+            scans.extend(sync::scan_volume(l, self.cfg.threads)?);
+        }
+        let (fresh, stats) = self.pool.install(|| build(scans, &Exclusions { paths }));
+        *self.shared.index.write() = Some(fresh);
+        for open in &mut self.open {
+            open.clear();
+        }
+        // replay what changed during the scans
+        for v in 0..self.vols.len() {
+            self.catch_up(v)?;
+        }
+        self.dirty = true;
+        self.save()?;
+        self.shared.set_state("ready");
+        self.log(format!(
+            "rebuilt with new exclusions: {} entries ({} excluded) in {} ms",
+            stats.kept,
+            stats.excluded,
+            t.elapsed().as_millis()
+        ));
+        Ok(())
+    }
+
     /// Daily safety net (PLAN.md §7.2): a full rescan replaces the live index.
     fn reconcile(&mut self) -> Result<(), String> {
         self.last_reconcile = Instant::now();
@@ -589,5 +653,51 @@ impl Worker {
             t.elapsed().as_millis()
         ));
         Ok(idx)
+    }
+}
+
+/// The exclusions of a fresh install (PLAN.md §5).
+fn default_exclusions(include_windows: bool) -> Vec<String> {
+    let windows = (!include_windows).then(|| std::env::var("SystemRoot").ok()).flatten();
+    Exclusions::defaults(windows.as_deref()).paths
+}
+
+/// Accepts `X:\path` or `\path` (every drive); at most 500 paths.
+fn validate_exclusions(paths: &[String]) -> Result<Vec<String>, String> {
+    if paths.len() > 500 {
+        return Err("too many exclusion paths (at most 500)".into());
+    }
+    let mut out = Vec::new();
+    for p in paths {
+        const SEP: u8 = b'\\';
+        let p = p.trim().replace('/', "\\");
+        let p = p.trim_end_matches(SEP as char).to_string();
+        let b = p.as_bytes();
+        let any_depth = p.strip_prefix("**\\").is_some_and(|n| !n.is_empty() && !n.contains('\\'));
+        let ok = p.len() < 1024
+            && (any_depth
+                || (b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == SEP)
+                || (b.len() >= 2 && b[0] == SEP && b[1] != SEP));
+        if !ok {
+            return Err(format!(r"not a valid path to exclude: {p:?} (use C:\Folder or \Folder)"));
+        }
+        if !out.contains(&p) {
+            out.push(p);
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exclusion_paths_are_checked() {
+        let ok = validate_exclusions(&[r"C:\Windows\".into(), r"\node_modules".into(), "d:/proiecte/vechi".into()]).unwrap();
+        assert_eq!(ok, vec![r"C:\Windows", r"\node_modules", r"d:\proiecte\vechi"]);
+        assert!(validate_exclusions(&["Windows".into()]).is_err());
+        assert!(validate_exclusions(&[r"\\server\share".into()]).is_err());
+        assert!(validate_exclusions(&[String::new()]).is_err());
     }
 }

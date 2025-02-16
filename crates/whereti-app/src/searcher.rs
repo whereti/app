@@ -5,7 +5,7 @@
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
-use whereti_ipc::{Client, Request, Response, SearchReply, SearchRequest, Sort, StatusReply};
+use whereti_ipc::{Client, ConfigReply, Request, Response, SearchReply, SearchRequest, Sort, StatusReply};
 
 pub struct Job {
     pub generation: u64,
@@ -17,6 +17,9 @@ pub struct Job {
 pub enum Update {
     Results { generation: u64, reply: SearchReply, round_trip: Duration },
     Status(StatusReply),
+    Config(ConfigReply),
+    /// A change was accepted; a short message for the user.
+    Done(String),
     /// The service cannot be reached (not running, or stopped meanwhile).
     Offline(String),
 }
@@ -24,6 +27,8 @@ pub enum Update {
 enum Msg {
     Search(Job),
     Status,
+    Config,
+    SetExclusions(Vec<String>),
 }
 
 pub struct Searcher {
@@ -51,19 +56,40 @@ impl Searcher {
         let _ = self.tx.send(Msg::Status);
     }
 
+    pub fn ask_config(&self) {
+        let _ = self.tx.send(Msg::Config);
+    }
+
+    pub fn set_exclusions(&self, paths: Vec<String>) {
+        let _ = self.tx.send(Msg::SetExclusions(paths));
+    }
+
     pub fn updates(&self) -> impl Iterator<Item = Update> + '_ {
         std::iter::from_fn(|| self.rx.try_recv().ok())
     }
 }
 
+#[derive(Default)]
+struct Pending {
+    search: Option<Job>,
+    status: bool,
+    config: bool,
+    exclusions: Option<Vec<String>>,
+}
+
 fn worker(jobs: Receiver<Msg>, out: Sender<Update>, wake: impl Fn()) {
     let mut client: Option<Client> = None;
     while let Ok(first) = jobs.recv() {
-        // Keep only the newest search; remember whether status was asked.
-        let (mut search, mut status) = (None, false);
+        // Collapse everything queued: newest search, newest exclusions, flags.
+        let mut p = Pending::default();
         let mut take = |m: Msg| match m {
-            Msg::Search(j) => search = Some(j),
-            Msg::Status => status = true,
+            Msg::Search(j) => p.search = Some(j),
+            Msg::Status => p.status = true,
+            Msg::Config => p.config = true,
+            Msg::SetExclusions(e) => {
+                p.exclusions = Some(e);
+                p.config = true;
+            }
         };
         take(first);
         loop {
@@ -89,31 +115,41 @@ fn worker(jobs: Receiver<Msg>, out: Sender<Update>, wake: impl Fn()) {
             }
         }
         let c = client.as_mut().expect("connected");
-        let mut failed = false;
-        if let Some(job) = search {
-            let req = Request::Search(SearchRequest { query: job.query, limit: job.limit, sort: job.sort });
-            let t = Instant::now();
-            match c.call(&req) {
-                Ok(Response::Search(reply)) => {
-                    let _ = out.send(Update::Results { generation: job.generation, reply, round_trip: t.elapsed() });
-                }
-                Ok(Response::Error(e)) => {
-                    let _ = out.send(Update::Offline(e));
-                }
-                Ok(_) => {}
-                Err(_) => failed = true,
+        let result = (|| -> std::io::Result<()> {
+            if let Some(paths) = p.exclusions {
+                let msg = match c.call(&Request::SetExclusions { paths })? {
+                    Response::Ok => "Excluderile au fost salvate — indexul se reconstruiește".to_string(),
+                    Response::Error(e) => format!("Nu s-au putut salva excluderile: {e}"),
+                    _ => "Răspuns neașteptat de la serviciu".to_string(),
+                };
+                let _ = out.send(Update::Done(msg));
             }
-        }
-        if status && !failed {
-            match c.call(&Request::Status) {
-                Ok(Response::Status(s)) => {
+            if let Some(job) = p.search {
+                let req = Request::Search(SearchRequest { query: job.query, limit: job.limit, sort: job.sort });
+                let t = Instant::now();
+                match c.call(&req)? {
+                    Response::Search(reply) => {
+                        let _ = out.send(Update::Results { generation: job.generation, reply, round_trip: t.elapsed() });
+                    }
+                    Response::Error(e) => {
+                        let _ = out.send(Update::Offline(e));
+                    }
+                    _ => {}
+                }
+            }
+            if p.config {
+                if let Response::Config(cfg) = c.call(&Request::GetConfig)? {
+                    let _ = out.send(Update::Config(cfg));
+                }
+            }
+            if p.status {
+                if let Response::Status(s) = c.call(&Request::Status)? {
                     let _ = out.send(Update::Status(s));
                 }
-                Ok(_) => {}
-                Err(_) => failed = true,
             }
-        }
-        if failed {
+            Ok(())
+        })();
+        if result.is_err() {
             // The service restarted or stopped: reconnect on the next job.
             client = None;
             let _ = out.send(Update::Offline("connection to the service was lost".into()));

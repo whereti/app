@@ -3837,9 +3837,11 @@ version = "0.0.1"
 dependencies = [
  "eframe",
  "global-hotkey",
+ "raw-window-handle",
  "tray-icon",
  "whereti-ipc",
  "whereti-query",
+ "windows",
  "windows-sys 0.61.2",
 ]
 

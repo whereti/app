@@ -77,17 +77,6 @@ pub fn tz_offset() -> i32 {
     -(tz.Bias + if id == TIME_ZONE_ID_DAYLIGHT { tz.DaylightBias } else { tz.StandardBias })
 }
 
-/// "24.10.2026 16:45" (Romanian date order).
-pub fn local_time(minutes_utc: u32, tz_offset: i32) -> String {
-    if minutes_utc == 0 {
-        return String::new();
-    }
-    let local = minutes_utc as i64 + tz_offset as i64;
-    let (y, m, d) = whereti_query::civil_from_day(local.div_euclid(1440));
-    let mins = local.rem_euclid(1440);
-    format!("{d:02}.{m:02}.{y:04} {:02}:{:02}", mins / 60, mins % 60)
-}
-
 /// "1,2 MB" (decimal comma).
 pub fn size(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
@@ -117,6 +106,57 @@ pub fn count(n: u64) -> String {
     out
 }
 
+
+const RUN_KEY: windows::core::PCWSTR = windows::core::w!(r"Software\Microsoft\Windows\CurrentVersion\Run");
+const RUN_VALUE: windows::core::PCWSTR = windows::core::w!("whereti");
+
+/// Is whereti in the per-user "start with Windows" list?
+pub fn autostart_enabled() -> bool {
+    use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_SZ};
+    // SAFETY: only asks whether the value exists.
+    unsafe { RegGetValueW(HKEY_CURRENT_USER, RUN_KEY, RUN_VALUE, RRF_RT_REG_SZ, None, None, None).is_ok() }
+}
+
+/// Adds or removes `"<this exe>" --hidden` in HKCU\…\Run.
+pub fn set_autostart(on: bool) -> Result<(), String> {
+    use windows::Win32::System::Registry::{RegDeleteKeyValueW, RegSetKeyValueW, HKEY_CURRENT_USER, REG_SZ};
+    // SAFETY: valid key/value names; data is a NUL-terminated UTF-16 string.
+    unsafe {
+        if on {
+            let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+            let cmd: Vec<u16> = format!("\"{}\" --hidden", exe.display()).encode_utf16().chain([0]).collect();
+            RegSetKeyValueW(
+                HKEY_CURRENT_USER,
+                RUN_KEY,
+                RUN_VALUE,
+                REG_SZ.0,
+                Some(cmd.as_ptr() as *const _),
+                (cmd.len() * 2) as u32,
+            )
+            .ok()
+            .map_err(|e| e.to_string())
+        } else {
+            let r = RegDeleteKeyValueW(HKEY_CURRENT_USER, RUN_KEY, RUN_VALUE);
+            if r.is_ok() || r.0 == 2 { Ok(()) } else { Err(r.to_hresult().message()) } // 2 = not there
+        }
+    }
+}
+
+
+/// Appends a line to `%TEMP%\wt-ui-trace.txt` when `WT_UI_TRACE` is set
+/// (diagnostics only; nothing is written otherwise).
+pub fn trace(msg: impl AsRef<str>) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("WT_UI_TRACE").is_some()) {
+        return;
+    }
+    use std::io::Write;
+    let path = std::env::temp_dir().join("wt-ui-trace.txt");
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(f, "{:?} {}", std::time::SystemTime::now(), msg.as_ref());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -126,8 +166,5 @@ mod tests {
         assert_eq!(count(1_243_551), "1.243.551");
         assert_eq!(size(1536), "1,5 KB");
         assert_eq!(size(12), "12 B");
-        let m = (whereti_query::day_from_civil(2026, 10, 24) * 1440 + 13 * 60 + 45) as u32;
-        assert_eq!(local_time(m, 180), "24.10.2026 16:45");
-        assert_eq!(local_time(0, 180), "");
     }
 }

@@ -28,8 +28,12 @@ pub struct VolumeScan {
     pub scan: MftScan,
 }
 
+/// First component of a `**\name` rule (that name at any depth).
+pub(crate) const ANY_DEPTH: &str = "**";
+
 /// Paths left out of the name index. `C:\Windows` applies to drive C only;
-/// `\System Volume Information` (no letter) applies to every volume.
+/// `\System Volume Information` (no letter) applies to every volume;
+/// `**\node_modules` leaves out every `node_modules`, at any depth.
 #[derive(Debug, Clone, Default)]
 pub struct Exclusions {
     pub paths: Vec<String>,
@@ -58,10 +62,17 @@ impl Exclusions {
     }
 
     /// Rules for one volume, each as folded path components.
+    /// `**\name` rules come out as `["**", name]`: that name anywhere.
     pub(crate) fn for_volume(&self, letter: char) -> Vec<Vec<String>> {
         let mut out = Vec::new();
         for p in &self.paths {
             let p = p.replace('/', "\\");
+            if let Some(name) = p.strip_prefix("**\\") {
+                if !name.is_empty() && !name.contains('\\') {
+                    out.push(vec![ANY_DEPTH.to_string(), fold(name)]);
+                }
+                continue;
+            }
             let rest = match p.as_bytes() {
                 [l, b':', b'\\', ..] if (*l as char).eq_ignore_ascii_case(&letter) => &p[3..],
                 [_, b':', ..] => continue,
@@ -136,10 +147,30 @@ fn add_volume(
             state[i] = 1;
         }
     }
+    let rules = vs_rules(exclusions, vs.letter);
+    let (anywhere, paths): (Vec<_>, Vec<_>) = rules.into_iter().partition(|r| r[0] == ANY_DEPTH);
     if root != NO_PARENT {
         state[root as usize] = 2;
-        for i in resolve_paths(scan, root, &vs_rules(exclusions, vs.letter), &parent_of) {
+        for i in resolve_paths(scan, root, &paths, &parent_of) {
             state[i as usize] = 1;
+        }
+    }
+    // `**\name`: every file or folder with that name, at any depth.
+    if !anywhere.is_empty() {
+        let names: Vec<&str> = anywhere.iter().map(|r| r[1].as_str()).collect();
+        let mut folded = String::new();
+        for (i, e) in scan.entries.iter().enumerate() {
+            let name = scan.name(e);
+            let hit = if name.is_ascii() {
+                names.iter().any(|n| n.eq_ignore_ascii_case(name))
+            } else {
+                folded.clear();
+                whereti_query::fold_into(name, &mut folded);
+                names.contains(&folded.as_str())
+            };
+            if hit && i as u32 != root {
+                state[i] = 1;
+            }
         }
     }
     // 2. Every entry inherits the state of its nearest decided ancestor.
