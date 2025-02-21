@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
+mod extract_cmd;
 mod index_cmd;
 mod inspect_cmd;
 mod live_cmd;
@@ -45,6 +46,8 @@ enum Cmd {
     Verify(live_cmd::VerifyArgs),
     /// Show what Windows, the MFT and the index say about one path (Administrator)
     Inspect(inspect_cmd::InspectArgs),
+    /// Extract the text of documents (in the sandboxed worker), with timings
+    Extract(extract_cmd::ExtractArgs),
 }
 
 #[derive(Args)]
@@ -116,6 +119,7 @@ fn main() -> ExitCode {
         Cmd::Exclusions(args) => search_cmd::exclusions(args).map(|_| ExitCode::SUCCESS),
         Cmd::Verify(args) => live_cmd::verify(args).map(|_| ExitCode::SUCCESS),
         Cmd::Inspect(args) => inspect_cmd::run(args).map(|_| ExitCode::SUCCESS),
+        Cmd::Extract(args) => extract_cmd::run(args).map(|_| ExitCode::SUCCESS),
     };
     match result {
         Ok(code) => code,

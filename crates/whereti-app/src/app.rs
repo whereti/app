@@ -12,6 +12,7 @@ use eframe::egui::{
 };
 use whereti_ipc::{Row, Sort, StatusReply};
 
+use crate::preview::Preview;
 use crate::searcher::{Job, Searcher, Update};
 use crate::settings::SettingsState;
 use crate::shell;
@@ -101,12 +102,16 @@ pub struct WheretiApp {
     pub(crate) settings: SettingsState,
     pub(crate) requests: Arc<Requests>,
     pub(crate) tray: Option<Tray>,
+    preview: Preview,
 }
 
 impl WheretiApp {
     pub fn new(ctx: &egui::Context, requests: Arc<Requests>, tray: Option<Tray>, visible: bool) -> Self {
         let wake_ctx = ctx.clone();
         let searcher = Searcher::start(move || wake_ctx.request_repaint());
+        let settings = SettingsState::load();
+        let wake_ctx = ctx.clone();
+        let preview = Preview::start(settings.preview, move || wake_ctx.request_repaint());
         let accent = theme::system_accent();
         theme::apply(ctx, accent);
         let mut app = WheretiApp {
@@ -136,9 +141,10 @@ impl WheretiApp {
             styled_theme: None,
             hwnd: None,
             page: Page::Search,
-            settings: SettingsState::load(),
+            settings,
             requests,
             tray,
+            preview,
         };
         app.settings.apply_theme(ctx);
         match app.tray.as_ref().map(|t| t.hotkey) {
@@ -245,7 +251,8 @@ impl WheretiApp {
 
     fn handle_keys(&mut self, ctx: &egui::Context) {
         let page = ((self.view_height / ROW_HEIGHT) as usize).max(1);
-        let (down, up, pg_down, pg_up, ctrl_enter, enter, copy, esc, settings, menu) = ctx.input_mut(|i| {
+        let search_page = self.page == Page::Search;
+        let (down, up, pg_down, pg_up, ctrl_enter, enter, copy, esc, settings, menu, tab) = ctx.input_mut(|i| {
             (
                 i.consume_key(Modifiers::NONE, Key::ArrowDown),
                 i.consume_key(Modifiers::NONE, Key::ArrowUp),
@@ -257,6 +264,7 @@ impl WheretiApp {
                 i.consume_key(Modifiers::NONE, Key::Escape),
                 i.consume_key(Modifiers::CTRL, Key::Comma),
                 i.consume_key(Modifiers::SHIFT, Key::F10),
+                search_page && i.consume_key(Modifiers::NONE, Key::Tab),
             )
         });
         if settings {
@@ -269,6 +277,9 @@ impl WheretiApp {
                 self.focus_search = true;
             }
             return;
+        }
+        if tab {
+            self.toggle_preview();
         }
         let last = self.rows.len().saturating_sub(1);
         let before = self.selected;
@@ -311,8 +322,17 @@ impl WheretiApp {
             } else {
                 self.query.clear();
                 self.run_search();
+                // egui drops focus on Esc; keep typing in the search field
+                self.focus_search = true;
             }
         }
+    }
+
+    fn toggle_preview(&mut self) {
+        self.preview.open = !self.preview.open;
+        self.settings.preview = self.preview.open;
+        self.settings.save();
+        self.focus_search = true;
     }
 
     fn toggle_settings(&mut self) {
@@ -346,6 +366,8 @@ impl WheretiApp {
                         .text_color(p.text)
                         .frame(Frame::NONE)
                         .margin(Vec2::new(0.0, 4.0))
+                        // Tab toggles the preview on the results page instead of moving focus
+                        .lock_focus(self.page == Page::Search)
                         .desired_width((ui.available_width() - right_w).max(120.0));
                     let resp = ui.add(edit);
                     self.search_id = Some(resp.id);
@@ -362,6 +384,13 @@ impl WheretiApp {
                             .on_hover_text("Setări (Ctrl+,)");
                         if gear.clicked() {
                             self.toggle_settings();
+                        }
+                        ui.add_space(2.0);
+                        if self.page == Page::Search {
+                            let tip = if self.preview.open { "Ascunde previzualizarea (Tab)" } else { "Arată previzualizarea (Tab)" };
+                            if icon_button(ui, p, IconKind::Preview, self.preview.open).on_hover_text(tip).clicked() {
+                                self.toggle_preview();
+                            }
                         }
                         ui.add_space(4.0);
                         if !self.query.is_empty() {
@@ -437,7 +466,8 @@ impl WheretiApp {
 
         // Keep the selected row visible after keyboard moves.
         let mut area = egui::ScrollArea::vertical().auto_shrink([false, false]);
-        if self.scroll_to_selected {
+        // (the first frame does not know the view height yet: wait for it)
+        if self.scroll_to_selected && self.view_height > 0.0 {
             let top = self.selected as f32 * ROW_HEIGHT;
             let mut off = self.scroll_offset;
             if top < off {
@@ -613,6 +643,20 @@ impl eframe::App for WheretiApp {
                     self.filter_chips(ui, &p);
                 }
             });
+        let show_preview =
+            self.page == Page::Search && self.preview.open && self.offline.is_none() && !self.rows.is_empty();
+        if show_preview {
+            self.preview.select(self.rows.get(self.selected));
+            let needles = highlight_needles(&self.query);
+            let width = ctx.content_rect().width();
+            egui::Panel::right("preview")
+                .frame(Frame::NONE.fill(p.bg).inner_margin(Margin { left: 8, right: 18, top: 6, bottom: 10 }))
+                .resizable(true)
+                .show_separator_line(true)
+                .default_size((width * 0.42).clamp(320.0, 640.0))
+                .size_range(280.0..=(width * 0.7).max(300.0))
+                .show(ui, |ui| self.preview.show(ui, &p, self.rows.get(self.selected), &needles, self.tz));
+        }
         egui::CentralPanel::default()
             .frame(Frame::NONE.fill(p.bg).inner_margin(Margin { left: 10, right: 10, top: 2, bottom: 0 }))
             .show(ui, |ui| match self.page {
@@ -645,6 +689,7 @@ pub(crate) enum IconKind {
     Gear,
     Close,
     Back,
+    Preview,
 }
 
 /// A 30×30 icon button.
@@ -675,6 +720,17 @@ pub(crate) fn icon_button(ui: &mut egui::Ui, p: &Palette, kind: IconKind, active
             painter.line_segment([c + Vec2::new(-6.0, 0.0), c + Vec2::new(6.0, 0.0)], s);
             painter.line_segment([c + Vec2::new(-6.0, 0.0), c + Vec2::new(-1.5, -4.5)], s);
             painter.line_segment([c + Vec2::new(-6.0, 0.0), c + Vec2::new(-1.5, 4.5)], s);
+        }
+        IconKind::Preview => {
+            // a window with a side pane
+            let r = egui::Rect::from_center_size(c, Vec2::new(16.0, 13.0));
+            painter.rect_stroke(r, 2.5, s, egui::StrokeKind::Middle);
+            let x = r.left() + 9.5;
+            painter.line_segment([egui::pos2(x, r.top()), egui::pos2(x, r.bottom())], s);
+            for k in 0..3 {
+                let y = r.top() + 3.5 + k as f32 * 3.0;
+                painter.line_segment([egui::pos2(x + 2.0, y), egui::pos2(r.right() - 2.0, y)], Stroke::new(1.2, col));
+            }
         }
         IconKind::Gear => {
             for k in 0..8 {
@@ -829,7 +885,7 @@ fn paint_row(
 }
 
 /// Folder glyph, or a coloured tile with the extension (PDF, DOCX, JPG…).
-fn paint_tile(painter: &egui::Painter, p: &Palette, tile: Rect, is_dir: bool, name: &str) {
+pub(crate) fn paint_tile(painter: &egui::Painter, p: &Palette, tile: Rect, is_dir: bool, name: &str) {
     if is_dir {
         let yellow = Color32::from_rgb(0xF2, 0xB8, 0x3E);
         painter.rect_filled(tile, 9.0, theme::with_alpha(yellow, if p.dark { 0.20 } else { 0.18 }));
@@ -910,7 +966,7 @@ fn highlighted(name: &str, needles: &[String], font: FontId, color: Color32, acc
 }
 
 /// For each character of `name`: is it part of a (folded) needle match?
-fn match_mask(name: &str, needles: &[String]) -> Vec<bool> {
+pub(crate) fn match_mask(name: &str, needles: &[String]) -> Vec<bool> {
     let chars: Vec<char> = name.chars().collect();
     let mut folded = String::new();
     let mut owner: Vec<usize> = Vec::new(); // folded byte -> original char index
@@ -955,7 +1011,7 @@ fn middle_elide(ui: &egui::Ui, path: &str, font: FontId, width: f32) -> String {
     format!("{}\\…\\{}", parts[0], parts[parts.len() - 1])
 }
 
-fn now_minutes() -> i64 {
+pub(crate) fn now_minutes() -> i64 {
     let unix =
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() / 60).unwrap_or(0);
     unix as i64 + 134_774 * 1440

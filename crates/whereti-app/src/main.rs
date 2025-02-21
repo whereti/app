@@ -6,6 +6,7 @@
 #![windows_subsystem = "windows"]
 
 mod app;
+mod preview;
 mod searcher;
 mod settings;
 mod shell;

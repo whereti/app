@@ -26,6 +26,8 @@ pub struct SettingsState {
     pub hotkey: Option<String>,
     pub theme: ThemeChoice,
     pub autostart: bool,
+    /// The preview panel is open.
+    pub preview: bool,
     config: Option<ConfigReply>,
     exclusions: Vec<String>,
     new_exclusion: String,
@@ -43,6 +45,7 @@ impl SettingsState {
             hotkey: None,
             theme: ThemeChoice::System,
             autostart: shell::autostart_enabled(),
+            preview: true,
             config: None,
             exclusions: Vec::new(),
             new_exclusion: String::new(),
@@ -55,6 +58,7 @@ impl SettingsState {
                     Some(("hotkey", v)) if HOTKEYS.iter().any(|h| h.0 == v) => s.hotkey = Some(v.to_string()),
                     Some(("theme", "light")) => s.theme = ThemeChoice::Light,
                     Some(("theme", "dark")) => s.theme = ThemeChoice::Dark,
+                    Some(("preview", "off")) => s.preview = false,
                     _ => {}
                 }
             }
@@ -68,7 +72,7 @@ impl SettingsState {
             ThemeChoice::Light => "light",
             ThemeChoice::Dark => "dark",
         };
-        let mut text = format!("theme={theme}\n");
+        let mut text = format!("theme={theme}\npreview={}\n", if self.preview { "on" } else { "off" });
         if let Some(h) = &self.hotkey {
             text.push_str(&format!("hotkey={h}\n"));
         }

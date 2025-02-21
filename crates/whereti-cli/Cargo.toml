@@ -8,6 +8,7 @@ repository.workspace = true
 [dependencies]
 clap = { version = "4.6.7", features = ["derive"] }
 whereti-core = { version = "0.0.1", path = "../whereti-core" }
+whereti-extract = { version = "0.0.1", path = "../whereti-extract" }
 whereti-engine = { version = "0.0.1", path = "../whereti-engine" }
 whereti-ipc = { version = "0.0.1", path = "../whereti-ipc" }
 whereti-ntfs = { version = "0.0.1", path = "../whereti-ntfs" }
