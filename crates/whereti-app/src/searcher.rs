@@ -5,17 +5,24 @@
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
-use whereti_ipc::{Client, ConfigReply, Request, Response, SearchReply, SearchRequest, Sort, StatusReply};
+use whereti_ipc::{Client, ConfigReply, ContentReply, Request, Response, SearchReply, SearchRequest, Sort, StatusReply};
+
+/// Content search waits this long after the name results, so it runs only
+/// once typing pauses.
+const CONTENT_DEBOUNCE: Duration = Duration::from_millis(150);
 
 pub struct Job {
     pub generation: u64,
     pub query: String,
     pub sort: Sort,
     pub limit: u32,
+    /// Also look for the words inside files.
+    pub content: bool,
 }
 
 pub enum Update {
     Results { generation: u64, reply: SearchReply, round_trip: Duration },
+    Content { generation: u64, reply: ContentReply },
     Status(StatusReply),
     Config(ConfigReply),
     /// A change was accepted; a short message for the user.
@@ -79,7 +86,8 @@ struct Pending {
 
 fn worker(jobs: Receiver<Msg>, out: Sender<Update>, wake: impl Fn()) {
     let mut client: Option<Client> = None;
-    while let Ok(first) = jobs.recv() {
+    let mut carried: Option<Msg> = None;
+    while let Some(first) = carried.take().or_else(|| jobs.recv().ok()) {
         // Collapse everything queued: newest search, newest exclusions, flags.
         let mut p = Pending::default();
         let mut take = |m: Msg| match m {
@@ -125,16 +133,29 @@ fn worker(jobs: Receiver<Msg>, out: Sender<Update>, wake: impl Fn()) {
                 let _ = out.send(Update::Done(msg));
             }
             if let Some(job) = p.search {
-                let req = Request::Search(SearchRequest { query: job.query, limit: job.limit, sort: job.sort });
+                let req = Request::Search(SearchRequest { query: job.query.clone(), limit: job.limit, sort: job.sort });
                 let t = Instant::now();
                 match c.call(&req)? {
                     Response::Search(reply) => {
                         let _ = out.send(Update::Results { generation: job.generation, reply, round_trip: t.elapsed() });
+                        wake();
                     }
                     Response::Error(e) => {
                         let _ = out.send(Update::Offline(e));
                     }
                     _ => {}
+                }
+                if job.content {
+                    // A newer keystroke cancels it; the new message is handled next.
+                    match jobs.recv_timeout(CONTENT_DEBOUNCE) {
+                        Ok(m) => carried = Some(m),
+                        Err(_) => {
+                            let req = Request::ContentSearch(SearchRequest { query: job.query, limit: 200, sort: job.sort });
+                            if let Response::Content(reply) = c.call(&req)? {
+                                let _ = out.send(Update::Content { generation: job.generation, reply });
+                            }
+                        }
+                    }
                 }
             }
             if p.config {

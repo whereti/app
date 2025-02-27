@@ -78,16 +78,53 @@ impl NameIndex {
     pub fn search(&self, query: &Query, opts: &SearchOptions) -> SearchResults {
         let t0 = std::time::Instant::now();
         let mut warnings = Vec::new();
-        let mut clauses: Vec<Clause> = query
+        let hits = self.matching_entries(query, &mut warnings);
+        let t_eval = t0.elapsed();
+        let rank_needle = query.clauses.iter().find_map(|c| match (&c.negated, c.any_of.as_slice()) {
+            (false, [Term::Text(t)]) => Some(t.clone()),
+            _ => None,
+        });
+        let total = hits.len();
+        let hits = self.top(hits, opts, rank_needle.as_deref());
+        if trace_enabled() {
+            let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+            eprintln!("[trace] match {:.2} ms · rank {:.2} ms · {} hits", ms(t_eval), ms(t0.elapsed() - t_eval), total);
+        }
+        SearchResults { total, hits, warnings }
+    }
+
+    /// Every live entry matching `query`, unranked, in index order.
+    pub fn matching(&self, query: &Query) -> Vec<u32> {
+        self.matching_entries(query, &mut Vec::new())
+    }
+
+    /// The entries of `entries` that are live and match `query`, in the given order.
+    pub fn filter(&self, query: &Query, entries: &[u32]) -> Vec<u32> {
+        let mut warnings = Vec::new();
+        let clauses = self.compile_clauses(query, &mut warnings);
+        let mut s = Scratch::default();
+        entries
+            .iter()
+            .copied()
+            .filter(|&i| {
+                (i as usize) < self.len() && self.flags[i as usize] & HIDDEN_FROM_SEARCH == 0 && self.eval(&clauses, i, &mut s)
+            })
+            .collect()
+    }
+
+    fn compile_clauses(&self, query: &Query, warnings: &mut Vec<String>) -> Vec<Clause> {
+        query
             .clauses
             .iter()
-            .map(|c| Clause {
-                negated: c.negated,
-                any: c.any_of.iter().map(|t| self.compile(t, &mut warnings)).collect(),
-            })
-            .collect();
+            .map(|c| Clause { negated: c.negated, any: c.any_of.iter().map(|t| self.compile(t, warnings)).collect() })
+            .collect()
+    }
+
+    fn matching_entries(&self, query: &Query, warnings: &mut Vec<String>) -> Vec<u32> {
+        let t0 = std::time::Instant::now();
+        let mut clauses = self.compile_clauses(query, warnings);
         if clauses.is_empty() || self.is_empty() {
-            return SearchResults { warnings, ..Default::default() };
+            return Vec::new();
         }
 
         // Driver: the longest plain word of a clause that is a single positive term.
@@ -105,11 +142,6 @@ impl NameIndex {
                 driver = Some((ci, needle, covered));
             }
         }
-        let rank_needle = query.clauses.iter().find_map(|c| match (&c.negated, c.any_of.as_slice()) {
-            (false, [Term::Text(t)]) => Some(t.clone()),
-            _ => None,
-        });
-
         let t_compile = t0.elapsed();
         let candidates: Option<Vec<u32>> = driver.as_ref().map(|(ci, needle, covered)| {
             if *covered {
@@ -140,22 +172,18 @@ impl NameIndex {
                 .collect(),
         };
 
-        let t_eval = t0.elapsed();
-        let total = hits.len();
-        let hits = self.top(hits, opts, rank_needle.as_deref());
         if trace_enabled() {
             let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
             eprintln!(
-                "[trace] compile {:.2} ms · scan {:.2} ms ({} candidates) · filter {:.2} ms · rank {:.2} ms · {} hits",
+                "[trace] compile {:.2} ms · scan {:.2} ms ({} candidates) · filter {:.2} ms · {} hits",
                 ms(t_compile),
                 ms(t_scan - t_compile),
                 candidate_count,
-                ms(t_eval - t_scan),
-                ms(t0.elapsed() - t_eval),
-                total
+                ms(t0.elapsed() - t_scan),
+                hits.len()
             );
         }
-        SearchResults { total, hits, warnings }
+        hits
     }
 
     fn compile(&self, term: &Term, warnings: &mut Vec<String>) -> Matcher {
@@ -181,10 +209,8 @@ impl NameIndex {
             Term::Modified { min, max } => Matcher::Modified(*min, *max),
             Term::FoldersOnly => Matcher::Folders,
             Term::FilesOnly => Matcher::Files,
-            Term::Content(_) => {
-                warnings.push("content search is not available yet (coming with the content index)".into());
-                Matcher::Never
-            }
+            // Answered by the content index, never by names.
+            Term::Content(_) => Matcher::Never,
             Term::All(ts) => Matcher::All(ts.iter().map(|t| self.compile(t, warnings)).collect()),
         }
     }

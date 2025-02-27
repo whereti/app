@@ -28,7 +28,7 @@ use windows_sys::Win32::System::Pipes::{
 };
 
 pub const PIPE_NAME: &str = r"\\.\pipe\whereti";
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 const MAX_MESSAGE: usize = 64 << 20;
 
 /// The account that created the pipe (OW), SYSTEM and Administrators: full
@@ -63,6 +63,12 @@ pub enum Request {
     GetConfig,
     /// Replace the exclusion paths; the service rebuilds the index (seconds).
     SetExclusions { paths: Vec<String> },
+    /// Files whose text contains the plain words of the query (or its
+    /// `content:` terms); the other conditions (ext:, path:, dm:…) filter them.
+    /// Only files the caller may read are returned.
+    ContentSearch(SearchRequest),
+    /// Folders whose documents are indexed by content.
+    SetContentFolders { paths: Vec<String> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -73,6 +79,9 @@ pub struct ConfigReply {
     pub exclusions: Vec<String>,
     /// The exclusions a fresh install uses.
     pub default_exclusions: Vec<String>,
+    /// Folders indexed by content.
+    pub content_folders: Vec<String>,
+    pub default_content_folders: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -94,6 +103,32 @@ pub struct SearchReply {
     pub micros: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct ContentReply {
+    /// Best first.
+    pub rows: Vec<Row>,
+    /// Files whose text matches, before filters and the limit.
+    pub total: u64,
+    pub micros: u64,
+    /// Said under the results, e.g. "indexing: 1,234 of 5,000 documents".
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ContentStatus {
+    /// "off", "starting", "scanning", "indexing", "ready", "paused", "error: …"
+    pub state: String,
+    /// Documents in the index.
+    pub files: u64,
+    /// Waiting to be (re)indexed.
+    pub queued: u64,
+    /// Indexed in this round (for a progress bar: done / (done + queued)).
+    pub done: u64,
+    /// Could not be read (damaged, protected, too large).
+    pub failed: u64,
+    pub disk_bytes: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VolumeStatus {
     pub letter: char,
@@ -112,12 +147,14 @@ pub struct StatusReply {
     pub last_change_secs: Option<u64>,
     pub open_files: u64,
     pub recent_log: Vec<String>,
+    pub content: ContentStatus,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Response {
     Hello { version: u32, server: String },
     Search(SearchReply),
+    Content(ContentReply),
     Status(StatusReply),
     Config(ConfigReply),
     Ok,
@@ -200,7 +237,68 @@ impl Client {
     }
 }
 
-pub type Handler = Arc<dyn Fn(Request) -> Response + Send + Sync>;
+/// Who sent a request: lets the service check what that user may read.
+pub trait Caller {
+    /// For each path: may the caller open it for reading?
+    fn can_read(&self, paths: &[String]) -> Vec<bool>;
+}
+
+/// A caller allowed everything (in-process use and tests).
+pub struct Trusted;
+
+impl Caller for Trusted {
+    fn can_read(&self, paths: &[String]) -> Vec<bool> {
+        vec![true; paths.len()]
+    }
+}
+
+/// The client at the other end of a pipe: checked by impersonating it, so
+/// Windows applies that user's own permissions.
+struct PipeCaller(std::os::windows::io::RawHandle);
+
+impl Caller for PipeCaller {
+    fn can_read(&self, paths: &[String]) -> Vec<bool> {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::Security::RevertToSelf;
+        use windows_sys::Win32::Storage::FileSystem::{CreateFileW, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING};
+        use windows_sys::Win32::System::Pipes::ImpersonateNamedPipeClient;
+        const FILE_READ_DATA: u32 = 0x1;
+        // SAFETY: valid pipe handle of a connected client.
+        if unsafe { ImpersonateNamedPipeClient(self.0 as _) } == 0 {
+            return vec![false; paths.len()];
+        }
+        let out = paths
+            .iter()
+            .map(|p| {
+                let wide: Vec<u16> = p.encode_utf16().chain([0]).collect();
+                // SAFETY: NUL-terminated path; the handle is closed right away.
+                let h = unsafe {
+                    CreateFileW(
+                        wide.as_ptr(),
+                        FILE_READ_DATA,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                        std::ptr::null(),
+                        OPEN_EXISTING,
+                        0,
+                        std::ptr::null_mut(),
+                    )
+                };
+                if h == INVALID_HANDLE_VALUE {
+                    // A file locked by its writer is still the caller's to see.
+                    io::Error::last_os_error().raw_os_error() == Some(32) // ERROR_SHARING_VIOLATION
+                } else {
+                    unsafe { CloseHandle(h) };
+                    true
+                }
+            })
+            .collect();
+        // SAFETY: undo the impersonation on this thread.
+        unsafe { RevertToSelf() };
+        out
+    }
+}
+
+pub type Handler = Arc<dyn Fn(Request, &dyn Caller) -> Response + Send + Sync>;
 
 /// Serves the pipe on background threads (one per client) until `stop()`.
 pub struct Server {
@@ -272,7 +370,8 @@ fn serve_client(handle: OwnedHandle, handler: Handler) {
                 return;
             }
         };
-        let resp = handler(req);
+        let caller = PipeCaller(std::os::windows::io::AsRawHandle::as_raw_handle(&pipe));
+        let resp = handler(req, &caller);
         if write_message(&mut pipe, &resp).is_err() {
             return;
         }
@@ -342,9 +441,11 @@ mod tests {
     #[test]
     fn client_and_server_talk_over_a_real_pipe() {
         let name = format!(r"\\.\pipe\whereti-test-{}", std::process::id());
-        let handler: Handler = Arc::new(|req| match req {
+        let handler: Handler = Arc::new(|req, _caller| match req {
             Request::Hello { .. } => Response::Hello { version: PROTOCOL_VERSION, server: "test".into() },
             Request::Search(s) => Response::Search(SearchReply { total: s.limit as u64, ..Default::default() }),
+            // report what the impersonated caller may read
+            Request::SetContentFolders { paths } => Response::Error(format!("{:?}", _caller.can_read(&paths))),
             other => Response::Error(format!("unsupported in this test: {other:?}")),
         });
         let server = Server::start_named(&name, handler.clone()).unwrap();
@@ -368,6 +469,12 @@ mod tests {
         for t in threads {
             t.join().unwrap();
         }
+        let mut c = Client::connect_to(&name, Duration::from_secs(5)).unwrap();
+        let mine = std::env::current_exe().unwrap().display().to_string();
+        let paths = vec![mine, r"C:\definitely
+ot\here.txt".to_string()];
+        assert_eq!(c.call(&Request::SetContentFolders { paths }).unwrap(), Response::Error("[true, false]".into()));
+        drop(c);
         server.stop();
         assert!(Client::connect_to(&name, Duration::from_millis(100)).is_err(), "pipe must be gone after stop");
     }

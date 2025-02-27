@@ -529,6 +529,42 @@ impl NameIndex {
         scans
     }
 
+    /// The MFT record of each entry (`None` for removed entries), in one pass
+    /// over the record maps.
+    pub fn records_of(&self, entries: &[u32]) -> Vec<Option<u64>> {
+        let mut want: HashMap<u32, usize> = HashMap::with_capacity(entries.len());
+        for (k, &e) in entries.iter().enumerate() {
+            want.insert(e, k);
+        }
+        let mut out = vec![None; entries.len()];
+        for map in &self.rec_maps {
+            for (record, &first) in map.iter().enumerate() {
+                if first == NO_PARENT {
+                    continue;
+                }
+                if let Some(&k) = want.get(&first) {
+                    out[k] = Some(record as u64);
+                }
+                if let Some(more) = self.links.get(&first) {
+                    for m in more {
+                        if let Some(&k) = want.get(m) {
+                            out[k] = Some(record as u64);
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// The live entry (first hard link) of an MFT record, if any.
+    pub fn live_entry_of(&self, vol: usize, record: u64) -> Option<u32> {
+        if vol >= self.rec_maps.len() {
+            return None;
+        }
+        self.entries_of(vol, record).into_iter().find(|&e| self.flags[e as usize] & HIDDEN_FROM_SEARCH == 0)
+    }
+
     /// Entries (any state) of one MFT record, for diagnostics.
     pub fn entries_for_record(&self, vol: usize, record: u64) -> Vec<u32> {
         self.entries_of(vol, record)

@@ -4,6 +4,7 @@
 
 #![cfg(windows)]
 
+pub mod content;
 pub mod engine;
 pub mod log;
 pub mod sync;
@@ -20,7 +21,7 @@ pub fn run_foreground(cfg: Config, seconds: Option<u64>) -> Result<(), String> {
     let engine = Engine::start(cfg, Logger::console());
     let handler: whereti_ipc::Handler = {
         let engine = engine.clone();
-        Arc::new(move |req| engine.handle(req))
+        Arc::new(move |req, caller| engine.handle(req, caller))
     };
     let server = whereti_ipc::Server::start(handler).map_err(|e| {
         engine.stop();

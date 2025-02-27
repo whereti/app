@@ -85,6 +85,34 @@ fn run_via_service(mut client: Client, args: &SearchArgs) -> Result<(), String> 
         dur_fine(Duration::from_micros(reply.micros)),
         dur_fine(round_trip)
     );
+    // Then the files whose text matches (not already listed by name).
+    let content_req = Request::ContentSearch(SearchRequest {
+        query: args.query.join(" "),
+        limit: args.limit as u32,
+        sort: whereti_ipc::Sort::Relevance,
+    });
+    let t = Instant::now();
+    if let Response::Content(c) = client.call(&content_req).map_err(|e| e.to_string())? {
+        let named: std::collections::HashSet<&str> = reply.rows.iter().map(|r| r.path.as_str()).collect();
+        let extra: Vec<&Row> = c.rows.iter().filter(|r| !named.contains(r.path.as_str())).collect();
+        if !extra.is_empty() || c.note.is_some() {
+            println!();
+            println!("found in content:");
+            for r in &extra {
+                print_row(r, tz);
+            }
+            if let Some(n) = &c.note {
+                println!("note: {n}");
+            }
+            println!();
+            println!(
+                "{} files contain the words · {} in the service, {} round trip",
+                num(c.total),
+                dur_fine(Duration::from_micros(c.micros)),
+                dur_fine(t.elapsed())
+            );
+        }
+    }
     if let Some(n) = args.bench {
         let mut service = Vec::new();
         let mut total = Vec::new();
@@ -229,6 +257,15 @@ pub fn status(args: StatusArgs) -> Result<(), String> {
         dur(Duration::from_millis(s.cpu_ms)),
         bytes(s.private_bytes)
     );
+    let c = &s.content;
+    println!(
+        "content        {} · {} documents, {} waiting, {} unreadable · {} on disk",
+        c.state,
+        num(c.files),
+        num(c.queued),
+        num(c.failed),
+        bytes(c.disk_bytes)
+    );
     if args.log {
         println!();
         for line in &s.recent_log {
@@ -305,6 +342,62 @@ pub fn exclusions(args: ExclusionsArgs) -> Result<(), String> {
     match client.call(&Request::SetExclusions { paths }).map_err(|e| e.to_string())? {
         Response::Ok => {
             println!("saved — the service is rebuilding the index (a few seconds); `wt status` shows progress");
+            Ok(())
+        }
+        Response::Error(e) => Err(e),
+        other => Err(format!("unexpected reply: {other:?}")),
+    }
+}
+
+#[derive(Args)]
+pub struct ContentArgs {
+    /// list (default), add, remove or reset (back to Desktop, Documents, Downloads)
+    #[arg(default_value = "list")]
+    action: String,
+    /// Folder to add or remove, e.g. D:\Acte
+    path: Option<String>,
+}
+
+/// `wt content [list|add|remove|reset] [FOLDER]` — folders indexed by content.
+pub fn content(args: ContentArgs) -> Result<(), String> {
+    let mut client = Client::connect(Duration::from_millis(500)).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            "the whereti service is not running".to_string()
+        } else {
+            e.to_string()
+        }
+    })?;
+    let cfg = match client.call(&Request::GetConfig).map_err(|e| e.to_string())? {
+        Response::Config(c) => c,
+        other => return Err(format!("unexpected reply: {other:?}")),
+    };
+    let mut paths = cfg.content_folders.clone();
+    match (args.action.as_str(), args.path) {
+        ("list", _) => {
+            for p in &paths {
+                println!("{p}");
+            }
+            return Ok(());
+        }
+        ("add", Some(p)) => {
+            if paths.iter().any(|x| x.eq_ignore_ascii_case(&p)) {
+                return Err(format!("{p} is already indexed"));
+            }
+            paths.push(p);
+        }
+        ("remove", Some(p)) => {
+            let before = paths.len();
+            paths.retain(|x| !x.eq_ignore_ascii_case(&p));
+            if paths.len() == before {
+                return Err(format!("{p} is not in the list"));
+            }
+        }
+        ("reset", _) => paths = cfg.default_content_folders.clone(),
+        _ => return Err("usage: wt content [list | add FOLDER | remove FOLDER | reset]".into()),
+    }
+    match client.call(&Request::SetContentFolders { paths }).map_err(|e| e.to_string())? {
+        Response::Ok => {
+            println!("saved — the service indexes the difference in the background; `wt status` shows progress");
             Ok(())
         }
         Response::Error(e) => Err(e),

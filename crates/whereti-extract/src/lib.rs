@@ -75,6 +75,17 @@ pub fn kind_of(ext: &str) -> Option<Kind> {
     })
 }
 
+/// Extensions with a converter, besides plain text.
+const DOC_EXTS: &[&str] = &[
+    "docx", "docm", "dotx", "dotm", "pptx", "pptm", "ppsx", "potx", "xlsx", "xlsm", "xlsb", "xls", "ods", "odt", "odp",
+    "pdf", "rtf", "html", "htm", "xhtml",
+];
+
+/// Every extension `extract` reads, lower case, without the dot.
+pub fn extensions() -> Vec<&'static str> {
+    DOC_EXTS.iter().chain(TEXT_EXTS).copied().collect()
+}
+
 /// Plain-text formats: documents, data and ~80 kinds of source code.
 const TEXT_EXTS: &[&str] = &[
     "txt", "md", "markdown", "log", "csv", "tsv", "json", "jsonc", "xml", "yaml", "yml", "toml", "ini", "cfg",
@@ -483,6 +494,13 @@ mod tests {
     fn rtf_and_html() {
         let html = "<html><head><style>p{}</style><script>var x=1;</script></head><body><p>Ofertă &amp; preț</p><p>Linia&nbsp;2</p></body></html>";
         assert_eq!(extract("html", html.as_bytes(), 1000).unwrap().text, "Ofertă & preț\nLinia 2");
+    }
+
+    #[test]
+    fn every_listed_extension_has_a_kind() {
+        for e in extensions() {
+            assert!(kind_of(e).is_some(), "{e}");
+        }
     }
 
     #[test]

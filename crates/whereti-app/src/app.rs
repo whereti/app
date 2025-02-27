@@ -79,6 +79,10 @@ pub struct WheretiApp {
     generation: u64,
     rows: Vec<Row>,
     total: u64,
+    /// `rows[content_start..]` were found in file contents (not by name).
+    content_start: Option<usize>,
+    /// A content search for the current query is on its way.
+    content_pending: bool,
     round_trip: Duration,
     warnings: Vec<String>,
     recent_mode: bool,
@@ -121,6 +125,8 @@ impl WheretiApp {
             generation: 0,
             rows: Vec::new(),
             total: 0,
+            content_start: None,
+            content_pending: false,
             round_trip: Duration::ZERO,
             warnings: Vec::new(),
             recent_mode: true,
@@ -181,7 +187,9 @@ impl WheretiApp {
         self.generation += 1;
         let (query, sort, recent) = self.effective_query();
         self.recent_mode = recent;
-        self.searcher.search(Job { generation: self.generation, query, sort, limit: RESULT_LIMIT });
+        let content = !recent && !highlight_needles(&self.query).is_empty();
+        self.content_pending = content;
+        self.searcher.search(Job { generation: self.generation, query, sort, limit: RESULT_LIMIT, content });
     }
 
     pub(crate) fn flash(&mut self, msg: impl Into<String>) {
@@ -218,16 +226,32 @@ impl WheretiApp {
                     self.offline = None;
                     self.rows = reply.rows;
                     self.total = reply.total;
+                    self.content_start = None;
                     self.round_trip = round_trip;
                     self.warnings = reply.warnings;
                     self.selected = 0;
                     self.scroll_offset = 0.0;
                     self.scroll_to_selected = true;
                 }
+                Update::Content { generation, reply } => {
+                    if generation != self.generation {
+                        continue;
+                    }
+                    self.content_pending = false;
+                    let named: std::collections::HashSet<String> = self.rows.iter().map(|r| r.path.clone()).collect();
+                    let extra: Vec<Row> = reply.rows.into_iter().filter(|r| !named.contains(&r.path)).collect();
+                    if !extra.is_empty() {
+                        self.content_start = Some(self.rows.len());
+                        self.rows.extend(extra);
+                    }
+                }
                 Update::Status(s) => {
                     self.offline = None;
                     if let Some(t) = &self.tray {
-                        let tip = format!("whereti — {} fișiere · {}", shell::count(s.entries), state_ro(&s.state));
+                        let mut tip = format!("whereti — {} fișiere · {}", shell::count(s.entries), state_ro(&s.state));
+                        if s.content.state == "indexing" {
+                            tip.push_str(&format!("\nConținut: {}", content_progress(&s.content)));
+                        }
                         let _ = t.icon.set_tooltip(Some(tip));
                     }
                     self.status = Some(s);
@@ -432,11 +456,20 @@ impl WheretiApp {
             );
             return;
         }
+        if self.rows.is_empty() && self.content_pending {
+            ui.add_space(30.0);
+            ui.vertical_centered(|ui| {
+                ui.add(egui::Spinner::new().size(18.0).color(p.text3));
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new("Caut și în conținutul fișierelor…").size(13.0).color(p.text3));
+            });
+            return;
+        }
         if self.rows.is_empty() {
             let (title, sub) = if self.query.trim().is_empty() && self.filter == Filter::All {
                 ("Nimic modificat recent", "Fișierele modificate în Desktop, Documents și Downloads apar aici.".to_string())
             } else {
-                ("Nimic găsit", format!("Niciun nume nu se potrivește cu „{}”. Încearcă:", self.query.trim()))
+                ("Nimic găsit", format!("Niciun fișier nu conține „{}” în nume sau în text. Încearcă:", self.query.trim()))
             };
             if let Some(example) = empty_state(ui, p, p.text3, title, &sub, &["factura", "ext:pdf", "dm:today", "*.jpg"]) {
                 self.query = example.to_string();
@@ -449,6 +482,8 @@ impl WheretiApp {
         ui.add_space(4.0);
         let header = if self.recent_mode {
             "RECENTE".to_string()
+        } else if self.content_start == Some(0) {
+            "NICIUN NUME NU SE POTRIVEȘTE".to_string()
         } else {
             format!("{} REZULTATE", shell::count(self.total))
         };
@@ -467,8 +502,9 @@ impl WheretiApp {
         // Keep the selected row visible after keyboard moves.
         let mut area = egui::ScrollArea::vertical().auto_shrink([false, false]);
         // (the first frame does not know the view height yet: wait for it)
+        let item_of = |row: usize, start: Option<usize>| row + start.is_some_and(|s| row >= s) as usize;
         if self.scroll_to_selected && self.view_height > 0.0 {
-            let top = self.selected as f32 * ROW_HEIGHT;
+            let top = item_of(self.selected, self.content_start) as f32 * ROW_HEIGHT;
             let mut off = self.scroll_offset;
             if top < off {
                 off = top;
@@ -486,8 +522,20 @@ impl WheretiApp {
         let tz = self.tz;
         let needles = highlight_needles(&self.query);
         let now = now_minutes();
-        let out = area.show_rows(ui, ROW_HEIGHT, rows.len(), |ui, range| {
-            for i in range {
+        let content_start = self.content_start;
+        let section = self.content_section_label();
+        let items = rows.len() + content_start.is_some() as usize;
+        let out = area.show_rows(ui, ROW_HEIGHT, items, |ui, range| {
+            for item in range {
+                let i = match content_start {
+                    Some(s) if item == s => {
+                        let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), ROW_HEIGHT), Sense::hover());
+                        paint_section(ui, p, rect, &section);
+                        continue;
+                    }
+                    Some(s) if item > s => item - 1,
+                    _ => item,
+                };
                 let (rect, resp) =
                     ui.allocate_exact_size(Vec2::new(ui.available_width(), ROW_HEIGHT), Sense::click_and_drag());
                 paint_row(ui, p, rect, &rows[i], i == selected, resp.hovered(), tz, now, &needles);
@@ -534,6 +582,18 @@ impl WheretiApp {
         }
     }
 
+    /// "GĂSIT ÎN CONȚINUT · 12" (+ indexing progress while it runs).
+    fn content_section_label(&self) -> String {
+        let shown = self.content_start.map_or(0, |s| self.rows.len() - s) as u64;
+        let mut label = format!("GĂSIT ÎN CONȚINUT · {}", shell::count(shown));
+        if let Some(c) = self.status.as_ref().map(|s| &s.content) {
+            if c.state == "indexing" {
+                label.push_str(&format!("   ·   indexare în curs, {}", content_progress(c)));
+            }
+        }
+        label
+    }
+
     fn status_bar(&mut self, ui: &mut egui::Ui, p: &Palette) {
         let rect = ui.max_rect();
         ui.painter().hline(rect.x_range(), rect.top(), Stroke::new(1.0, p.border));
@@ -562,6 +622,10 @@ impl WheretiApp {
                 ui.add_space(14.0);
                 let (dot, text) = match (&self.offline, &self.status) {
                     (Some(_), _) => (p.error, "serviciul nu rulează".to_string()),
+                    (None, Some(s)) if s.state == "ready" && s.content.state == "indexing" => (
+                        p.warn,
+                        format!("{} fișiere · conținut {}", shell::count(s.entries), content_progress(&s.content)),
+                    ),
                     (None, Some(s)) if s.state == "ready" => {
                         (p.ok, format!("{} fișiere indexate · actualizat", shell::count(s.entries)))
                     }
@@ -676,6 +740,21 @@ pub(crate) fn state_ro(state: &str) -> String {
         s if s.starts_with("rescanning") => s.replace("rescanning", "se rescanează"),
         s => s.to_string(),
     }
+}
+
+/// "1.234 din 5.678 documente (22%)"
+pub(crate) fn content_progress(c: &whereti_ipc::ContentStatus) -> String {
+    let all = c.done + c.queued;
+    let pct = (c.done * 100).checked_div(all).unwrap_or(100);
+    format!("{} din {} documente ({pct}%)", shell::count(c.done), shell::count(all))
+}
+
+/// The header between name results and content results.
+fn paint_section(ui: &egui::Ui, p: &Palette, rect: Rect, label: &str) {
+    let painter = ui.painter_at(rect);
+    let y = rect.bottom() - 14.0;
+    painter.hline(rect.x_range().shrink(8.0), rect.top() + 14.0, Stroke::new(1.0, p.border));
+    painter.text(Pos2::new(rect.left() + 8.0, y), Align2::LEFT_CENTER, label, FontId::new(11.0, semibold()), p.text3);
 }
 
 pub(crate) fn semibold() -> FontFamily {
@@ -933,6 +1012,7 @@ fn type_color(ext: &str, dark: bool) -> Color32 {
 fn highlight_needles(query: &str) -> Vec<String> {
     query
         .split_whitespace()
+        .map(|w| w.strip_prefix("content:").or_else(|| w.strip_prefix("c:")).unwrap_or(w))
         .filter(|w| !w.contains(':') && !w.starts_with('!') && !w.contains(['*', '?', '\\', '|', '"']))
         .map(whereti_query::fold)
         .filter(|w| !w.is_empty())

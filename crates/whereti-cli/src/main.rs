@@ -46,6 +46,8 @@ enum Cmd {
     Verify(live_cmd::VerifyArgs),
     /// Show what Windows, the MFT and the index say about one path (Administrator)
     Inspect(inspect_cmd::InspectArgs),
+    /// List, add or remove the folders indexed by content (through the service)
+    Content(search_cmd::ContentArgs),
     /// Extract the text of documents (in the sandboxed worker), with timings
     Extract(extract_cmd::ExtractArgs),
 }
@@ -119,6 +121,7 @@ fn main() -> ExitCode {
         Cmd::Exclusions(args) => search_cmd::exclusions(args).map(|_| ExitCode::SUCCESS),
         Cmd::Verify(args) => live_cmd::verify(args).map(|_| ExitCode::SUCCESS),
         Cmd::Inspect(args) => inspect_cmd::run(args).map(|_| ExitCode::SUCCESS),
+        Cmd::Content(args) => search_cmd::content(args).map(|_| ExitCode::SUCCESS),
         Cmd::Extract(args) => extract_cmd::run(args).map(|_| ExitCode::SUCCESS),
     };
     match result {

@@ -212,9 +212,10 @@ fn limit_keeps_the_best_and_counts_all() {
 #[test]
 fn unsupported_terms_warn_instead_of_failing() {
     let idx = index();
+    // content terms are answered by the content index, never by names
     let r = idx.search(&parse("c:factura", &ctx()), &SearchOptions::default());
     assert_eq!(r.total, 0);
-    assert_eq!(r.warnings.len(), 1);
+    assert!(r.warnings.is_empty());
     let r = idx.search(&parse("regex:(", &ctx()), &SearchOptions::default());
     assert_eq!(r.warnings.len(), 1);
     assert!(idx.search(&parse("", &ctx()), &SearchOptions::default()).hits.is_empty());
@@ -253,4 +254,38 @@ fn snapshot_round_trip_and_damage_detection() {
     std::fs::write(&path, &bytes[..mid]).unwrap();
     assert!(snapshot::load(&path).is_err(), "truncated file must be detected");
     std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn records_entries_and_filters_for_the_content_index() {
+    let idx = index();
+    // every PDF/TXT under C:\Users\ana\Documents, unranked
+    let q = parse(r#"path:"c:\users\ana\documents\" ext:pdf;txt"#, &ctx());
+    let entries = idx.matching(&q);
+    let mut paths: Vec<String> = entries.iter().map(|&e| idx.full_path(e)).collect();
+    paths.sort();
+    assert_eq!(
+        paths,
+        [
+            r"C:\Users\ana\Documents\Raport anual 2025.pdf",
+            r"C:\Users\ana\Documents\factura_enel.PDF",
+            r"C:\Users\ana\Documents\raport.txt",
+            r"C:\Users\ana\Documents\shared.txt",
+            r"C:\Users\ana\Documents\Școală\temă.txt",
+        ]
+    );
+    // entry -> MFT record -> a live entry of the same record
+    let records = idx.records_of(&entries);
+    for (e, r) in entries.iter().zip(&records) {
+        let r = r.expect("every live entry has a record");
+        let back = idx.live_entry_of(0, r).expect("live");
+        // a hard link may come back as the other name of the same file
+        assert!(back == *e || idx.full_path(back).ends_with("shared.txt"));
+    }
+    assert_eq!(idx.live_entry_of(0, 999_999), None);
+    assert_eq!(idx.live_entry_of(7, 41), None, "no such volume");
+    // filter keeps the given order and applies the conditions
+    let pdfs = idx.filter(&parse("ext:pdf", &ctx()), &entries);
+    assert_eq!(pdfs.len(), 2);
+    assert!(pdfs.iter().all(|&e| idx.full_path(e).to_lowercase().ends_with(".pdf")));
 }

@@ -8,7 +8,9 @@ repository.workspace = true
 [dependencies]
 parking_lot = "0.13.0"
 rayon = "1.12.0"
+whereti-content = { version = "0.0.1", path = "../whereti-content" }
 whereti-core = { version = "0.0.1", path = "../whereti-core" }
+whereti-extract = { version = "0.0.1", path = "../whereti-extract" }
 whereti-ipc = { version = "0.0.1", path = "../whereti-ipc" }
 whereti-ntfs = { version = "0.0.1", path = "../whereti-ntfs" }
 whereti-query = { version = "0.0.1", path = "../whereti-query" }

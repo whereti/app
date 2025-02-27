@@ -102,7 +102,7 @@ fn run_service() -> Result<(), String> {
     let engine = Engine::start(Config::default(), log);
     let pipe_handler: whereti_ipc::Handler = {
         let engine = engine.clone();
-        Arc::new(move |req| engine.handle(req))
+        Arc::new(move |req, caller| engine.handle(req, caller))
     };
     let server = match whereti_ipc::Server::start(pipe_handler) {
         Ok(s) => s,

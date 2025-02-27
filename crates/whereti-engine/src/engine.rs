@@ -19,10 +19,11 @@ use std::time::{Duration, Instant};
 use parking_lot::{Mutex, RwLock};
 use whereti_core::{build, snapshot, ApplyStats, Exclusions, NameIndex, SearchOptions, SortBy};
 use whereti_ipc::{
-    ConfigReply, Request, Response, Row, SearchReply, Sort, StatusReply, VolumeStatus, PROTOCOL_VERSION,
+    Caller, ConfigReply, Request, Response, Row, SearchReply, Sort, StatusReply, VolumeStatus, PROTOCOL_VERSION,
 };
 use whereti_ntfs::Volume;
 
+use crate::content::{self, Content};
 use crate::log::Logger;
 use crate::sync::{self, Batch, JournalMsg, JournalRead, Prefetched};
 use crate::system::{self, Background};
@@ -82,13 +83,15 @@ impl From<JournalMsg> for Msg {
     }
 }
 
-struct Shared {
-    index: RwLock<Option<NameIndex>>,
-    state: Mutex<String>,
+pub(crate) struct Shared {
+    pub(crate) index: RwLock<Option<NameIndex>>,
+    pub(crate) state: Mutex<String>,
     started: Instant,
-    last_change: Mutex<Option<Instant>>,
+    pub(crate) last_change: Mutex<Option<Instant>>,
     open_files: AtomicU64,
-    log: Logger,
+    pub(crate) log: Logger,
+    /// Told about changes, so it re-plans only when documents changed.
+    pub(crate) content: std::sync::OnceLock<Arc<Content>>,
 }
 
 impl Shared {
@@ -101,6 +104,8 @@ pub struct Engine {
     shared: Arc<Shared>,
     tx: mpsc::Sender<Msg>,
     worker: Mutex<Option<JoinHandle<()>>>,
+    content: Arc<Content>,
+    content_thread: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl Engine {
@@ -113,7 +118,16 @@ impl Engine {
             last_change: Mutex::new(None),
             open_files: AtomicU64::new(0),
             log,
+            content: std::sync::OnceLock::new(),
         });
+        let content_dir = if cfg.index_path == system::default_index_path() {
+            let _ = system::ensure_data_dir();
+            system::data_dir().join("content")
+        } else {
+            cfg.index_path.with_file_name("content")
+        };
+        let content = Content::open(&content_dir, &|m| shared.log.log(m));
+        let _ = shared.content.set(content.clone());
         let worker = {
             let (shared, tx) = (shared.clone(), tx.clone());
             std::thread::Builder::new()
@@ -121,13 +135,27 @@ impl Engine {
                 .spawn(move || Worker::new(shared, cfg, tx).run(rx))
                 .expect("engine thread")
         };
-        Arc::new(Engine { shared, tx, worker: Mutex::new(Some(worker)) })
+        let content_thread = {
+            let (content, shared) = (content.clone(), shared.clone());
+            std::thread::Builder::new().name("content".into()).spawn(move || content.run(shared)).expect("content thread")
+        };
+        Arc::new(Engine {
+            shared,
+            tx,
+            worker: Mutex::new(Some(worker)),
+            content,
+            content_thread: Mutex::new(Some(content_thread)),
+        })
     }
 
-    /// Saves (if needed) and stops the worker.
+    /// Saves (if needed) and stops the worker and the content indexer.
     pub fn stop(&self) {
+        self.content.stop();
         let _ = self.tx.send(Msg::Stop);
         if let Some(h) = self.worker.lock().take() {
+            let _ = h.join();
+        }
+        if let Some(h) = self.content_thread.lock().take() {
             let _ = h.join();
         }
     }
@@ -140,7 +168,7 @@ impl Engine {
         self.shared.log.log(msg);
     }
 
-    pub fn handle(&self, req: Request) -> Response {
+    pub fn handle(&self, req: Request, caller: &dyn Caller) -> Response {
         match req {
             Request::Hello { .. } => Response::Hello {
                 version: PROTOCOL_VERSION,
@@ -190,8 +218,29 @@ impl Engine {
                     Some(idx) => (idx.volumes().iter().map(|v| v.letter()).collect(), idx.exclusions().to_vec()),
                     None => (Vec::new(), Vec::new()),
                 };
-                Response::Config(ConfigReply { volumes, exclusions, default_exclusions: default_exclusions(false) })
+                Response::Config(ConfigReply {
+                    volumes,
+                    exclusions,
+                    default_exclusions: default_exclusions(false),
+                    content_folders: self.content.folders(),
+                    default_content_folders: content::default_folders(),
+                })
             }
+            Request::ContentSearch(r) => {
+                let guard = self.shared.index.read();
+                let Some(idx) = guard.as_ref() else {
+                    return Response::Content(Default::default());
+                };
+                let query = whereti_query::parse(&r.query, &system::date_ctx());
+                Response::Content(self.content.search(idx, &query, r.limit.min(MAX_LIMIT) as usize, caller))
+            }
+            Request::SetContentFolders { paths } => match self.content.set_folders(&paths) {
+                Ok(()) => {
+                    self.log(format!("content folders changed by a client: {}", self.content.folders().join(" · ")));
+                    Response::Ok
+                }
+                Err(e) => Response::Error(e),
+            },
             Request::SetExclusions { paths } => match validate_exclusions(&paths) {
                 Ok(paths) => {
                     self.log(format!("exclusions changed by a client: {}", paths.join(" · ")));
@@ -220,6 +269,7 @@ impl Engine {
                     last_change_secs: self.shared.last_change.lock().map(|t| t.elapsed().as_secs()),
                     open_files: self.shared.open_files.load(Ordering::Relaxed),
                     recent_log: self.shared.log.recent(),
+                    content: self.content.status(),
                 })
             }
         }
@@ -404,6 +454,7 @@ impl Worker {
     /// apply them and move the journal position.
     fn apply_batch(&mut self, v: usize, batch: Batch, journal_id: u64, next_usn: i64) -> Result<ApplyStats, String> {
         let mut pre = Prefetched::read(&self.vols[v], &batch.records).map_err(|e| format!("reading MFT records: {e}"))?;
+        let records = batch.records.clone();
         let stats = {
             let mut guard = self.shared.index.write();
             let idx = guard.as_mut().expect("index");
@@ -413,6 +464,9 @@ impl Worker {
             }
             stats
         };
+        if let (Some(c), Some(idx)) = (self.shared.content.get(), self.shared.index.read().as_ref()) {
+            c.note_changes(idx, v, &records);
+        }
         if stats.records > 0 {
             self.dirty = true;
             self.last_change = Instant::now();
@@ -570,6 +624,9 @@ impl Worker {
             }
         }
         self.dirty = true;
+        if let Some(c) = self.shared.content.get() {
+            c.recheck();
+        }
         self.shared.set_state("ready");
         self.log(format!("rescanned {list} in {} ms", t.elapsed().as_millis()));
         Ok(())
@@ -599,6 +656,9 @@ impl Worker {
         }
         self.dirty = true;
         self.save()?;
+        if let Some(c) = self.shared.content.get() {
+            c.recheck();
+        }
         self.shared.set_state("ready");
         self.log(format!(
             "rebuilt with new exclusions: {} entries ({} excluded) in {} ms",
