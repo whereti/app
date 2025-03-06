@@ -36,6 +36,7 @@ enum Msg {
     Status,
     Config,
     SetExclusions(Vec<String>),
+    SetContentFolders(Vec<String>),
 }
 
 pub struct Searcher {
@@ -71,6 +72,10 @@ impl Searcher {
         let _ = self.tx.send(Msg::SetExclusions(paths));
     }
 
+    pub fn set_content_folders(&self, paths: Vec<String>) {
+        let _ = self.tx.send(Msg::SetContentFolders(paths));
+    }
+
     pub fn updates(&self) -> impl Iterator<Item = Update> + '_ {
         std::iter::from_fn(|| self.rx.try_recv().ok())
     }
@@ -82,6 +87,7 @@ struct Pending {
     status: bool,
     config: bool,
     exclusions: Option<Vec<String>>,
+    content_folders: Option<Vec<String>>,
 }
 
 fn worker(jobs: Receiver<Msg>, out: Sender<Update>, wake: impl Fn()) {
@@ -97,6 +103,11 @@ fn worker(jobs: Receiver<Msg>, out: Sender<Update>, wake: impl Fn()) {
             Msg::SetExclusions(e) => {
                 p.exclusions = Some(e);
                 p.config = true;
+            }
+            Msg::SetContentFolders(f) => {
+                p.content_folders = Some(f);
+                p.config = true;
+                p.status = true;
             }
         };
         take(first);
@@ -128,6 +139,14 @@ fn worker(jobs: Receiver<Msg>, out: Sender<Update>, wake: impl Fn()) {
                 let msg = match c.call(&Request::SetExclusions { paths })? {
                     Response::Ok => "Excluderile au fost salvate — indexul se reconstruiește".to_string(),
                     Response::Error(e) => format!("Nu s-au putut salva excluderile: {e}"),
+                    _ => "Răspuns neașteptat de la serviciu".to_string(),
+                };
+                let _ = out.send(Update::Done(msg));
+            }
+            if let Some(paths) = p.content_folders {
+                let msg = match c.call(&Request::SetContentFolders { paths })? {
+                    Response::Ok => "Folderele au fost salvate — conținutul lor se indexează în fundal".to_string(),
+                    Response::Error(e) => format!("Nu s-au putut salva folderele: {e}"),
                     _ => "Răspuns neașteptat de la serviciu".to_string(),
                 };
                 let _ = out.send(Update::Done(msg));

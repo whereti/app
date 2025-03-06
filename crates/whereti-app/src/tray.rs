@@ -165,5 +165,30 @@ pub fn magnifier_rgba() -> Vec<u8> {
 }
 
 fn magnifier_icon() -> Icon {
-    Icon::from_rgba(magnifier_rgba(), 32, 32).expect("valid icon")
+    icon_with_progress(None)
+}
+
+/// The magnifier, with a progress bar along the bottom while indexing
+/// (`percent` = how far; `None` = the plain icon).
+pub fn icon_with_progress(percent: Option<u8>) -> Icon {
+    let mut px = magnifier_rgba();
+    if let Some(pct) = percent {
+        let n = 32usize;
+        let filled = 2 + (28 * pct.min(100) as usize) / 100;
+        for y in 26..31 {
+            for x in 1..31 {
+                let i = (y * n + x) * 4;
+                let edge = y == 26 || y == 30 || x == 1 || x == 30;
+                let color = if edge {
+                    [0xFF, 0xFF, 0xFF, 0xFF]
+                } else if x < filled {
+                    [0x1E, 0xA0, 0x4E, 0xFF] // green: done
+                } else {
+                    [0x50, 0x50, 0x58, 0xFF]
+                };
+                px[i..i + 4].copy_from_slice(&color);
+            }
+        }
+    }
+    Icon::from_rgba(px, 32, 32).expect("valid icon")
 }

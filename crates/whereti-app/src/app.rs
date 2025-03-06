@@ -22,6 +22,9 @@ use crate::tray::{Requests, Tray, PREFERRED_HOTKEY};
 const ROW_HEIGHT: f32 = 56.0;
 const RESULT_LIMIT: u32 = 500;
 const STATUS_EVERY: Duration = Duration::from_secs(2);
+/// While indexing, the status is asked for this often even with the window
+/// hidden, for the tray icon's progress. Once ready: never while hidden.
+const STATUS_HIDDEN_EVERY: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Filter {
@@ -91,6 +94,10 @@ pub struct WheretiApp {
     scroll_offset: f32,
     view_height: f32,
     pub(crate) status: Option<StatusReply>,
+    /// Content indexing speed, for "~3 min left".
+    eta: Eta,
+    /// Progress shown on the tray icon, in 5 % steps (`None` = plain icon).
+    tray_progress: Option<u8>,
     pub(crate) offline: Option<String>,
     last_status_ask: Instant,
     pub(crate) message: Option<(String, Instant)>,
@@ -135,6 +142,8 @@ impl WheretiApp {
             scroll_offset: 0.0,
             view_height: 0.0,
             status: None,
+            eta: Eta::default(),
+            tray_progress: None,
             offline: None,
             last_status_ask: Instant::now() - STATUS_EVERY,
             message: None,
@@ -165,6 +174,10 @@ impl WheretiApp {
         }
         app.run_search();
         app
+    }
+
+    pub(crate) fn content_eta(&self, c: &whereti_ipc::ContentStatus) -> Option<Duration> {
+        self.eta.left(c)
     }
 
     pub(crate) fn hotkey_label(&self) -> Option<&'static str> {
@@ -247,10 +260,17 @@ impl WheretiApp {
                 }
                 Update::Status(s) => {
                     self.offline = None;
+                    self.eta.sample(&s.content);
+                    let eta = self.eta.left(&s.content);
+                    let progress = indexing_fraction(&s).map(|f| ((f * 20.0).floor() as u8).min(19) * 5);
                     if let Some(t) = &self.tray {
+                        if progress != self.tray_progress {
+                            let _ = t.icon.set_icon(Some(crate::tray::icon_with_progress(progress)));
+                            self.tray_progress = progress;
+                        }
                         let mut tip = format!("whereti — {} fișiere · {}", shell::count(s.entries), state_ro(&s.state));
                         if s.content.state == "indexing" {
-                            tip.push_str(&format!("\nConținut: {}", content_progress(&s.content)));
+                            tip.push_str(&format!("\nConținut: {}", content_progress(&s.content, eta)));
                         }
                         let _ = t.icon.set_tooltip(Some(tip));
                     }
@@ -588,7 +608,7 @@ impl WheretiApp {
         let mut label = format!("GĂSIT ÎN CONȚINUT · {}", shell::count(shown));
         if let Some(c) = self.status.as_ref().map(|s| &s.content) {
             if c.state == "indexing" {
-                label.push_str(&format!("   ·   indexare în curs, {}", content_progress(c)));
+                label.push_str(&format!("   ·   indexare în curs, {}", content_progress(c, self.eta.left(c))));
             }
         }
         label
@@ -624,7 +644,7 @@ impl WheretiApp {
                     (Some(_), _) => (p.error, "serviciul nu rulează".to_string()),
                     (None, Some(s)) if s.state == "ready" && s.content.state == "indexing" => (
                         p.warn,
-                        format!("{} fișiere · conținut {}", shell::count(s.entries), content_progress(&s.content)),
+                        format!("{} fișiere · conținut {}", shell::count(s.entries), content_progress(&s.content, self.eta.left(&s.content))),
                     ),
                     (None, Some(s)) if s.state == "ready" => {
                         (p.ok, format!("{} fișiere indexate · actualizat", shell::count(s.entries)))
@@ -658,6 +678,15 @@ impl eframe::App for WheretiApp {
             }
         }
         self.apply_updates();
+        // Hidden: ask once at start (started with --hidden), then only while indexing.
+        let indexing = self.status.as_ref().and_then(indexing_fraction).is_some();
+        if !self.visible && (indexing || (self.status.is_none() && self.offline.is_none())) {
+            if self.last_status_ask.elapsed() >= STATUS_HIDDEN_EVERY {
+                self.searcher.ask_status();
+                self.last_status_ask = Instant::now();
+            }
+            ctx.request_repaint_after(STATUS_HIDDEN_EVERY);
+        }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
@@ -742,11 +771,64 @@ pub(crate) fn state_ro(state: &str) -> String {
     }
 }
 
-/// "1.234 din 5.678 documente (22%)"
-pub(crate) fn content_progress(c: &whereti_ipc::ContentStatus) -> String {
+/// "1.234 din 5.678 documente (22%) · ~3 min rămase"
+pub(crate) fn content_progress(c: &whereti_ipc::ContentStatus, left: Option<Duration>) -> String {
     let all = c.done + c.queued;
     let pct = (c.done * 100).checked_div(all).unwrap_or(100);
-    format!("{} din {} documente ({pct}%)", shell::count(c.done), shell::count(all))
+    let mut s = format!("{} din {} documente ({pct}%)", shell::count(c.done), shell::count(all));
+    if let Some(d) = left {
+        s.push_str(&format!(" · {}", time_left(d)));
+    }
+    s
+}
+
+/// "~40 s rămase", "~3 min rămase", "~2 h 10 min rămase"
+pub(crate) fn time_left(d: Duration) -> String {
+    let secs = d.as_secs();
+    if secs < 60 {
+        format!("~{} s rămase", secs.max(5).div_ceil(5) * 5)
+    } else if secs < 3600 {
+        format!("~{} min rămase", secs.div_ceil(60))
+    } else {
+        format!("~{} h {} min rămase", secs / 3600, (secs % 3600) / 60)
+    }
+}
+
+/// How far indexing is, if something is being indexed (0.0–1.0).
+fn indexing_fraction(s: &StatusReply) -> Option<f32> {
+    if s.state == "indexing" || s.state == "reindexing" {
+        return Some(0.0); // the name index has no counter: an empty bar
+    }
+    let c = &s.content;
+    (c.state == "indexing" && c.done + c.queued > 0).then(|| c.done as f32 / (c.done + c.queued) as f32)
+}
+
+/// Measures the content indexing speed over the current round.
+#[derive(Default)]
+pub(crate) struct Eta {
+    start: Option<(Instant, u64)>,
+}
+
+impl Eta {
+    fn sample(&mut self, c: &whereti_ipc::ContentStatus) {
+        match self.start {
+            _ if c.state != "indexing" => self.start = None,
+            // a new round starts counting from 0 again
+            Some((_, d0)) if c.done < d0 => self.start = Some((Instant::now(), c.done)),
+            None => self.start = Some((Instant::now(), c.done)),
+            _ => {}
+        }
+    }
+
+    /// Time left, once there is enough to measure (10 s and 3 documents).
+    pub(crate) fn left(&self, c: &whereti_ipc::ContentStatus) -> Option<Duration> {
+        let (t0, d0) = self.start?;
+        let (elapsed, done) = (t0.elapsed().as_secs_f64(), c.done.saturating_sub(d0));
+        if c.state != "indexing" || elapsed < 10.0 || done < 3 {
+            return None;
+        }
+        Some(Duration::from_secs_f64(c.queued as f64 * elapsed / done as f64))
+    }
 }
 
 /// The header between name results and content results.
@@ -1123,6 +1205,21 @@ pub(crate) fn relative_time(minutes_utc: u32, tz: i32, now_utc: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn time_left_and_progress_text() {
+        assert_eq!(time_left(Duration::from_secs(3)), "~5 s rămase");
+        assert_eq!(time_left(Duration::from_secs(42)), "~45 s rămase");
+        assert_eq!(time_left(Duration::from_secs(61)), "~2 min rămase");
+        assert_eq!(time_left(Duration::from_secs(7800)), "~2 h 10 min rămase");
+        let c = whereti_ipc::ContentStatus { state: "indexing".into(), done: 120, queued: 236, ..Default::default() };
+        assert_eq!(content_progress(&c, None), "120 din 356 documente (33%)");
+        assert_eq!(content_progress(&c, Some(Duration::from_secs(150))), "120 din 356 documente (33%) · ~3 min rămase");
+        // no estimate before there is enough to measure
+        let mut eta = Eta::default();
+        eta.sample(&c);
+        assert_eq!(eta.left(&c), None);
+    }
 
     #[test]
     fn relative_times_in_romanian() {

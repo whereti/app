@@ -253,13 +253,20 @@ fn highlight(text: &str, needles: &[String], p: &Palette, mono: bool) -> (Layout
         ..plain.clone()
     };
     let mut job = LayoutJob::default();
+    // "termen de livrare": "de" alone would light up half the text.
+    let phrase = needles.join(" ");
+    let all_words = needles.len();
+    let long: Vec<String> = needles.iter().filter(|n| n.chars().count() >= 3).cloned().collect();
+    let needles: &[String] = if long.is_empty() { needles } else { &long };
     let marked = if needles.is_empty() { Vec::new() } else { match_mask(text, needles) };
     if marked.is_empty() || !marked.contains(&true) {
         job.append(text, 0.0, plain);
         return (job, 0, None);
     }
+    // Jump to the whole phrase when the text has it, else to the first word.
+    let phrase_at = (all_words > 1).then(|| match_mask(text, &[phrase]).iter().position(|&m| m)).flatten();
     let chars: Vec<(usize, char)> = text.char_indices().collect();
-    let (mut hits, mut first) = (0, None);
+    let (mut hits, mut first) = (0, phrase_at);
     let mut i = 0;
     while i < chars.len() {
         let m = marked[i];

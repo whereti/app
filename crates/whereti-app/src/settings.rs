@@ -32,6 +32,9 @@ pub struct SettingsState {
     exclusions: Vec<String>,
     new_exclusion: String,
     exclusions_dirty: bool,
+    content_folders: Vec<String>,
+    new_content_folder: String,
+    content_dirty: bool,
 }
 
 fn settings_file() -> PathBuf {
@@ -50,6 +53,9 @@ impl SettingsState {
             exclusions: Vec::new(),
             new_exclusion: String::new(),
             exclusions_dirty: false,
+            content_folders: Vec::new(),
+            new_content_folder: String::new(),
+            content_dirty: false,
         };
         if let Ok(text) = std::fs::read_to_string(settings_file()) {
             // Tolerate a UTF-8 BOM and stray spaces: the file may be edited by hand.
@@ -94,6 +100,9 @@ impl SettingsState {
     pub fn on_config(&mut self, c: ConfigReply) {
         if !self.exclusions_dirty {
             self.exclusions = c.exclusions.clone();
+        }
+        if !self.content_dirty {
+            self.content_folders = c.content_folders.clone();
         }
         self.config = Some(c);
     }
@@ -186,6 +195,8 @@ pub fn show(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
                 ui.label(egui::RichText::new(line).size(13.5).color(p.text));
             });
             divider(ui, p);
+            content_block(app, ui, p);
+            divider(ui, p);
             ui.label(egui::RichText::new("Foldere excluse").size(14.0).family(semibold()).color(p.text));
             ui.label(
                 egui::RichText::new(
@@ -269,6 +280,105 @@ pub fn show(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
             ui.label(egui::RichText::new("Licența de susținător vine în curând.").size(12.5).color(p.text3));
         });
         ui.add_space(20.0);
+    });
+}
+
+/// Content indexing: state, progress with time left, and the folders.
+fn content_block(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
+    ui.label(egui::RichText::new("Căutare în conținut").size(14.0).family(semibold()).color(p.text));
+    if let Some(c) = app.status.as_ref().map(|s| s.content.clone()) {
+        let facts = format!(
+            "{} documente indexate · {} pe disc{}",
+            shell::count(c.files),
+            shell::size(c.disk_bytes),
+            if c.failed > 0 { format!(" · {} nu au putut fi citite", shell::count(c.failed)) } else { String::new() }
+        );
+        let state = match c.state.as_str() {
+            "ready" => "la zi".to_string(),
+            "indexing" => "se indexează".to_string(),
+            "scanning" => "verifică folderele".to_string(),
+            "starting" => "pornește".to_string(),
+            other => other.to_string(),
+        };
+        ui.label(egui::RichText::new(format!("{facts} · {state}")).size(12.5).color(p.text2));
+        if c.state == "indexing" {
+            ui.add_space(6.0);
+            let all = (c.done + c.queued).max(1);
+            let frac = c.done as f32 / all as f32;
+            let (r, _) = ui.allocate_exact_size(Vec2::new(ui.available_width().min(420.0), 8.0), Sense::hover());
+            ui.painter().rect_filled(r, 4.0, p.border);
+            let mut done = r;
+            done.set_width(r.width() * frac);
+            ui.painter().rect_filled(done, 4.0, p.accent);
+            ui.add_space(4.0);
+            let text = crate::app::content_progress(&c, app.content_eta(&c));
+            ui.label(egui::RichText::new(text).size(12.5).color(p.text2));
+        }
+    }
+    ui.add_space(10.0);
+    ui.label(egui::RichText::new("Foldere indexate după conținut").size(13.5).family(semibold()).color(p.text));
+    ui.label(
+        egui::RichText::new("Documentele din aceste foldere (PDF, Word, Excel, PowerPoint, text, cod) pot fi găsite după ce scrie în ele.")
+            .size(12.5)
+            .color(p.text2),
+    );
+    ui.add_space(8.0);
+    let mut remove = None;
+    for (i, path) in app.settings.content_folders.iter().enumerate() {
+        Frame::NONE
+            .fill(p.bg)
+            .corner_radius(CornerRadius::same(8))
+            .inner_margin(Margin { left: 12, right: 4, top: 4, bottom: 4 })
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(path).size(13.0).color(p.text));
+                    ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                        if icon_button(ui, p, IconKind::Close, false).on_hover_text("Scoate").clicked() {
+                            remove = Some(i);
+                        }
+                    });
+                });
+            });
+        ui.add_space(4.0);
+    }
+    if let Some(i) = remove {
+        app.settings.content_folders.remove(i);
+        app.settings.content_dirty = true;
+    }
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        let edit = egui::TextEdit::singleline(&mut app.settings.new_content_folder)
+            .hint_text(egui::RichText::new(r"D:\Acte").color(p.text3))
+            .font(FontId::proportional(13.5))
+            .margin(Vec2::new(10.0, 6.0))
+            .desired_width(320.0);
+        let resp = ui.add(edit);
+        let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        if (button(ui, p, "Adaugă", false).clicked() || enter) && !app.settings.new_content_folder.trim().is_empty() {
+            let path = app.settings.new_content_folder.trim().trim_end_matches('\\').to_string();
+            if !app.settings.content_folders.iter().any(|x| x.eq_ignore_ascii_case(&path)) {
+                app.settings.content_folders.push(path);
+                app.settings.content_dirty = true;
+            }
+            app.settings.new_content_folder.clear();
+        }
+    });
+    ui.add_space(10.0);
+    ui.horizontal(|ui| {
+        let dirty = app.settings.content_dirty;
+        if button(ui, p, "Aplică", true).clicked() && dirty {
+            app.searcher.set_content_folders(app.settings.content_folders.clone());
+            app.settings.content_dirty = false;
+        }
+        if button(ui, p, "Restabilește implicitele", false).clicked() {
+            if let Some(c) = &app.settings.config {
+                app.settings.content_folders = c.default_content_folders.clone();
+                app.settings.content_dirty = true;
+            }
+        }
+        if dirty {
+            ui.label(egui::RichText::new("Modificări neaplicate").size(12.5).color(p.warn));
+        }
     });
 }
 
