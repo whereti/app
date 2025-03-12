@@ -296,12 +296,15 @@ fn content_block(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
         let state = match c.state.as_str() {
             "ready" => "la zi".to_string(),
             "indexing" => "se indexează".to_string(),
+            "paused: battery" => "în pauză: pe baterie".to_string(),
+            "paused: fullscreen" => "în pauză: rulează un joc sau o prezentare".to_string(),
+            "paused: busy" => "în pauză: procesorul e ocupat".to_string(),
             "scanning" => "verifică folderele".to_string(),
             "starting" => "pornește".to_string(),
             other => other.to_string(),
         };
         ui.label(egui::RichText::new(format!("{facts} · {state}")).size(12.5).color(p.text2));
-        if c.state == "indexing" {
+        if crate::app::content_active(&c) {
             ui.add_space(6.0);
             let all = (c.done + c.queued).max(1);
             let frac = c.done as f32 / all as f32;
@@ -316,11 +319,23 @@ fn content_block(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
         }
     }
     ui.add_space(10.0);
-    ui.label(egui::RichText::new("Foldere indexate după conținut").size(13.5).family(semibold()).color(p.text));
     ui.label(
-        egui::RichText::new("Documentele din aceste foldere (PDF, Word, Excel, PowerPoint, text, cod) pot fi găsite după ce scrie în ele.")
-            .size(12.5)
-            .color(p.text2),
+        egui::RichText::new(
+            "Documentele (PDF, Word, Excel, PowerPoint, OpenDocument, RTF, e-mailuri) sunt căutate pe toate discurile, \
+             fără folderele de sistem și de programe — nu trebuie setat nimic.",
+        )
+        .size(12.5)
+        .color(p.text2),
+    );
+    ui.add_space(10.0);
+    ui.label(egui::RichText::new("Fișiere text și cod").size(13.5).family(semibold()).color(p.text));
+    ui.label(
+        egui::RichText::new(
+            "Fișierele .txt, .md, .csv, .html și codul sursă sunt căutate doar în aceste foldere (proiectele au sute de mii). \
+             Adaugă un folder dacă vrei să cauți și în codul lui.",
+        )
+        .size(12.5)
+        .color(p.text2),
     );
     ui.add_space(8.0);
     let mut remove = None;

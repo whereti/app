@@ -39,10 +39,38 @@ pub struct Exclusions {
     pub paths: Vec<String>,
 }
 
+/// Folders that hold only generated files nobody looks for: left out of
+/// the index entirely by default (`**\name` rules). On a developer PC
+/// `node_modules` alone can be half of all entries.
+pub const GENERATED_DIRS: &[&str] = &[
+    // version control internals
+    ".git", ".svn", ".hg", ".bzr",
+    // JavaScript / web
+    "node_modules", "bower_components", ".npm", ".pnpm-store", ".next", ".nuxt", ".svelte-kit", ".angular",
+    ".parcel-cache", ".turbo", ".vercel", ".expo", ".docusaurus", ".sass-cache",
+    // Python
+    "__pycache__", ".venv", ".tox", ".mypy_cache", ".pytest_cache", ".ruff_cache", ".ipynb_checkpoints", ".eggs",
+    // Java / Kotlin / .NET / C++ / Dart / infra
+    ".gradle", ".m2", ".nuget", ".vs", "ipch", "cmake-build-debug", "cmake-build-release", ".dart_tool", ".pub-cache",
+    ".terraform", ".serverless",
+];
+
 impl Exclusions {
     /// The defaults from PLAN.md §5. `windows_dir` is `%SystemRoot%`
     /// (e.g. `C:\Windows`); pass `None` to keep it in the index.
     pub fn defaults(windows_dir: Option<&str>) -> Self {
+        let mut e = Self::system_defaults(windows_dir);
+        e.paths.extend(GENERATED_DIRS.iter().map(|d| format!("**\\{d}")));
+        e
+    }
+
+    /// The defaults before generated folders were left out (whereti ≤ 0.0.1
+    /// builds of 2026-10-24): an index built with exactly these is upgraded.
+    pub fn previous_defaults(windows_dir: Option<&str>) -> Self {
+        Self::system_defaults(windows_dir)
+    }
+
+    fn system_defaults(windows_dir: Option<&str>) -> Self {
         let mut paths: Vec<String> = [
             r"\$Recycle.Bin",
             r"\System Volume Information",
@@ -419,21 +447,36 @@ pub(crate) fn compute_dir_order(idx: &NameIndex) -> Vec<u32> {
     dirs
 }
 
-/// Folder names whose contents users rarely look for (PLAN.md §4.3 ranking).
+/// Folder names whose contents users rarely look for: ranked last, and their
+/// files are never indexed by content (PLAN.md §4.3, §6). Unlike
+/// `GENERATED_DIRS` these names are also used for people's own folders
+/// ("Release", "build", "out"…), so the files stay findable by name.
 const NOISE_DIRS: &[&str] = &[
-    "appdata", "programdata", "program files", "program files (x86)", "node_modules",
-    ".git", ".svn", ".hg", ".cache", "cache", "caches", "temp", "tmp", ".tmp",
-    "__pycache__", "target", ".venv", "venv", "site-packages", ".cargo", ".rustup",
-    ".npm", ".yarn", ".pnpm-store", ".gradle", ".m2", ".nuget", ".vs", ".idea",
-    "obj", ".turbo", ".next", ".codex", ".vscode-server",
+    // system and programs
+    "appdata", "programdata", "program files", "program files (x86)", "windowsapps", "windows.old", "$windows.~bt",
+    "msocache", "steamapps",
+    // build output
+    "bin", "obj", "debug", "release", "build", "dist", "out", "target", "x64", "x86", "coverage", ".nyc_output",
+    // caches and temporary files
+    ".cache", "cache", "caches", "temp", "tmp", ".tmp", "logs",
+    // tools and environments
+    "venv", "site-packages", ".cargo", ".rustup", ".yarn", ".idea", ".vscode", ".vscode-server", ".codex", ".conda",
+    "anaconda3", "miniconda3", ".docker", ".android", ".kotlin",
+    // generated folders (also left out of the index by default; ranked last if a user keeps them)
+    "node_modules", "bower_components", ".git", ".svn", ".hg", ".npm", ".pnpm-store", ".next", ".nuxt", ".turbo",
+    "__pycache__", ".venv", ".tox", ".mypy_cache", ".pytest_cache", ".gradle", ".m2", ".nuget", ".vs",
 ];
 
 pub(crate) fn is_noise_dir(folded_name: &str) -> bool {
     NOISE_DIRS.contains(&folded_name)
 }
 
-/// Sets FLAG_NOISE on noise folders and everything below them.
-fn mark_noise(idx: &mut NameIndex) {
+/// Sets FLAG_NOISE on noise folders and everything below them (and clears
+/// it elsewhere, so a saved index follows the current list).
+pub(crate) fn mark_noise(idx: &mut NameIndex) {
+    for f in &mut idx.flags {
+        *f &= !FLAG_NOISE;
+    }
     let mut folded = String::new();
     for k in 0..idx.dir_order.len() {
         let d = idx.dir_order[k];

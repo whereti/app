@@ -120,6 +120,53 @@ pub fn process_private_bytes() -> u64 {
     }
 }
 
+/// True when running on battery (PLAN.md §6.6: no indexing then).
+pub fn on_battery() -> bool {
+    use windows_sys::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
+    // SAFETY: zeroed out-parameter.
+    let mut s: SYSTEM_POWER_STATUS = unsafe { std::mem::zeroed() };
+    // ACLineStatus: 0 = offline (battery), 1 = online, 255 = unknown (desktops)
+    unsafe { GetSystemPowerStatus(&mut s) != 0 && s.ACLineStatus == 0 }
+}
+
+/// How busy the whole PC's CPU was since the last call, without this
+/// process (0.0–1.0).
+pub struct CpuMeter {
+    last: Option<(u64, u64, u64)>,
+}
+
+impl CpuMeter {
+    pub fn new() -> CpuMeter {
+        CpuMeter { last: None }
+    }
+
+    pub fn busy(&mut self) -> f32 {
+        use windows_sys::Win32::System::Threading::GetSystemTimes;
+        let ft = |f: FILETIME| (f.dwHighDateTime as u64) << 32 | f.dwLowDateTime as u64;
+        // SAFETY: zeroed out-parameters.
+        let (mut idle, mut kernel, mut user) = unsafe { (std::mem::zeroed(), std::mem::zeroed(), std::mem::zeroed()) };
+        if unsafe { GetSystemTimes(&mut idle, &mut kernel, &mut user) } == 0 {
+            return 0.0;
+        }
+        // kernel time includes idle time; all in 100 ns units
+        let now = (ft(idle), ft(kernel) + ft(user), process_cpu_ms() * 10_000);
+        let Some(prev) = self.last.replace(now) else { return 0.0 };
+        let total = now.1.saturating_sub(prev.1);
+        if total == 0 {
+            return 0.0;
+        }
+        let busy = total.saturating_sub(now.0.saturating_sub(prev.0));
+        let ours = now.2.saturating_sub(prev.2);
+        busy.saturating_sub(ours) as f32 / total as f32
+    }
+}
+
+impl Default for CpuMeter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Lowers this thread's CPU *and* disk priority until dropped (PLAN.md §6.6).
 pub struct Background;
 

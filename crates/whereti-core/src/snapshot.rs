@@ -198,6 +198,8 @@ pub fn load(path: &Path) -> io::Result<NameIndex> {
     }
     idx.links = map;
     validate(&idx)?;
+    // the noise list may have grown since the file was written
+    crate::build::mark_noise(&mut idx);
     Ok(idx)
 }
 

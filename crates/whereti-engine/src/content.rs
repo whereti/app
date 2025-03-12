@@ -1,8 +1,13 @@
 //! Content indexing and search (PLAN.md §6, §7.3).
 //!
-//! **What is indexed:** documents (PDF, Office, OpenDocument, RTF, HTML) and
-//! text/code files inside the content folders — by default every user's
-//! Desktop, Documents and Downloads.
+//! **What is indexed — with nothing to set up:**
+//! - **documents** (PDF, Word, Excel, PowerPoint, OpenDocument, RTF, e-mails)
+//!   **everywhere** on the indexed drives, except system and noise folders
+//!   (Program Files, AppData, ProgramData, node_modules, .git, caches…) —
+//!   a typical PC has a few thousand;
+//! - **text and code** (txt, md, csv, html, sources) only inside the content
+//!   folders — by default every user's Desktop, Documents and Downloads —
+//!   because projects and caches hold hundreds of thousands of them.
 //!
 //! **How it stays current:** the name index already knows every file and is
 //! kept live by the USN journal. A round ("crawl") asks it for the files in
@@ -51,6 +56,20 @@ const COMMIT_EVERY: Duration = Duration::from_secs(20);
 const CHECK_EVERY: Duration = Duration::from_secs(10);
 /// A round even without a relevant change seen.
 const SAFETY_ROUND: Duration = Duration::from_secs(30 * 60);
+/// Documents indexed wherever they are (outside system and noise folders).
+const EVERYWHERE: &[&str] = &[
+    "pdf", "docx", "docm", "dotx", "dotm", "doc", "xlsx", "xlsm", "xlsb", "xls", "pptx", "pptm", "ppsx", "potx", "ppt",
+    "odt", "ods", "odp", "rtf", "eml", "msg",
+];
+const SKIP: u16 = FLAG_CLOUD | FLAG_NOISE | FLAG_SYSTEM | FLAG_HIDDEN;
+
+/// A user hint counts for this long (the app repeats it every 5 s).
+const HINT_VALID: Duration = Duration::from_secs(20);
+/// Pause while the PC's CPU (without us) is busier than this.
+const BUSY_CPU: f32 = 0.70;
+/// How often a paused indexer looks again.
+const PAUSE_CHECK: Duration = Duration::from_secs(5);
+
 /// Content hits considered per search, before filters.
 const SEARCH_DEPTH: usize = 500;
 
@@ -67,6 +86,8 @@ pub struct Content {
     /// Keys in the index, as of the last round (to notice deletions).
     known_keys: RwLock<HashSet<u64>>,
     exts: HashSet<&'static str>,
+    /// Last hint from a user session: (when, busy, away).
+    hint: Mutex<Option<(Instant, bool, bool)>>,
 }
 
 impl Content {
@@ -89,7 +110,30 @@ impl Content {
             dirty: AtomicBool::new(false),
             known_keys: RwLock::new(HashSet::new()),
             exts: whereti_extract::extensions().into_iter().collect(),
+            hint: Mutex::new(None),
         })
+    }
+
+    pub fn hint(&self, busy: bool, away: bool) {
+        *self.hint.lock() = Some((Instant::now(), busy, away));
+    }
+
+    fn recent_hint(&self) -> Option<(bool, bool)> {
+        self.hint.lock().filter(|h| h.0.elapsed() < HINT_VALID).map(|h| (h.1, h.2))
+    }
+
+    /// Why indexing should wait now, if it should (PLAN.md §6.6).
+    fn pause_reason(&self, cpu: &mut system::CpuMeter) -> Option<&'static str> {
+        if system::on_battery() {
+            return Some("battery");
+        }
+        if self.recent_hint().is_some_and(|(busy, _)| busy) {
+            return Some("fullscreen");
+        }
+        if cpu.busy() > BUSY_CPU {
+            return Some("busy");
+        }
+        None
     }
 
     /// Called after each journal batch with the records it touched: is any
@@ -109,10 +153,15 @@ impl Content {
             let Some(e) = idx.live_entry_of(vol, r) else { continue };
             let is_dir = idx.is_dir(e);
             if !is_dir {
-                let name = idx.full_path(e);
+                let name = idx.name(e);
                 let ext = name.rsplit_once('.').map(|(_, x)| x.to_ascii_lowercase()).unwrap_or_default();
                 if !self.exts.contains(ext.as_str()) {
                     continue;
+                }
+                // a document anywhere (outside noise) counts right away
+                if EVERYWHERE.contains(&ext.as_str()) && idx.flags(e) & SKIP == 0 {
+                    self.dirty.store(true, Ordering::Relaxed);
+                    return;
                 }
             }
             let mut path = fold(&idx.full_path(e));
@@ -255,9 +304,54 @@ impl Content {
         let (mut since_commit, mut last_commit) = (0usize, Instant::now());
         let total = todo.len();
         let mut indexed = 0usize;
-        for (n, c) in todo.into_iter().enumerate() {
+        let mut cpu = system::CpuMeter::new();
+        let mut last_cpu_check = Instant::now();
+        let mut paused_for: Option<&'static str> = None;
+        'files: for (n, c) in todo.into_iter().enumerate() {
             if self.stopping() || *self.wake.lock() {
                 break; // stop, or folders changed: plan again
+            }
+            // Wait while the user games, presents, is on battery or the CPU is busy.
+            loop {
+                // the CPU is measured over at least a second
+                let reason = if last_cpu_check.elapsed() >= Duration::from_secs(1) || paused_for.is_some() {
+                    last_cpu_check = Instant::now();
+                    self.pause_reason(&mut cpu)
+                } else if system::on_battery() {
+                    Some("battery")
+                } else if self.recent_hint().is_some_and(|(busy, _)| busy) {
+                    Some("fullscreen")
+                } else {
+                    None
+                };
+                match reason {
+                    None => {
+                        if let Some(r) = paused_for.take() {
+                            shared.log.log(format!("content: resumed (was paused: {r})"));
+                            self.set_state("indexing");
+                        }
+                        break;
+                    }
+                    Some(r) => {
+                        if paused_for != Some(r) {
+                            if paused_for.is_none() {
+                                // make the work done so far searchable before waiting
+                                index.commit().map_err(|e| e.to_string())?;
+                                since_commit = 0;
+                            }
+                            shared.log.log(format!("content: paused ({r})"));
+                            paused_for = Some(r);
+                            self.set_state(&format!("paused: {r}"));
+                        }
+                        let mut wake = self.wake.lock();
+                        if !*wake {
+                            self.wake_cv.wait_for(&mut wake, PAUSE_CHECK);
+                        }
+                        if *wake || self.stopping() {
+                            break 'files;
+                        }
+                    }
+                }
             }
             let started = Instant::now();
             if let Some((what, text)) = extract(&c, sandbox) {
@@ -277,8 +371,11 @@ impl Content {
                 since_commit = 0;
                 last_commit = Instant::now();
             }
-            // Rest at least as long as the file took.
-            std::thread::sleep(started.elapsed().max(Duration::from_millis(5)));
+            // Rest at least as long as the file took; a quarter of that
+            // while nobody is at the PC (locked, screen saver).
+            let away = self.recent_hint().is_some_and(|(_, away)| away);
+            let rest = if away { started.elapsed() / 4 } else { started.elapsed() };
+            std::thread::sleep(rest.max(Duration::from_millis(5)));
         }
         index.commit().map_err(|e| e.to_string())?;
         self.update_counts(index, known);
@@ -382,27 +479,42 @@ struct Candidate {
     modified: u32,
 }
 
-/// Files in the content folders that we can read, by key.
+/// The files to index, by key: documents everywhere, and text/code inside
+/// the content folders (all outside cloud-only, hidden, system and noise).
 fn files_in(idx: &NameIndex, folders: &[String]) -> HashMap<u64, Candidate> {
-    if folders.is_empty() {
-        return HashMap::new();
-    }
-    let mut paths = Vec::new();
-    for f in folders {
-        let mut p = fold(f.trim_end_matches('\\'));
-        p.push('\\');
-        paths.push(Term::Path(p));
-    }
-    let exts = whereti_extract::extensions().into_iter().map(String::from).collect();
-    let query = Query {
+    let file = || Clause { negated: false, any_of: vec![Term::FilesOnly] };
+    let documents = Query {
         clauses: vec![
-            Clause { negated: false, any_of: vec![Term::FilesOnly] },
-            Clause { negated: false, any_of: paths },
-            Clause { negated: false, any_of: vec![Term::Ext(exts)] },
+            file(),
+            Clause {
+                negated: false,
+                any_of: vec![Term::Ext(
+                    EVERYWHERE.iter().filter(|e| whereti_extract::kind_of(e).is_some()).map(|e| e.to_string()).collect(),
+                )],
+            },
         ],
     };
-    const SKIP: u16 = FLAG_CLOUD | FLAG_NOISE | FLAG_SYSTEM | FLAG_HIDDEN;
-    let entries: Vec<u32> = idx.matching(&query).into_iter().filter(|&e| idx.flags(e) & SKIP == 0).collect();
+    let mut entries = idx.matching(&documents);
+    if !folders.is_empty() {
+        let paths = folders
+            .iter()
+            .map(|f| {
+                let mut p = fold(f.trim_end_matches('\\'));
+                p.push('\\');
+                Term::Path(p)
+            })
+            .collect();
+        let text = whereti_extract::extensions().into_iter().filter(|e| !EVERYWHERE.contains(e)).map(String::from).collect();
+        let in_folders = Query {
+            clauses: vec![
+                file(),
+                Clause { negated: false, any_of: paths },
+                Clause { negated: false, any_of: vec![Term::Ext(text)] },
+            ],
+        };
+        entries.extend(idx.matching(&in_folders));
+    }
+    let entries: Vec<u32> = entries.into_iter().filter(|&e| idx.flags(e) & SKIP == 0).collect();
     let records = idx.records_of(&entries);
     let mut out = HashMap::with_capacity(entries.len());
     for (e, r) in entries.into_iter().zip(records) {

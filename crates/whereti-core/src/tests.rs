@@ -289,3 +289,28 @@ fn records_entries_and_filters_for_the_content_index() {
     assert_eq!(pdfs.len(), 2);
     assert!(pdfs.iter().all(|&e| idx.full_path(e).to_lowercase().ends_with(".pdf")));
 }
+
+#[test]
+fn generated_folders_are_left_out_and_build_folders_rank_last() {
+    let c = scan(vec![
+        d(5, 5, "."),
+        d(20, 5, "proiect"),
+        d(21, 20, "node_modules"),
+        f(40, 21, "raport.js"),
+        d(22, 20, ".git"),
+        f(41, 22, "raport.pack"),
+        d(23, 20, "Release"),
+        f(42, 23, "raport.exe"),
+        f(43, 20, "raport.docx"),
+    ]);
+    let vols = vec![VolumeScan { letter: 'E', serial: 3, journal_id: 1, next_usn: 1, scan: c }];
+    let idx = build(vols, &Exclusions::defaults(None)).0;
+    // node_modules and .git: gone; Release: still findable, but after the document
+    assert_eq!(find(&idx, "raport"), [r"E:\proiect\raport.docx", r"E:\proiect\Release\raport.exe"]);
+    // a saved index picks up the current noise list when loaded
+    let dir = std::env::temp_dir().join(format!("wt-noise-{}.idx", std::process::id()));
+    crate::snapshot::save(&idx, &dir).unwrap();
+    let back = crate::snapshot::load(&dir).unwrap();
+    let _ = std::fs::remove_file(&dir);
+    assert_eq!(find(&back, "raport"), find(&idx, "raport"));
+}

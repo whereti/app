@@ -28,7 +28,7 @@ use windows_sys::Win32::System::Pipes::{
 };
 
 pub const PIPE_NAME: &str = r"\\.\pipe\whereti";
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 const MAX_MESSAGE: usize = 64 << 20;
 
 /// The account that created the pipe (OW), SYSTEM and Administrators: full
@@ -69,6 +69,10 @@ pub enum Request {
     ContentSearch(SearchRequest),
     /// Folders whose documents are indexed by content.
     SetContentFolders { paths: Vec<String> },
+    /// What the user is doing, as seen from their session: `busy` = a
+    /// full-screen game or video, or a presentation; `away` = screen locked
+    /// or screen saver. Background work pauses or speeds up accordingly.
+    Hint { busy: bool, away: bool },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -116,7 +120,8 @@ pub struct ContentReply {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ContentStatus {
-    /// "off", "starting", "scanning", "indexing", "ready", "paused", "error: …"
+    /// "starting", "scanning", "indexing", "ready", "error: …", or
+    /// "paused: battery" / "paused: fullscreen" / "paused: busy" (the CPU)
     pub state: String,
     /// Documents in the index.
     pub files: u64,

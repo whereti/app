@@ -145,6 +145,20 @@ pub fn set_autostart(on: bool) -> Result<(), String> {
 
 /// Appends a line to `%TEMP%\wt-ui-trace.txt` when `WT_UI_TRACE` is set
 /// (diagnostics only; nothing is written otherwise).
+/// (busy, away): a full-screen app or presentation runs / the screen is
+/// locked or the screen saver is on.
+pub fn user_state() -> (bool, bool) {
+    use windows_sys::Win32::UI::Shell::{
+        SHQueryUserNotificationState, QUNS_BUSY, QUNS_NOT_PRESENT, QUNS_PRESENTATION_MODE, QUNS_RUNNING_D3D_FULL_SCREEN,
+    };
+    let mut state = 0;
+    // SAFETY: out-parameter.
+    if unsafe { SHQueryUserNotificationState(&mut state) } != 0 {
+        return (false, false);
+    }
+    (matches!(state, QUNS_BUSY | QUNS_RUNNING_D3D_FULL_SCREEN | QUNS_PRESENTATION_MODE), state == QUNS_NOT_PRESENT)
+}
+
 pub fn trace(msg: impl AsRef<str>) {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if !*ON.get_or_init(|| std::env::var_os("WT_UI_TRACE").is_some()) {

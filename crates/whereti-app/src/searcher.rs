@@ -183,6 +183,8 @@ fn worker(jobs: Receiver<Msg>, out: Sender<Update>, wake: impl Fn()) {
                 }
             }
             if p.status {
+                let (busy, away) = crate::shell::user_state();
+                c.call(&Request::Hint { busy, away })?;
                 if let Response::Status(s) = c.call(&Request::Status)? {
                     let _ = out.send(Update::Status(s));
                 }

@@ -33,13 +33,11 @@ pub(crate) enum Filter {
     Images,
     Audio,
     Video,
-    Code,
     Folders,
 }
 
 impl Filter {
-    const ALL: [Filter; 7] =
-        [Filter::All, Filter::Documents, Filter::Images, Filter::Audio, Filter::Video, Filter::Code, Filter::Folders];
+    const ALL: [Filter; 6] = [Filter::All, Filter::Documents, Filter::Images, Filter::Audio, Filter::Video, Filter::Folders];
 
     fn label(self) -> &'static str {
         match self {
@@ -48,7 +46,6 @@ impl Filter {
             Filter::Images => "Imagini",
             Filter::Audio => "Audio",
             Filter::Video => "Video",
-            Filter::Code => "Cod",
             Filter::Folders => "Foldere",
         }
     }
@@ -61,9 +58,6 @@ impl Filter {
             Filter::Images => "ext:jpg;jpeg;png;gif;bmp;webp;heic;tif;tiff;svg;ico;raw;cr2;nef;arw",
             Filter::Audio => "ext:mp3;wav;flac;aac;ogg;m4a;wma;opus",
             Filter::Video => "ext:mp4;mkv;avi;mov;wmv;webm;m4v;mpg;mpeg",
-            Filter::Code => {
-                "ext:rs;py;js;ts;tsx;jsx;go;java;c;cpp;h;hpp;cs;php;rb;swift;kt;sql;sh;ps1;html;css;json;yaml;yml;toml;xml"
-            }
             Filter::Folders => "folder:",
         }
     }
@@ -269,7 +263,7 @@ impl WheretiApp {
                             self.tray_progress = progress;
                         }
                         let mut tip = format!("whereti — {} fișiere · {}", shell::count(s.entries), state_ro(&s.state));
-                        if s.content.state == "indexing" {
+                        if content_active(&s.content) {
                             tip.push_str(&format!("\nConținut: {}", content_progress(&s.content, eta)));
                         }
                         let _ = t.icon.set_tooltip(Some(tip));
@@ -607,7 +601,7 @@ impl WheretiApp {
         let shown = self.content_start.map_or(0, |s| self.rows.len() - s) as u64;
         let mut label = format!("GĂSIT ÎN CONȚINUT · {}", shell::count(shown));
         if let Some(c) = self.status.as_ref().map(|s| &s.content) {
-            if c.state == "indexing" {
+            if content_active(c) {
                 label.push_str(&format!("   ·   indexare în curs, {}", content_progress(c, self.eta.left(c))));
             }
         }
@@ -617,46 +611,56 @@ impl WheretiApp {
     fn status_bar(&mut self, ui: &mut egui::Ui, p: &Palette) {
         let rect = ui.max_rect();
         ui.painter().hline(rect.x_range(), rect.top(), Stroke::new(1.0, p.border));
-        ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            ui.add_space(14.0);
-            let small = |t: String, c: Color32| egui::RichText::new(t).size(12.0).color(c);
-            if let Some((msg, at)) = &self.message {
-                if at.elapsed() < Duration::from_secs(8) {
-                    ui.label(small(msg.clone(), p.warn));
-                    ui.ctx().request_repaint_after(Duration::from_secs(1));
-                    return;
-                }
+        let font = FontId::proportional(12.0);
+        let width = |ui: &egui::Ui, t: &str| ui.fonts_mut(|f| f.layout_no_wrap(t.to_string(), font.clone(), p.text).size().x);
+
+        // Right: the index state. It always gets its room first.
+        let (dot, state) = match (&self.offline, &self.status) {
+            (Some(_), _) => (p.error, "serviciul nu rulează".to_string()),
+            (None, Some(s)) if s.state == "ready" && content_active(&s.content) => (
+                p.warn,
+                format!("{} fișiere · conținut {}", shell::count(s.entries), content_progress(&s.content, self.eta.left(&s.content))),
+            ),
+            (None, Some(s)) if s.state == "ready" => (p.ok, format!("{} fișiere indexate · actualizat", shell::count(s.entries))),
+            (None, Some(s)) => (p.warn, format!("{} fișiere · {}", shell::count(s.entries), state_ro(&s.state))),
+            (None, None) => (p.text3, "se conectează…".to_string()),
+        };
+        let right_w = width(ui, &state) + 14.0 + 16.0;
+
+        // Left: a message, or the longest set of hints that still fits.
+        let room = rect.width() - right_w - 14.0 - 24.0;
+        let mut left: Option<(String, Color32)> = None;
+        if let Some((msg, at)) = &self.message {
+            if at.elapsed() < Duration::from_secs(8) {
+                left = Some((msg.clone(), p.warn));
+                ui.ctx().request_repaint_after(Duration::from_secs(1));
             }
-            if self.offline.is_none() && self.page == Page::Search {
-                let ms = format!("{:.0}", self.round_trip.as_secs_f64() * 1000.0);
-                ui.label(small(format!("{ms} ms"), p.text3));
-                ui.label(small("·".into(), p.text3));
-                ui.label(small(
-                    "Enter deschide  ·  Ctrl+Enter arată în Explorer  ·  click dreapta pentru meniu  ·  trage în altă aplicație"
-                        .into(),
-                    p.text3,
-                ));
-            }
-            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                ui.add_space(14.0);
-                let (dot, text) = match (&self.offline, &self.status) {
-                    (Some(_), _) => (p.error, "serviciul nu rulează".to_string()),
-                    (None, Some(s)) if s.state == "ready" && s.content.state == "indexing" => (
-                        p.warn,
-                        format!("{} fișiere · conținut {}", shell::count(s.entries), content_progress(&s.content, self.eta.left(&s.content))),
-                    ),
-                    (None, Some(s)) if s.state == "ready" => {
-                        (p.ok, format!("{} fișiere indexate · actualizat", shell::count(s.entries)))
-                    }
-                    (None, Some(s)) => (p.warn, format!("{} fișiere · {}", shell::count(s.entries), state_ro(&s.state))),
-                    (None, None) => (p.text3, "se conectează…".to_string()),
-                };
-                ui.label(small(text, p.text2));
-                let (r, _) = ui.allocate_exact_size(Vec2::new(8.0, 8.0), Sense::hover());
-                ui.painter().circle_filled(r.center(), 3.5, dot);
-            });
-        });
+        }
+        if left.is_none() && self.offline.is_none() && self.page == Page::Search {
+            let ms = format!("{:.0} ms", self.round_trip.as_secs_f64() * 1000.0);
+            let options = [
+                format!("{ms}  ·  Enter deschide  ·  Ctrl+Enter arată în Explorer  ·  click dreapta pentru meniu  ·  trage în altă aplicație"),
+                format!("{ms}  ·  Enter deschide  ·  Ctrl+Enter arată în Explorer  ·  click dreapta pentru meniu"),
+                format!("{ms}  ·  Enter deschide  ·  Ctrl+Enter arată în Explorer"),
+                ms,
+            ];
+            left = options.into_iter().find(|t| width(ui, t) <= room).map(|t| (t, p.text3));
+        }
+
+        let y = rect.center().y + 1.0;
+        let painter = ui.painter();
+        if let Some((text, color)) = left {
+            // a long message is cut rather than drawn under the state
+            let job = LayoutJob {
+                wrap: egui::text::TextWrapping { max_width: room.max(0.0), max_rows: 1, break_anywhere: true, overflow_character: Some('…') },
+                ..LayoutJob::simple_singleline(text, font.clone(), color)
+            };
+            let g = ui.fonts_mut(|f| f.layout_job(job));
+            painter.galley(Pos2::new(rect.left() + 14.0, y - g.size().y / 2.0), g, color);
+        }
+        let x = rect.right() - 14.0;
+        painter.text(Pos2::new(x, y), Align2::RIGHT_CENTER, &state, font.clone(), p.text2);
+        painter.circle_filled(Pos2::new(x - width(ui, &state) - 9.0, y), 3.5, dot);
     }
 }
 
@@ -776,9 +780,10 @@ pub(crate) fn content_progress(c: &whereti_ipc::ContentStatus, left: Option<Dura
     let all = c.done + c.queued;
     let pct = (c.done * 100).checked_div(all).unwrap_or(100);
     let mut s = format!("{} din {} documente ({pct}%)", shell::count(c.done), shell::count(all));
-    if let Some(d) = left {
+    if let Some(d) = left.filter(|_| c.state == "indexing") {
         s.push_str(&format!(" · {}", time_left(d)));
     }
+    s.push_str(pause_note(c));
     s
 }
 
@@ -800,7 +805,22 @@ fn indexing_fraction(s: &StatusReply) -> Option<f32> {
         return Some(0.0); // the name index has no counter: an empty bar
     }
     let c = &s.content;
-    (c.state == "indexing" && c.done + c.queued > 0).then(|| c.done as f32 / (c.done + c.queued) as f32)
+    (content_active(c) && c.done + c.queued > 0).then(|| c.done as f32 / (c.done + c.queued) as f32)
+}
+
+/// Indexing, or paused in the middle of it.
+pub(crate) fn content_active(c: &whereti_ipc::ContentStatus) -> bool {
+    c.state == "indexing" || c.state.starts_with("paused")
+}
+
+/// "în pauză (pe baterie)" for a paused state, else empty.
+pub(crate) fn pause_note(c: &whereti_ipc::ContentStatus) -> &'static str {
+    match c.state.as_str() {
+        "paused: battery" => " · în pauză: pe baterie",
+        "paused: fullscreen" => " · în pauză: rulează un joc sau o prezentare",
+        "paused: busy" => " · în pauză: procesorul e ocupat",
+        _ => "",
+    }
 }
 
 /// Measures the content indexing speed over the current round.
@@ -812,6 +832,7 @@ pub(crate) struct Eta {
 impl Eta {
     fn sample(&mut self, c: &whereti_ipc::ContentStatus) {
         match self.start {
+            // a pause resets the measurement: the speed before it says little after
             _ if c.state != "indexing" => self.start = None,
             // a new round starts counting from 0 again
             Some((_, d0)) if c.done < d0 => self.start = Some((Instant::now(), c.done)),

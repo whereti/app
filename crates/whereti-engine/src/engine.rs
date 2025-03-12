@@ -234,6 +234,10 @@ impl Engine {
                 let query = whereti_query::parse(&r.query, &system::date_ctx());
                 Response::Content(self.content.search(idx, &query, r.limit.min(MAX_LIMIT) as usize, caller))
             }
+            Request::Hint { busy, away } => {
+                self.content.hint(busy, away);
+                Response::Ok
+            }
             Request::SetContentFolders { paths } => match self.content.set_folders(&paths) {
                 Ok(()) => {
                     self.log(format!("content folders changed by a client: {}", self.content.folders().join(" · ")));
@@ -392,6 +396,13 @@ impl Worker {
                 idx
             }
         };
+        // An index built with the old default exclusions (never edited by
+        // the user) moves to the current defaults: generated folders out.
+        let windows = (!self.cfg.include_windows).then(|| std::env::var("SystemRoot").ok()).flatten();
+        let old: HashSet<String> =
+            Exclusions::previous_defaults(windows.as_deref()).paths.iter().map(|p| p.to_lowercase()).collect();
+        let has: HashSet<String> = index.exclusions().iter().map(|p| p.to_lowercase()).collect();
+        let upgrade_defaults = has == old;
         self.vols = sync::open_volumes(&index)?;
         self.open = vec![HashSet::new(); self.vols.len()];
         self.journal_max = self.vols.iter().map(|v| v.query_usn_journal().map_or(0, |j| j.maximum_size)).collect();
@@ -428,6 +439,10 @@ impl Worker {
         }
         self.shared.set_state("ready");
         self.log(format!("ready in {} ms", t.elapsed().as_millis()));
+        if upgrade_defaults {
+            self.log("default exclusions updated: generated folders (node_modules, .git, caches…) are left out");
+            self.reconfigure(default_exclusions(self.cfg.include_windows))?;
+        }
         Ok(())
     }
 
