@@ -101,7 +101,15 @@ impl Preview {
         self.cache.iter().find(|c| &c.path == path)
     }
 
-    pub fn show(&mut self, ui: &mut egui::Ui, p: &Palette, row: Option<&Row>, needles: &[String], tz: i32) {
+    pub fn show(
+        &mut self,
+        ui: &mut egui::Ui,
+        p: &Palette,
+        row: Option<&Row>,
+        icon: Option<&egui::TextureHandle>,
+        needles: &[String],
+        tz: i32,
+    ) {
         let Some(row) = row else {
             ui.add_space(40.0);
             ui.vertical_centered(|ui| ui.label(egui::RichText::new("Selectează un rezultat").size(13.0).color(p.text3)));
@@ -115,7 +123,13 @@ impl Preview {
         // Header: tile, name, folder, facts.
         ui.horizontal_top(|ui| {
             let (tile, _) = ui.allocate_exact_size(Vec2::splat(44.0), Sense::hover());
-            paint_tile(ui.painter(), p, tile, row.is_dir, name);
+            match icon {
+                Some(t) => {
+                    let uv = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::Pos2::new(1.0, 1.0));
+                    ui.painter().image(t.id(), tile, uv, egui::Color32::WHITE);
+                }
+                None => paint_tile(ui.painter(), p, tile, row.is_dir, name),
+            }
             ui.add_space(6.0);
             ui.vertical(|ui| {
                 ui.add(egui::Label::new(egui::RichText::new(name).size(16.0).family(semibold()).color(p.text)).wrap());

@@ -8,6 +8,8 @@
 //! dm:today  dm:lastweek  dm:2024-01..2024-06
 //! path:D:\proiecte       proiecte\whereti (a backslash means "match the path")
 //! folder:  file:         regex:^IMG_\d{4}\.jpg$
+//! mine:                  only the user's own files: no system, hidden,
+//!                        program, cache or build folders
 //! ```
 //!
 //! Parsing never fails: anything that is not valid syntax is searched literally.
@@ -38,6 +40,8 @@ pub enum Term {
     Modified { min: u32, max: u32 },
     FoldersOnly,
     FilesOnly,
+    /// Not hidden, not system, not inside program / cache / build folders.
+    Mine,
     /// Content search (not available in the name index).
     Content(String),
     /// Every term must match (e.g. `folder:raport` = folder AND "raport").
@@ -211,6 +215,7 @@ fn parse_function(prefix: &str, value: &str, quoted: bool, ctx: &DateCtx) -> Opt
         "dm" | "datemodified" => date::parse_range(value, ctx).map(|(min, max)| Term::Modified { min, max }),
         "regex" if !value.is_empty() => Some(Term::Regex(value.to_string())),
         "c" | "content" if !value.is_empty() => Some(Term::Content(fold(value))),
+        "mine" if value.is_empty() => Some(Term::Mine),
         "folder" | "file" => {
             let kind = if prefix == "folder" { Term::FoldersOnly } else { Term::FilesOnly };
             if value.is_empty() {

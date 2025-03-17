@@ -12,6 +12,8 @@ use eframe::egui::{
 };
 use whereti_ipc::{Row, Sort, StatusReply};
 
+use crate::file_icons::FileIcons;
+use crate::icons::{self, Icon};
 use crate::preview::Preview;
 use crate::searcher::{Job, Searcher, Update};
 use crate::settings::SettingsState;
@@ -19,7 +21,7 @@ use crate::shell;
 use crate::theme::{self, Palette};
 use crate::tray::{Requests, Tray, PREFERRED_HOTKEY};
 
-const ROW_HEIGHT: f32 = 56.0;
+const ROW_HEIGHT: f32 = 52.0;
 const RESULT_LIMIT: u32 = 500;
 const STATUS_EVERY: Duration = Duration::from_secs(2);
 /// While indexing, the status is asked for this often even with the window
@@ -108,6 +110,8 @@ pub struct WheretiApp {
     pub(crate) requests: Arc<Requests>,
     pub(crate) tray: Option<Tray>,
     preview: Preview,
+    /// Explorer's own file icons, cached per type.
+    pub(crate) file_icons: FileIcons,
 }
 
 impl WheretiApp {
@@ -154,6 +158,7 @@ impl WheretiApp {
             requests,
             tray,
             preview,
+            file_icons: FileIcons::new(),
         };
         app.settings.apply_theme(ctx);
         match app.tray.as_ref().map(|t| t.hotkey) {
@@ -183,9 +188,12 @@ impl WheretiApp {
     fn effective_query(&self) -> (String, Sort, bool) {
         let q = self.query.trim();
         if q.is_empty() && self.filter == Filter::All {
-            let home = std::env::var("USERPROFILE").unwrap_or_default();
-            let recent = format!(r#"file: path:"{home}\Desktop" | path:"{home}\Documents" | path:"{home}\Downloads""#);
-            return (recent, Sort::Modified, true);
+            // answered locally from Windows' list of opened files (see recent.rs)
+            return (String::new(), Sort::Modified, true);
+        }
+        if q.is_empty() {
+            // only a filter: the newest of the user's own files of that kind
+            return (format!("{} mine:", self.filter.clause()), Sort::Modified, false);
         }
         (format!("{q} {}", self.filter.clause()), Sort::Relevance, false)
     }
@@ -196,7 +204,7 @@ impl WheretiApp {
         self.recent_mode = recent;
         let content = !recent && !highlight_needles(&self.query).is_empty();
         self.content_pending = content;
-        self.searcher.search(Job { generation: self.generation, query, sort, limit: RESULT_LIMIT, content });
+        self.searcher.search(Job { generation: self.generation, query, sort, limit: RESULT_LIMIT, content, recent });
     }
 
     pub(crate) fn flash(&mut self, msg: impl Into<String>) {
@@ -383,79 +391,92 @@ impl WheretiApp {
         }
     }
 
-    /// The search card: magnifier, text field, clear button or hotkey hint, settings.
+    /// The search field: one quiet surface with a hairline; on focus a soft
+    /// accent ring. Clear button or the shortcut on the right, then the
+    /// preview and settings buttons.
     fn search_card(&mut self, ui: &mut egui::Ui, p: &Palette) {
         let focused = self.search_id.is_some_and(|id| ui.ctx().memory(|m| m.has_focus(id)));
-        let stroke = if focused { Stroke::new(1.5, p.accent) } else { Stroke::new(1.0, p.border) };
-        Frame::NONE
+        let frame = Frame::NONE
             .fill(p.surface)
-            .stroke(stroke)
+            .stroke(Stroke::new(1.0, if focused { theme::with_alpha(p.accent, 0.9) } else { p.border }))
             .corner_radius(CornerRadius::same(12))
-            .inner_margin(Margin { left: 14, right: 10, top: 10, bottom: 10 })
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    let (icon_rect, _) = ui.allocate_exact_size(Vec2::new(22.0, 30.0), Sense::hover());
-                    paint_magnifier(ui.painter(), icon_rect.center(), 8.0, if focused { p.accent } else { p.text3 });
-                    ui.add_space(6.0);
-                    let right_w = 200.0;
-                    let edit = egui::TextEdit::singleline(&mut self.query)
-                        .hint_text(egui::RichText::new("Caută fișiere, foldere…").size(19.0).color(p.text3))
-                        .font(FontId::proportional(19.0))
-                        .text_color(p.text)
-                        .frame(Frame::NONE)
-                        .margin(Vec2::new(0.0, 4.0))
-                        // Tab toggles the preview on the results page instead of moving focus
-                        .lock_focus(self.page == Page::Search)
-                        .desired_width((ui.available_width() - right_w).max(120.0));
-                    let resp = ui.add(edit);
-                    self.search_id = Some(resp.id);
-                    if self.focus_search {
-                        resp.request_focus();
-                        self.focus_search = false;
+            .inner_margin(Margin { left: 16, right: 8, top: 8, bottom: 8 });
+        let out = frame.show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let (icon_rect, _) = ui.allocate_exact_size(Vec2::new(20.0, 32.0), Sense::hover());
+                icons::paint(ui.painter(), icon_rect, Icon::Search, if focused { p.accent } else { p.text3 });
+                ui.add_space(8.0);
+                let right_w = 190.0;
+                let edit = egui::TextEdit::singleline(&mut self.query)
+                    .hint_text(egui::RichText::new("Caută fișiere, foldere, documente…").size(18.0).color(p.text3))
+                    .font(FontId::proportional(18.0))
+                    .text_color(p.text)
+                    .frame(Frame::NONE)
+                    .margin(Vec2::new(0.0, 5.0))
+                    // Tab toggles the preview on the results page instead of moving focus
+                    .lock_focus(self.page == Page::Search)
+                    .desired_width((ui.available_width() - right_w).max(120.0));
+                let resp = ui.add(edit);
+                self.search_id = Some(resp.id);
+                if self.focus_search {
+                    resp.request_focus();
+                    self.focus_search = false;
+                }
+                if resp.changed() {
+                    self.page = Page::Search;
+                    self.run_search();
+                }
+                ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 2.0;
+                    let gear =
+                        icon_button(ui, p, IconKind::Gear, self.page == Page::Settings).on_hover_text("Setări (Ctrl+,)");
+                    if gear.clicked() {
+                        self.toggle_settings();
                     }
-                    if resp.changed() {
-                        self.page = Page::Search;
-                        self.run_search();
+                    if self.page == Page::Search {
+                        let tip = if self.preview.open { "Ascunde previzualizarea (Tab)" } else { "Arată previzualizarea (Tab)" };
+                        if icon_button(ui, p, IconKind::Preview, self.preview.open).on_hover_text(tip).clicked() {
+                            self.toggle_preview();
+                        }
                     }
-                    ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                        let gear = icon_button(ui, p, IconKind::Gear, self.page == Page::Settings)
-                            .on_hover_text("Setări (Ctrl+,)");
-                        if gear.clicked() {
-                            self.toggle_settings();
+                    // a hairline between the buttons and the field's own controls
+                    let (sep, _) = ui.allocate_exact_size(Vec2::new(13.0, 20.0), Sense::hover());
+                    ui.painter().vline(sep.center().x, sep.y_range(), Stroke::new(1.0, p.border));
+                    if !self.query.is_empty() {
+                        if icon_button(ui, p, IconKind::Close, false).on_hover_text("Golește (Esc)").clicked() {
+                            self.query.clear();
+                            self.run_search();
+                            self.focus_search = true;
                         }
-                        ui.add_space(2.0);
-                        if self.page == Page::Search {
-                            let tip = if self.preview.open { "Ascunde previzualizarea (Tab)" } else { "Arată previzualizarea (Tab)" };
-                            if icon_button(ui, p, IconKind::Preview, self.preview.open).on_hover_text(tip).clicked() {
-                                self.toggle_preview();
-                            }
-                        }
-                        ui.add_space(4.0);
-                        if !self.query.is_empty() {
-                            if icon_button(ui, p, IconKind::Close, false).on_hover_text("Golește (Esc)").clicked() {
-                                self.query.clear();
-                                self.run_search();
-                                self.focus_search = true;
-                            }
-                        } else if let Some(k) = self.hotkey_label() {
-                            key_hint(ui, p, k);
-                        }
-                    });
+                    } else if let Some(k) = self.hotkey_label() {
+                        key_hint(ui, p, k);
+                    }
                 });
             });
+        });
+        if focused {
+            // soft focus ring outside the hairline
+            let r = out.response.rect.expand(2.5);
+            ui.painter().rect_stroke(r, 14.0, Stroke::new(3.0, theme::with_alpha(p.accent, 0.16)), egui::StrokeKind::Middle);
+        }
     }
 
+    /// Filters as quiet tabs: the chosen one in full colour with a thin
+    /// accent underline, a hairline under the whole row.
     fn filter_chips(&mut self, ui: &mut egui::Ui, p: &Palette) {
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 6.0;
+        let row = ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 22.0;
+            ui.add_space(4.0);
             for f in Filter::ALL {
-                if chip(ui, p, f.label(), self.filter == f).clicked() && self.filter != f {
+                if tab(ui, p, f.label(), self.filter == f).clicked() && self.filter != f {
                     self.filter = f;
                     self.run_search();
                     self.focus_search = true;
                 }
             }
         });
+        let r = row.response.rect;
+        ui.painter().hline(ui.max_rect().x_range(), r.bottom(), Stroke::new(1.0, p.line));
     }
 
     fn results(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, p: &Palette) {
@@ -463,6 +484,7 @@ impl WheretiApp {
             empty_state(
                 ui,
                 p,
+                Icon::Plug,
                 p.error,
                 "Serviciul whereti nu rulează",
                 &format!("Pornește-l dintr-un terminal de administrator: whereti-service start   ({msg})"),
@@ -481,11 +503,12 @@ impl WheretiApp {
         }
         if self.rows.is_empty() {
             let (title, sub) = if self.query.trim().is_empty() && self.filter == Filter::All {
-                ("Nimic modificat recent", "Fișierele modificate în Desktop, Documents și Downloads apar aici.".to_string())
+("Nimic deschis recent", "Fișierele pe care le deschizi și cele descărcate apar aici.".to_string())
             } else {
                 ("Nimic găsit", format!("Niciun fișier nu conține „{}” în nume sau în text. Încearcă:", self.query.trim()))
             };
-            if let Some(example) = empty_state(ui, p, p.text3, title, &sub, &["factura", "ext:pdf", "dm:today", "*.jpg"]) {
+            let icon = if self.query.trim().is_empty() && self.filter == Filter::All { Icon::Clock } else { Icon::Search };
+            if let Some(example) = empty_state(ui, p, icon, p.text3, title, &sub, &["factura", "ext:pdf", "dm:today", "*.jpg"]) {
                 self.query = example.to_string();
                 self.filter = Filter::All;
                 self.run_search();
@@ -493,7 +516,7 @@ impl WheretiApp {
             }
             return;
         }
-        ui.add_space(4.0);
+        ui.add_space(10.0);
         let header = if self.recent_mode {
             "RECENTE".to_string()
         } else if self.content_start == Some(0) {
@@ -502,10 +525,10 @@ impl WheretiApp {
             format!("{} REZULTATE", shell::count(self.total))
         };
         ui.horizontal(|ui| {
-            ui.add_space(8.0);
+            ui.add_space(12.0);
             ui.label(egui::RichText::new(header).size(11.0).color(p.text3).family(semibold()));
         });
-        ui.add_space(4.0);
+        ui.add_space(6.0);
         for w in self.warnings.clone() {
             ui.horizontal(|ui| {
                 ui.add_space(8.0);
@@ -531,13 +554,14 @@ impl WheretiApp {
         let mut clicked: Option<(usize, bool)> = None;
         let mut dragged: Option<usize> = None;
         let mut menu_for: Option<usize> = None;
+        let section = self.content_section_label();
         let rows = &self.rows;
+        let file_icons = &mut self.file_icons;
         let selected = self.selected;
         let tz = self.tz;
         let needles = highlight_needles(&self.query);
         let now = now_minutes();
         let content_start = self.content_start;
-        let section = self.content_section_label();
         let items = rows.len() + content_start.is_some() as usize;
         let out = area.show_rows(ui, ROW_HEIGHT, items, |ui, range| {
             for item in range {
@@ -552,7 +576,8 @@ impl WheretiApp {
                 };
                 let (rect, resp) =
                     ui.allocate_exact_size(Vec2::new(ui.available_width(), ROW_HEIGHT), Sense::click_and_drag());
-                paint_row(ui, p, rect, &rows[i], i == selected, resp.hovered(), tz, now, &needles);
+                let icon = file_icons.get(ui.ctx(), &rows[i].path, rows[i].is_dir);
+                paint_row(ui, p, rect, &rows[i], icon.as_ref(), i == selected, resp.hovered(), tz, now, &needles);
                 if resp.drag_started() {
                     dragged = Some(i);
                 } else if resp.secondary_clicked() {
@@ -722,22 +747,25 @@ impl eframe::App for WheretiApp {
             }
         }
         self.handle_keys(&ctx);
+        self.file_icons.begin_frame();
 
         egui::Panel::bottom("status")
             .frame(Frame::NONE.fill(p.bg))
-            .exact_size(34.0)
+            .exact_size(32.0)
             .show_separator_line(false)
             .resizable(false)
             .show(ui, |ui| self.status_bar(ui, &p));
         egui::Panel::top("search")
-            .frame(Frame::NONE.fill(p.bg).inner_margin(Margin { left: 18, right: 18, top: 14, bottom: 8 }))
+            .frame(Frame::NONE.fill(p.bg).inner_margin(Margin { left: 20, right: 20, top: 16, bottom: 0 }))
             .show_separator_line(false)
             .resizable(false)
             .show(ui, |ui| {
                 self.search_card(ui, &p);
-                ui.add_space(10.0);
+                ui.add_space(14.0);
                 if self.page == Page::Search {
                     self.filter_chips(ui, &p);
+                } else {
+                    ui.add_space(4.0);
                 }
             });
         let show_preview =
@@ -752,10 +780,14 @@ impl eframe::App for WheretiApp {
                 .show_separator_line(true)
                 .default_size((width * 0.42).clamp(320.0, 640.0))
                 .size_range(280.0..=(width * 0.7).max(300.0))
-                .show(ui, |ui| self.preview.show(ui, &p, self.rows.get(self.selected), &needles, self.tz));
+                .show(ui, |ui| {
+                    let row = self.rows.get(self.selected);
+                    let icon = row.and_then(|r| self.file_icons.get(ui.ctx(), &r.path, r.is_dir));
+                    self.preview.show(ui, &p, row, icon.as_ref(), &needles, self.tz)
+                });
         }
         egui::CentralPanel::default()
-            .frame(Frame::NONE.fill(p.bg).inner_margin(Margin { left: 10, right: 10, top: 2, bottom: 0 }))
+            .frame(Frame::NONE.fill(p.bg).inner_margin(Margin { left: 12, right: 12, top: 0, bottom: 0 }))
             .show(ui, |ui| match self.page {
                 Page::Search => self.results(ui, &ctx, &p),
                 Page::Settings => crate::settings::show(self, ui, &p),
@@ -852,16 +884,23 @@ impl Eta {
     }
 }
 
-/// The header between name results and content results.
+/// The header between name results and content results: a small label and
+/// a hairline running to the right edge.
 fn paint_section(ui: &egui::Ui, p: &Palette, rect: Rect, label: &str) {
     let painter = ui.painter_at(rect);
-    let y = rect.bottom() - 14.0;
-    painter.hline(rect.x_range().shrink(8.0), rect.top() + 14.0, Stroke::new(1.0, p.border));
-    painter.text(Pos2::new(rect.left() + 8.0, y), Align2::LEFT_CENTER, label, FontId::new(11.0, semibold()), p.text3);
+    let y = rect.bottom() - 16.0;
+    let g = painter.layout_no_wrap(label.to_string(), FontId::new(11.0, semibold()), p.accent);
+    let x = rect.left() + 12.0;
+    painter.galley(Pos2::new(x, y - g.size().y / 2.0), g.clone(), p.accent);
+    painter.hline((x + g.size().x + 10.0)..=(rect.right() - 12.0), y, Stroke::new(1.0, p.line));
 }
 
 pub(crate) fn semibold() -> FontFamily {
     FontFamily::Name("semibold".into())
+}
+
+pub(crate) fn medium() -> FontFamily {
+    FontFamily::Name("medium".into())
 }
 
 // ---------------------------------------------------------------- widgets
@@ -874,16 +913,15 @@ pub(crate) enum IconKind {
     Preview,
 }
 
-/// A 30×30 icon button.
+/// A 32×32 icon button with a line icon; tinted when active.
 pub(crate) fn icon_button(ui: &mut egui::Ui, p: &Palette, kind: IconKind, active: bool) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(30.0), Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(32.0), Sense::click());
     let painter = ui.painter();
     if active {
         painter.rect_filled(rect, 8.0, p.accent_soft);
     } else if resp.hovered() {
         painter.rect_filled(rect, 8.0, p.hover);
     }
-    let c = rect.center();
     let col = if active {
         p.accent
     } else if resp.hovered() {
@@ -891,85 +929,69 @@ pub(crate) fn icon_button(ui: &mut egui::Ui, p: &Palette, kind: IconKind, active
     } else {
         p.text2
     };
-    let s = Stroke::new(1.6, col);
-    match kind {
-        IconKind::Close => {
-            let d = 5.0;
-            painter.line_segment([c + Vec2::new(-d, -d), c + Vec2::new(d, d)], s);
-            painter.line_segment([c + Vec2::new(-d, d), c + Vec2::new(d, -d)], s);
-        }
-        IconKind::Back => {
-            painter.line_segment([c + Vec2::new(-6.0, 0.0), c + Vec2::new(6.0, 0.0)], s);
-            painter.line_segment([c + Vec2::new(-6.0, 0.0), c + Vec2::new(-1.5, -4.5)], s);
-            painter.line_segment([c + Vec2::new(-6.0, 0.0), c + Vec2::new(-1.5, 4.5)], s);
-        }
-        IconKind::Preview => {
-            // a window with a side pane
-            let r = egui::Rect::from_center_size(c, Vec2::new(16.0, 13.0));
-            painter.rect_stroke(r, 2.5, s, egui::StrokeKind::Middle);
-            let x = r.left() + 9.5;
-            painter.line_segment([egui::pos2(x, r.top()), egui::pos2(x, r.bottom())], s);
-            for k in 0..3 {
-                let y = r.top() + 3.5 + k as f32 * 3.0;
-                painter.line_segment([egui::pos2(x + 2.0, y), egui::pos2(r.right() - 2.0, y)], Stroke::new(1.2, col));
-            }
-        }
-        IconKind::Gear => {
-            for k in 0..8 {
-                let a = k as f32 * std::f32::consts::TAU / 8.0;
-                let dir = Vec2::new(a.cos(), a.sin());
-                painter.line_segment([c + dir * 5.5, c + dir * 8.0], Stroke::new(2.4, col));
-            }
-            painter.circle_stroke(c, 5.5, s);
-            painter.circle_stroke(c, 2.0, Stroke::new(1.4, col));
-        }
+    let icon = match kind {
+        IconKind::Gear => Icon::Settings,
+        IconKind::Close => Icon::Close,
+        IconKind::Back => Icon::Back,
+        IconKind::Preview => Icon::Panel,
+    };
+    let size = if matches!(kind, IconKind::Close) { 16.0 } else { 19.0 };
+    icons::paint(painter, Rect::from_center_size(rect.center(), Vec2::splat(size)), icon, col);
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// A filter tab: text, and a thin accent underline when chosen.
+fn tab(ui: &mut egui::Ui, p: &Palette, text: &str, selected: bool) -> egui::Response {
+    let font = FontId::new(13.5, if selected { semibold() } else { medium() });
+    let galley = ui.painter().layout_no_wrap(text.to_string(), font, p.text);
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(galley.size().x, 34.0), Sense::click());
+    let color = if selected || resp.hovered() { p.text } else { p.text2 };
+    ui.painter().galley(Pos2::new(rect.left(), rect.top() + 6.0), galley, color);
+    if selected {
+        let bar = Rect::from_min_max(Pos2::new(rect.left() - 2.0, rect.bottom() - 2.0), Pos2::new(rect.right() + 2.0, rect.bottom() + 0.5));
+        ui.painter().rect_filled(bar, 1.5, p.accent);
     }
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
-/// A rounded pill; solid accent when selected.
+/// A rounded pill with a hairline; tinted when selected (settings, examples).
 pub(crate) fn chip(ui: &mut egui::Ui, p: &Palette, text: &str, selected: bool) -> egui::Response {
-    let font = FontId::new(13.0, if selected { semibold() } else { FontFamily::Proportional });
-    let color = if selected { p.on_accent } else { p.text2 };
-    let galley = ui.painter().layout_no_wrap(text.to_string(), font, color);
-    let size = Vec2::new(galley.size().x + 26.0, 30.0);
+    let font = FontId::new(13.0, medium());
+    let galley = ui.painter().layout_no_wrap(text.to_string(), font, p.text2);
+    let size = Vec2::new(galley.size().x + 24.0, 30.0);
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
     let painter = ui.painter();
-    if selected {
-        painter.rect_filled(rect, 15.0, p.accent);
+    let (fill, stroke, color) = if selected {
+        (p.accent_soft, Stroke::new(1.0, theme::with_alpha(p.accent, 0.55)), p.accent)
+    } else if resp.hovered() {
+        (p.hover, Stroke::new(1.0, p.border), p.text)
     } else {
-        let fill = if resp.hovered() { p.hover } else { p.surface };
-        painter.rect(rect, 15.0, fill, Stroke::new(1.0, p.border), egui::StrokeKind::Inside);
-    }
-    let pos = rect.center() - galley.size() / 2.0;
-    let text_color = if !selected && resp.hovered() { p.text } else { color };
-    painter.galley(pos, galley, text_color);
+        (p.surface, Stroke::new(1.0, p.border), p.text2)
+    };
+    painter.rect(rect, 8.0, fill, stroke, egui::StrokeKind::Inside);
+    painter.galley(rect.center() - galley.size() / 2.0, galley, color);
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
-/// "Ctrl+Shift+Space" drawn as small key caps.
+/// "Ctrl+Shift+Space" drawn as small key caps with a hairline.
 fn key_hint(ui: &mut egui::Ui, p: &Palette, keys: &str) {
     for part in keys.split('+').rev() {
-        let galley = ui.painter().layout_no_wrap(part.to_string(), FontId::proportional(11.5), p.text2);
-        let size = Vec2::new(galley.size().x + 12.0, 22.0);
+        let galley = ui.painter().layout_no_wrap(part.to_string(), FontId::new(11.0, medium()), p.text3);
+        let size = Vec2::new(galley.size().x + 12.0, 21.0);
         let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
         ui.painter().rect(rect, 5.0, p.bg, Stroke::new(1.0, p.border), egui::StrokeKind::Inside);
-        ui.painter().galley(rect.center() - galley.size() / 2.0, galley, p.text2);
-        ui.add_space(2.0);
+        // a slightly heavier bottom edge, like a real key
+        ui.painter().hline(rect.x_range().shrink(3.0), rect.bottom() - 0.5, Stroke::new(1.0, p.border));
+        ui.painter().galley(rect.center() - galley.size() / 2.0, galley, p.text3);
+        ui.add_space(3.0);
     }
-}
-
-pub(crate) fn paint_magnifier(painter: &egui::Painter, c: Pos2, r: f32, color: Color32) {
-    let ring = c - Vec2::new(r * 0.18, r * 0.18);
-    painter.circle_stroke(ring, r * 0.78, Stroke::new(r * 0.24, color));
-    let dir = Vec2::new(1.0, 1.0).normalized();
-    painter.line_segment([ring + dir * r * 0.78, ring + dir * r * 1.5], Stroke::new(r * 0.28, color));
 }
 
 /// Centered icon, title, text and optional example chips (returns the clicked one).
 fn empty_state(
     ui: &mut egui::Ui,
     p: &Palette,
+    icon: Icon,
     tint: Color32,
     title: &str,
     sub: &str,
@@ -979,10 +1001,11 @@ fn empty_state(
     ui.add_space((ui.available_height() * 0.18).min(90.0));
     ui.vertical_centered(|ui| {
         let (r, _) = ui.allocate_exact_size(Vec2::splat(64.0), Sense::hover());
-        ui.painter().circle_filled(r.center(), 30.0, theme::with_alpha(tint, 0.10));
-        paint_magnifier(ui.painter(), r.center(), 14.0, tint);
-        ui.add_space(12.0);
-        ui.label(egui::RichText::new(title).size(18.0).family(semibold()).color(p.text));
+        ui.painter().circle_filled(r.center(), 30.0, theme::with_alpha(tint, 0.07));
+        ui.painter().circle_stroke(r.center(), 30.0, Stroke::new(1.0, theme::with_alpha(tint, 0.25)));
+        icons::paint(ui.painter(), Rect::from_center_size(r.center(), Vec2::splat(28.0)), icon, tint);
+        ui.add_space(14.0);
+        ui.label(egui::RichText::new(title).size(19.0).family(FontFamily::Name("display".into())).color(p.text));
         ui.add_space(4.0);
         ui.label(egui::RichText::new(sub).size(13.0).color(p.text2));
         if !examples.is_empty() {
@@ -1004,13 +1027,14 @@ fn empty_state(
 
 // ---------------------------------------------------------------- rows
 
-/// One result: file-type tile, name over its folder, date and size.
+/// One result: Explorer's icon, name over its folder, date and size.
 #[allow(clippy::too_many_arguments)]
 fn paint_row(
     ui: &egui::Ui,
     p: &Palette,
     rect: Rect,
     row: &Row,
+    icon: Option<&egui::TextureHandle>,
     selected: bool,
     hovered: bool,
     tz: i32,
@@ -1018,50 +1042,42 @@ fn paint_row(
     needles: &[String],
 ) {
     let painter = ui.painter_at(rect);
-    let inner = rect.shrink2(Vec2::new(4.0, 2.0));
+    let inner = rect.shrink2(Vec2::new(2.0, 2.0));
     if selected {
-        painter.rect_filled(inner, 9.0, p.accent_soft);
-        let bar = Rect::from_center_size(Pos2::new(inner.left() + 3.0, inner.center().y), Vec2::new(3.0, 22.0));
-        painter.rect_filled(bar, 2.0, p.accent);
+        painter.rect_filled(inner, 10.0, p.accent_soft);
     } else if hovered {
-        painter.rect_filled(inner, 9.0, p.hover);
+        painter.rect_filled(inner, 10.0, p.hover);
     }
 
     let (folder, name) = match row.path.rfind('\\') {
         Some(i) if i + 1 < row.path.len() => (&row.path[..i], &row.path[i + 1..]),
         _ => ("", row.path.as_str()),
     };
-    let tile = Rect::from_center_size(Pos2::new(inner.left() + 30.0, inner.center().y), Vec2::splat(34.0));
-    paint_tile(&painter, p, tile, row.is_dir, name);
+    let tile = Rect::from_center_size(Pos2::new(inner.left() + 26.0, inner.center().y), Vec2::splat(32.0));
+    match icon {
+        Some(t) => {
+            let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
+            painter.image(t.id(), tile, uv, Color32::WHITE);
+        }
+        None => paint_tile(&painter, p, tile.shrink(1.0), row.is_dir, name),
+    }
 
-    let right_w = 230.0;
+    let right_w = 210.0;
     let text_left = tile.right() + 14.0;
     let text_w = (inner.right() - right_w - text_left).max(80.0);
-    let name_job = highlighted(name, needles, FontId::new(15.0, semibold()), p.text, p.accent, text_w);
+    let name_job = highlighted(name, needles, FontId::new(14.5, medium()), p.text, p.accent, text_w);
     let name_g = ui.fonts_mut(|f| f.layout_job(name_job));
-    painter.galley(Pos2::new(text_left, inner.top() + 8.0), name_g, p.text);
-    let folder_text = middle_elide(ui, folder, FontId::proportional(12.5), text_w);
-    painter.text(
-        Pos2::new(text_left, inner.top() + 30.0),
-        Align2::LEFT_TOP,
-        folder_text,
-        FontId::proportional(12.5),
-        p.text2,
-    );
+    painter.galley(Pos2::new(text_left, inner.top() + 7.0), name_g, p.text);
+    let folder_text = middle_elide(ui, folder, FontId::proportional(12.0), text_w);
+    painter.text(Pos2::new(text_left, inner.top() + 28.0), Align2::LEFT_TOP, folder_text, FontId::proportional(12.0), p.text3);
 
     let size = if row.is_dir { String::new() } else { shell::size(row.size) };
+    painter.text(Pos2::new(inner.right() - 14.0, inner.center().y), Align2::RIGHT_CENTER, size, FontId::proportional(12.0), p.text3);
     painter.text(
-        Pos2::new(inner.right() - 14.0, inner.center().y),
-        Align2::RIGHT_CENTER,
-        size,
-        FontId::proportional(12.5),
-        p.text3,
-    );
-    painter.text(
-        Pos2::new(inner.right() - 96.0, inner.center().y),
+        Pos2::new(inner.right() - 92.0, inner.center().y),
         Align2::RIGHT_CENTER,
         relative_time(row.modified, tz, now),
-        FontId::proportional(12.5),
+        FontId::proportional(12.0),
         p.text2,
     );
 }

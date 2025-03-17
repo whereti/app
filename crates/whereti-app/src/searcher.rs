@@ -18,6 +18,8 @@ pub struct Job {
     pub limit: u32,
     /// Also look for the words inside files.
     pub content: bool,
+    /// The "recent" screen: answered from Windows' own recent list.
+    pub recent: bool,
 }
 
 pub enum Update {
@@ -150,6 +152,12 @@ fn worker(jobs: Receiver<Msg>, out: Sender<Update>, wake: impl Fn()) {
                     _ => "Răspuns neașteptat de la serviciu".to_string(),
                 };
                 let _ = out.send(Update::Done(msg));
+            }
+            if let Some(job) = p.search.take_if(|j| j.recent) {
+                let t = Instant::now();
+                let rows = crate::recent::recent_files(job.limit as usize);
+                let reply = SearchReply { total: rows.len() as u64, rows, ..Default::default() };
+                let _ = out.send(Update::Results { generation: job.generation, reply, round_trip: t.elapsed() });
             }
             if let Some(job) = p.search {
                 let req = Request::Search(SearchRequest { query: job.query.clone(), limit: job.limit, sort: job.sort });

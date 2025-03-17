@@ -6,7 +6,10 @@
 #![windows_subsystem = "windows"]
 
 mod app;
+mod file_icons;
+mod icons;
 mod preview;
+mod recent;
 mod searcher;
 mod settings;
 mod shell;
@@ -62,36 +65,42 @@ fn main() -> eframe::Result<()> {
     )
 }
 
-/// Segoe UI (the Windows UI font) for text, egui's fonts as fallback (emoji).
+/// Segoe UI Variable — the font of the Windows 11 apps — in several weights
+/// from the one variable font file, with egui's fonts as fallback (emoji,
+/// symbols). On Windows 10 (no variable font): classic Segoe UI files.
 fn setup_fonts(ctx: &egui::Context) {
+    use egui::epaint::text::{FontTweak, VariationCoords};
     let mut fonts = FontDefinitions::default();
     let dir = std::path::PathBuf::from(std::env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".into())).join("Fonts");
-    let mut load = |name: &str, file: &str| -> bool {
-        match std::fs::read(dir.join(file)) {
-            Ok(bytes) => {
-                fonts.font_data.insert(name.into(), Arc::new(FontData::from_owned(bytes)));
-                true
+    let fallback = fonts.families.get(&FontFamily::Proportional).cloned().unwrap_or_default();
+    // (family, weight, optical size, classic Segoe UI file)
+    let styles: [(&str, f32, f32, &str); 5] = [
+        ("body", 400.0, 11.0, "segoeui.ttf"),
+        ("medium", 500.0, 11.0, "seguisb.ttf"),
+        ("semibold", 600.0, 11.0, "seguisb.ttf"),
+        ("bold", 700.0, 11.0, "segoeuib.ttf"),
+        ("display", 600.0, 28.0, "seguisb.ttf"),
+    ];
+    let variable = std::fs::read(dir.join("SegUIVar.ttf")).ok().map(Arc::new);
+    for (name, wght, opsz, file) in styles {
+        let data = match &variable {
+            Some(bytes) => {
+                let blob: egui::epaint::text::Blob = bytes.clone();
+                let coords = VariationCoords::new([(b"wght", wght), (b"opsz", opsz)]);
+                Some(FontData::from_blob(blob, 0).tweak(FontTweak { coords, ..Default::default() }))
             }
-            Err(_) => false,
+            None => std::fs::read(dir.join(file)).ok().map(FontData::from_owned),
+        };
+        let mut family = Vec::new();
+        if let Some(d) = data {
+            fonts.font_data.insert(name.into(), Arc::new(d));
+            family.push(name.to_string());
         }
-    };
-    let regular = load("segoe", "segoeui.ttf");
-    let bold = load("segoe-bold", "segoeuib.ttf");
-    let semibold = load("segoe-semibold", "seguisb.ttf");
-    if regular {
-        fonts.families.entry(FontFamily::Proportional).or_default().insert(0, "segoe".into());
+        family.extend(fallback.iter().cloned());
+        if name == "body" {
+            fonts.families.insert(FontFamily::Proportional, family.clone());
+        }
+        fonts.families.insert(FontFamily::Name(name.into()), family);
     }
-    let mut bold_family = Vec::new();
-    if bold {
-        bold_family.push("segoe-bold".to_string());
-    }
-    bold_family.extend(fonts.families.get(&FontFamily::Proportional).cloned().unwrap_or_default());
-    fonts.families.insert(FontFamily::Name("bold".into()), bold_family);
-    let mut semibold_family = Vec::new();
-    if semibold {
-        semibold_family.push("segoe-semibold".to_string());
-    }
-    semibold_family.extend(fonts.families.get(&FontFamily::Proportional).cloned().unwrap_or_default());
-    fonts.families.insert(FontFamily::Name("semibold".into()), semibold_family);
     ctx.set_fonts(fonts);
 }

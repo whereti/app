@@ -59,6 +59,7 @@ enum Matcher {
     Modified(u32, u32),
     Folders,
     Files,
+    Mine,
     Never,
     All(Vec<Matcher>),
 }
@@ -208,6 +209,7 @@ impl NameIndex {
             Term::Size { min, max } => Matcher::Size(*min, *max),
             Term::Modified { min, max } => Matcher::Modified(*min, *max),
             Term::FoldersOnly => Matcher::Folders,
+            Term::Mine => Matcher::Mine,
             Term::FilesOnly => Matcher::Files,
             // Answered by the content index, never by names.
             Term::Content(_) => Matcher::Never,
@@ -236,6 +238,7 @@ impl NameIndex {
             Matcher::Modified(lo, hi) => (*lo..=*hi).contains(&self.mtime[iu]),
             Matcher::Folders => self.is_dir(i),
             Matcher::Files => !self.is_dir(i),
+            Matcher::Mine => self.flags[iu] & (FLAG_NOISE | FLAG_HIDDEN | FLAG_SYSTEM) == 0,
             Matcher::Never => false,
             Matcher::All(ms) => ms.iter().all(|m| self.matches(m, i, s)),
         }
