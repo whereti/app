@@ -775,15 +775,17 @@ impl eframe::App for WheretiApp {
             let needles = highlight_needles(&self.query);
             let width = ctx.content_rect().width();
             egui::Panel::right("preview")
-                .frame(Frame::NONE.fill(p.bg).inner_margin(Margin { left: 8, right: 18, top: 6, bottom: 10 }))
+                .frame(Frame::NONE.fill(p.bg).inner_margin(Margin { left: 16, right: 20, top: 12, bottom: 12 }))
                 .resizable(true)
-                .show_separator_line(true)
+                .show_separator_line(false)
                 .default_size((width * 0.42).clamp(320.0, 640.0))
                 .size_range(280.0..=(width * 0.7).max(300.0))
                 .show(ui, |ui| {
+                    // our own fine divider instead of egui's heavier one
+                    let r = ui.max_rect();
+                    ui.painter().vline(r.left() - 16.0, r.y_range().expand(12.0), Stroke::new(1.0, p.line));
                     let row = self.rows.get(self.selected);
-                    let icon = row.and_then(|r| self.file_icons.get(ui.ctx(), &r.path, r.is_dir));
-                    self.preview.show(ui, &p, row, icon.as_ref(), &needles, self.tz)
+                    self.preview.show(ui, &p, row, &mut self.file_icons, &needles, self.tz)
                 });
         }
         egui::CentralPanel::default()

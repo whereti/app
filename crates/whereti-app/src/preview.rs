@@ -28,6 +28,8 @@ const CACHE: usize = 16;
 const DEBOUNCE: Duration = Duration::from_millis(90);
 
 pub enum Content {
+    /// A folder: its first entries (folders first), and how many there are.
+    Folder { entries: Vec<(String, bool)>, folders: usize, files: usize },
     Text { text: String, truncated: bool, mono: bool },
     /// Nothing to show for this type (images, video, archives…).
     NoPreview,
@@ -88,8 +90,8 @@ impl Preview {
         }
         self.current = path.clone();
         self.scroll_to_match = true;
-        if let (Some(path), Some(row)) = (path, row) {
-            if row.is_dir || self.cache.iter().any(|c| c.path == path) {
+        if let Some(path) = path {
+            if self.cache.iter().any(|c| c.path == path) {
                 return;
             }
             let _ = self.tx.send(path);
@@ -106,10 +108,12 @@ impl Preview {
         ui: &mut egui::Ui,
         p: &Palette,
         row: Option<&Row>,
-        icon: Option<&egui::TextureHandle>,
+        icons: &mut crate::file_icons::FileIcons,
         needles: &[String],
         tz: i32,
     ) {
+        let icon = row.and_then(|r| icons.get(ui.ctx(), &r.path, r.is_dir));
+        let icon = icon.as_ref();
         let Some(row) = row else {
             ui.add_space(40.0);
             ui.vertical_centered(|ui| ui.label(egui::RichText::new("Selectează un rezultat").size(13.0).color(p.text3)));
@@ -152,7 +156,61 @@ impl Preview {
         ui.add_space(10.0);
 
         if row.is_dir {
-            return note(ui, p, "Folder", "Apasă Enter ca să-l deschizi în Explorer.");
+            let Some(Content::Folder { entries, folders, files }) = self.loaded().map(|l| &l.content) else {
+                return;
+            };
+            let summary = match (*folders, *files) {
+                (0, 0) => "Folder gol".to_string(),
+                (d, f) => [(d, "folder", "foldere"), (f, "fișier", "fișiere")]
+                    .iter()
+                    .filter(|(n, _, _)| *n > 0)
+                    .map(|(n, one, many)| format!("{} {}", shell::count(*n as u64), if *n == 1 { one } else { many }))
+                    .collect::<Vec<_>>()
+                    .join(" · "),
+            };
+            ui.label(egui::RichText::new(summary).size(12.0).family(semibold()).color(p.text2));
+            ui.add_space(6.0);
+            let entries = entries.clone();
+            let base = row.path.clone();
+            Frame::NONE
+                .fill(p.surface)
+                .stroke(Stroke::new(1.0, p.border))
+                .corner_radius(CornerRadius::same(10))
+                .inner_margin(Margin::symmetric(6, 4))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    egui::ScrollArea::vertical().id_salt(&base).auto_shrink([false, true]).show(ui, |ui| {
+                        for (name, is_dir) in &entries {
+                            let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 30.0), Sense::hover());
+                            let r = egui::Rect::from_center_size(egui::pos2(rect.left() + 14.0, rect.center().y), Vec2::splat(18.0));
+                            let full = format!("{base}\\{name}");
+                            match icons.get(ui.ctx(), &full, *is_dir) {
+                                Some(t) => {
+                                    let uv = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
+                                    ui.painter().image(t.id(), r, uv, egui::Color32::WHITE);
+                                }
+                                None => paint_tile(ui.painter(), p, r, *is_dir, name),
+                            }
+                            ui.painter().text(
+                                egui::pos2(rect.left() + 32.0, rect.center().y),
+                                egui::Align2::LEFT_CENTER,
+                                name,
+                                FontId::proportional(13.0),
+                                p.text,
+                            );
+                        }
+                        let shown = entries.len();
+                        if folders + files > shown {
+                            ui.add_space(4.0);
+                            ui.label(
+                                egui::RichText::new(format!("și încă {} — Enter îl deschide în Explorer", shell::count((folders + files - shown) as u64)))
+                                    .size(12.0)
+                                    .color(p.text3),
+                            );
+                        }
+                    });
+                });
+            return;
         }
         let Some(loaded) = self.loaded() else {
             ui.horizontal(|ui| {
@@ -163,6 +221,7 @@ impl Preview {
         };
         let took = loaded.took;
         match &loaded.content {
+            Content::Folder { .. } => {}
             Content::NoPreview => note(ui, p, "Fără previzualizare", "whereti afișează textul documentelor, al fișierelor text și al codului."),
             Content::Failed(e) => note(ui, p, "Textul nu poate fi citit", e),
             Content::Text { text, .. } if text.trim().is_empty() => note(
@@ -321,8 +380,25 @@ fn worker(jobs: Receiver<String>, out: Sender<Loaded>, wake: impl Fn()) {
     }
 }
 
+/// Entries listed for a folder.
+const FOLDER_ENTRIES: usize = 60;
+
 fn load(path: &str, sandbox: Option<&Sandbox>) -> Content {
     let p = Path::new(path);
+    if p.is_dir() {
+        let mut all: Vec<(String, bool)> = match std::fs::read_dir(p) {
+            Ok(rd) => rd
+                .flatten()
+                .map(|e| (e.file_name().to_string_lossy().into_owned(), e.file_type().is_ok_and(|t| t.is_dir())))
+                .collect(),
+            Err(e) => return Content::Failed(format!("Folderul nu poate fi deschis: {e}")),
+        };
+        let folders = all.iter().filter(|e| e.1).count();
+        let files = all.len() - folders;
+        all.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase())));
+        all.truncate(FOLDER_ENTRIES);
+        return Content::Folder { entries: all, folders, files };
+    }
     let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
     let Some(kind) = whereti_extract::kind_of(&ext) else { return Content::NoPreview };
     let mono = kind == Kind::Text && !matches!(ext.as_str(), "txt" | "md" | "markdown" | "log" | "srt" | "vtt" | "rst" | "adoc" | "org" | "tex");

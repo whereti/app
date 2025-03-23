@@ -459,6 +459,9 @@ const NOISE_DIRS: &[&str] = &[
     "bin", "obj", "debug", "release", "build", "dist", "out", "target", "x64", "x86", "coverage", ".nyc_output",
     // caches and temporary files
     ".cache", "cache", "caches", "temp", "tmp", ".tmp", "logs",
+    // developer toolchains and bundled libraries
+    "msys64", "msys2", "mingw64", "mingw32", "cygwin", "cygwin64", "strawberry", "include", "vendor", "third_party",
+    "third-party", "external", "sdk", "sdks",
     // tools and environments
     "venv", "site-packages", ".cargo", ".rustup", ".yarn", ".idea", ".vscode", ".vscode-server", ".codex", ".conda",
     "anaconda3", "miniconda3", ".docker", ".android", ".kotlin",

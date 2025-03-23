@@ -35,6 +35,8 @@ pub struct SettingsState {
     content_folders: Vec<String>,
     new_content_folder: String,
     content_dirty: bool,
+    /// The automatic exclusion rules are shown one by one.
+    show_auto: bool,
 }
 
 fn settings_file() -> PathBuf {
@@ -56,6 +58,7 @@ impl SettingsState {
             content_folders: Vec::new(),
             new_content_folder: String::new(),
             content_dirty: false,
+            show_auto: false,
         };
         if let Ok(text) = std::fs::read_to_string(settings_file()) {
             // Tolerate a UTF-8 BOM and stray spaces: the file may be edited by hand.
@@ -199,39 +202,62 @@ pub fn show(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
             divider(ui, p);
             ui.label(egui::RichText::new("Foldere excluse").size(14.0).family(semibold()).color(p.text));
             ui.label(
-                egui::RichText::new(
-                    r"Nu apar în rezultate. C:\Folder = acel folder · \Folder = pe toate discurile · **\node_modules = oriunde. După „Aplică”, indexul se reconstruiește în câteva secunde.",
-                )
-                .size(12.5)
-                .color(p.text2),
+                egui::RichText::new("Nu apar deloc în rezultate. După „Aplică”, indexul se reconstruiește în câteva secunde.")
+                    .size(12.5)
+                    .color(p.text2),
             );
-            ui.add_space(8.0);
-            let mut remove = None;
-            for (i, path) in app.settings.exclusions.iter().enumerate() {
-                Frame::NONE
-                    .fill(p.bg)
-                    .corner_radius(CornerRadius::same(8))
-                    .inner_margin(Margin { left: 12, right: 4, top: 4, bottom: 4 })
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new(path).size(13.0).color(p.text));
-                            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                                if icon_button(ui, p, IconKind::Close, false).on_hover_text("Scoate").clicked() {
-                                    remove = Some(i);
-                                }
-                            });
-                        });
-                    });
+            ui.add_space(10.0);
+            let defaults: Vec<String> =
+                app.settings.config.as_ref().map(|c| c.default_exclusions.clone()).unwrap_or_default();
+            let is_default = |x: &String| defaults.iter().any(|d| d.eq_ignore_ascii_case(x));
+            let auto: Vec<String> = app.settings.exclusions.iter().filter(|x| is_default(x)).cloned().collect();
+            let own: Vec<String> = app.settings.exclusions.iter().filter(|x| !is_default(x)).cloned().collect();
+            let generated = auto.iter().filter(|x| x.starts_with("**\\")).count();
+            let system = auto.len() - generated;
+            ui.horizontal(|ui| {
+                let (r, _) = ui.allocate_exact_size(Vec2::new(18.0, 18.0), Sense::hover());
+                crate::icons::paint(ui.painter(), r, crate::icons::Icon::Lock, p.text3);
                 ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Excluse automat: {system} foldere ale sistemului și {generated} tipuri de foldere generate (node_modules, .git, cache-uri…)"
+                    ))
+                    .size(12.5)
+                    .color(p.text2),
+                );
+                let label = if app.settings.show_auto { "Ascunde" } else { "Arată lista" };
+                if link(ui, p, label).clicked() {
+                    app.settings.show_auto = !app.settings.show_auto;
+                }
+            });
+            let mut remove: Option<String> = None;
+            if app.settings.show_auto {
+                ui.add_space(8.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
+                    for rule in &auto {
+                        if removable_chip(ui, p, &rule_label(rule)).on_hover_text(rule.as_str()).clicked() {
+                            remove = Some(rule.clone());
+                        }
+                    }
+                });
             }
-            if let Some(i) = remove {
-                app.settings.exclusions.remove(i);
+            if !own.is_empty() {
+                ui.add_space(10.0);
+                ui.label(egui::RichText::new("Adăugate de tine").size(12.5).family(semibold()).color(p.text2));
+                ui.add_space(4.0);
+                if let Some(i) = path_list(ui, p, &own, &mut app.file_icons) {
+                    remove = Some(own[i].clone());
+                }
+            }
+            if let Some(r) = remove {
+                app.settings.exclusions.retain(|x| x != &r);
                 app.settings.exclusions_dirty = true;
             }
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 let edit = egui::TextEdit::singleline(&mut app.settings.new_exclusion)
-                    .hint_text(egui::RichText::new(r"C:\Folder  ·  \Folder  ·  **\node_modules").color(p.text3))
+                    .hint_text(egui::RichText::new(r"Un folder, de ex. D:\Arhivă veche").color(p.text3))
                     .font(FontId::proportional(13.5))
                     .margin(Vec2::new(10.0, 6.0))
                     .desired_width(320.0);
@@ -338,25 +364,8 @@ fn content_block(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
         .color(p.text2),
     );
     ui.add_space(8.0);
-    let mut remove = None;
-    for (i, path) in app.settings.content_folders.iter().enumerate() {
-        Frame::NONE
-            .fill(p.bg)
-            .corner_radius(CornerRadius::same(8))
-            .inner_margin(Margin { left: 12, right: 4, top: 4, bottom: 4 })
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(path).size(13.0).color(p.text));
-                    ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                        if icon_button(ui, p, IconKind::Close, false).on_hover_text("Scoate").clicked() {
-                            remove = Some(i);
-                        }
-                    });
-                });
-            });
-        ui.add_space(4.0);
-    }
-    if let Some(i) = remove {
+    let folders = app.settings.content_folders.clone();
+    if let Some(i) = path_list(ui, p, &folders, &mut app.file_icons) {
         app.settings.content_folders.remove(i);
         app.settings.content_dirty = true;
     }
@@ -395,6 +404,86 @@ fn content_block(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
             ui.label(egui::RichText::new("Modificări neaplicate").size(12.5).color(p.warn));
         }
     });
+}
+
+/// "**\\node_modules" → "node_modules"; "\\Folder" → "Folder (pe orice disc)".
+fn rule_label(rule: &str) -> String {
+    if let Some(name) = rule.strip_prefix("**\\") {
+        name.to_string()
+    } else if let Some(rest) = rule.strip_prefix('\\') {
+        format!("{rest} (pe orice disc)")
+    } else {
+        rule.to_string()
+    }
+}
+
+/// A compact list of folders: icon, path, × on hover; fine lines between
+/// rows. Returns the index whose × was clicked.
+fn path_list(ui: &mut egui::Ui, p: &Palette, paths: &[String], icons: &mut crate::file_icons::FileIcons) -> Option<usize> {
+    let mut removed = None;
+    Frame::NONE
+        .fill(p.bg)
+        .stroke(Stroke::new(1.0, p.line))
+        .corner_radius(CornerRadius::same(10))
+        .inner_margin(Margin::symmetric(4, 2))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            for (i, path) in paths.iter().enumerate() {
+                let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 36.0), Sense::hover());
+                let hovered = ui.rect_contains_pointer(rect);
+                if hovered {
+                    ui.painter().rect_filled(rect.shrink(1.0), 7.0, p.hover);
+                }
+                if i > 0 {
+                    ui.painter().hline(rect.x_range().shrink(10.0), rect.top(), Stroke::new(1.0, p.line));
+                }
+                let icon_rect = egui::Rect::from_center_size(egui::pos2(rect.left() + 20.0, rect.center().y), Vec2::splat(20.0));
+                match icons.get(ui.ctx(), path, true) {
+                    Some(t) => {
+                        let uv = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
+                        ui.painter().image(t.id(), icon_rect, uv, Color32::WHITE);
+                    }
+                    None => crate::icons::paint(ui.painter(), icon_rect, crate::icons::Icon::Folder, p.text3),
+                }
+                ui.painter().text(
+                    egui::pos2(rect.left() + 40.0, rect.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    path,
+                    FontId::proportional(13.0),
+                    p.text,
+                );
+                let x = egui::Rect::from_center_size(egui::pos2(rect.right() - 20.0, rect.center().y), Vec2::splat(26.0));
+                let xr = ui.interact(x, resp.id.with("x"), Sense::click());
+                if hovered || xr.hovered() {
+                    if xr.hovered() {
+                        ui.painter().rect_filled(x, 6.0, p.border);
+                    }
+                    crate::icons::paint(ui.painter(), x.shrink(7.0), crate::icons::Icon::Close, p.text2);
+                }
+                if xr.on_hover_text("Scoate").clicked() {
+                    removed = Some(i);
+                }
+            }
+        });
+    removed
+}
+
+/// A small chip with a × at the end; the whole chip removes.
+fn removable_chip(ui: &mut egui::Ui, p: &Palette, text: &str) -> egui::Response {
+    let galley = ui.painter().layout_no_wrap(text.to_string(), FontId::proportional(12.5), p.text2);
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(galley.size().x + 36.0, 26.0), Sense::click());
+    let fill = if resp.hovered() { p.hover } else { p.bg };
+    ui.painter().rect(rect, 13.0, fill, Stroke::new(1.0, p.line), egui::StrokeKind::Inside);
+    ui.painter().galley(egui::pos2(rect.left() + 11.0, rect.center().y - galley.size().y / 2.0), galley, p.text2);
+    let x = egui::Rect::from_center_size(egui::pos2(rect.right() - 14.0, rect.center().y), Vec2::splat(10.0));
+    crate::icons::paint(ui.painter(), x, crate::icons::Icon::Close, if resp.hovered() { p.text } else { p.text3 });
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// Accent text that acts as a button.
+fn link(ui: &mut egui::Ui, p: &Palette, text: &str) -> egui::Response {
+    let resp = ui.add(egui::Label::new(egui::RichText::new(text).size(12.5).color(p.accent)).sense(Sense::click()));
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 /// A titled card.
