@@ -7,6 +7,7 @@
 
 mod app;
 mod file_icons;
+mod i18n;
 mod icons;
 mod preview;
 mod recent;
@@ -58,7 +59,9 @@ fn main() -> eframe::Result<()> {
                     wake();
                 });
             }
-            let preferred = settings::SettingsState::load().hotkey;
+            let saved = settings::SettingsState::load();
+            i18n::set(saved.lang);
+            let preferred = saved.hotkey;
             let tray = tray::install(requests.clone(), wake, preferred.as_deref()).ok();
             Ok(Box::new(app::WheretiApp::new(&ctx, requests, tray, visible)))
         }),

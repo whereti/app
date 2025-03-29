@@ -139,17 +139,17 @@ fn worker(jobs: Receiver<Msg>, out: Sender<Update>, wake: impl Fn()) {
         let result = (|| -> std::io::Result<()> {
             if let Some(paths) = p.exclusions {
                 let msg = match c.call(&Request::SetExclusions { paths })? {
-                    Response::Ok => "Excluderile au fost salvate — indexul se reconstruiește".to_string(),
-                    Response::Error(e) => format!("Nu s-au putut salva excluderile: {e}"),
-                    _ => "Răspuns neașteptat de la serviciu".to_string(),
+                    Response::Ok => crate::i18n::tr("Exclusions saved — the index is being rebuilt", "Excluderile au fost salvate — indexul se reconstruiește").to_string(),
+                    Response::Error(e) => crate::trf!("Could not save the exclusions: {e}", "Nu s-au putut salva excluderile: {e}"),
+                    _ => crate::i18n::tr("Unexpected reply from the service", "Răspuns neașteptat de la serviciu").to_string(),
                 };
                 let _ = out.send(Update::Done(msg));
             }
             if let Some(paths) = p.content_folders {
                 let msg = match c.call(&Request::SetContentFolders { paths })? {
-                    Response::Ok => "Folderele au fost salvate — conținutul lor se indexează în fundal".to_string(),
-                    Response::Error(e) => format!("Nu s-au putut salva folderele: {e}"),
-                    _ => "Răspuns neașteptat de la serviciu".to_string(),
+                    Response::Ok => crate::i18n::tr("Folders saved — their contents are indexed in the background", "Folderele au fost salvate — conținutul lor se indexează în fundal").to_string(),
+                    Response::Error(e) => crate::trf!("Could not save the folders: {e}", "Nu s-au putut salva folderele: {e}"),
+                    _ => crate::i18n::tr("Unexpected reply from the service", "Răspuns neașteptat de la serviciu").to_string(),
                 };
                 let _ = out.send(Update::Done(msg));
             }

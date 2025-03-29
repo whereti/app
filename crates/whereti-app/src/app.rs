@@ -13,6 +13,8 @@ use eframe::egui::{
 use whereti_ipc::{Row, Sort, StatusReply};
 
 use crate::file_icons::FileIcons;
+use crate::i18n::tr;
+use crate::trf;
 use crate::icons::{self, Icon};
 use crate::preview::Preview;
 use crate::searcher::{Job, Searcher, Update};
@@ -43,12 +45,12 @@ impl Filter {
 
     fn label(self) -> &'static str {
         match self {
-            Filter::All => "Toate",
-            Filter::Documents => "Documente",
-            Filter::Images => "Imagini",
-            Filter::Audio => "Audio",
-            Filter::Video => "Video",
-            Filter::Folders => "Foldere",
+            Filter::All => tr("All", "Toate"),
+            Filter::Documents => tr("Documents", "Documente"),
+            Filter::Images => tr("Images", "Imagini"),
+            Filter::Audio => tr("Audio", "Audio"),
+            Filter::Video => tr("Video", "Video"),
+            Filter::Folders => tr("Folders", "Foldere"),
         }
     }
 
@@ -164,11 +166,14 @@ impl WheretiApp {
         match app.tray.as_ref().map(|t| t.hotkey) {
             // Said once: the shortcut actually used is then remembered.
             Some(Some(k)) if k != PREFERRED_HOTKEY && app.settings.hotkey.is_none() => {
-                app.flash(format!("{PREFERRED_HOTKEY} e folosită de altă aplicație — tasta rapidă este {k}"));
+                app.flash(trf!(
+                    "{PREFERRED_HOTKEY} is used by another app — the shortcut is {k}",
+                    "{PREFERRED_HOTKEY} e folosită de altă aplicație — tasta rapidă este {k}"
+                ));
                 app.settings.hotkey = Some(k.to_string());
                 app.settings.save();
             }
-            Some(None) => app.flash("Nicio tastă rapidă disponibilă; deschide whereti din iconița din tray"),
+            Some(None) => app.flash(tr("No shortcut is free; open whereti from its tray icon", "Nicio tastă rapidă disponibilă; deschide whereti din iconița din tray")),
             _ => {}
         }
         app.run_search();
@@ -270,9 +275,9 @@ impl WheretiApp {
                             let _ = t.icon.set_icon(Some(crate::tray::icon_with_progress(progress)));
                             self.tray_progress = progress;
                         }
-                        let mut tip = format!("whereti — {} fișiere · {}", shell::count(s.entries), state_ro(&s.state));
+                        let mut tip = trf!("whereti — {} files · {}", "whereti — {} fișiere · {}", shell::count(s.entries), state_ro(&s.state));
                         if content_active(&s.content) {
-                            tip.push_str(&format!("\nConținut: {}", content_progress(&s.content, eta)));
+                            tip.push_str(&trf!("\nContents: {}", "\nConținut: {}", content_progress(&s.content, eta)));
                         }
                         let _ = t.icon.set_tooltip(Some(tip));
                     }
@@ -359,7 +364,7 @@ impl WheretiApp {
         if copy {
             if let Some(row) = self.rows.get(self.selected) {
                 ctx.copy_text(row.path.clone());
-                self.flash("Calea a fost copiată");
+                self.flash(tr("Path copied", "Calea a fost copiată"));
             }
         }
         if esc {
@@ -408,7 +413,7 @@ impl WheretiApp {
                 ui.add_space(8.0);
                 let right_w = 190.0;
                 let edit = egui::TextEdit::singleline(&mut self.query)
-                    .hint_text(egui::RichText::new("Caută fișiere, foldere, documente…").size(18.0).color(p.text3))
+                    .hint_text(egui::RichText::new(tr("Search files, folders, documents…", "Caută fișiere, foldere, documente…")).size(18.0).color(p.text3))
                     .font(FontId::proportional(18.0))
                     .text_color(p.text)
                     .frame(Frame::NONE)
@@ -429,12 +434,16 @@ impl WheretiApp {
                 ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 2.0;
                     let gear =
-                        icon_button(ui, p, IconKind::Gear, self.page == Page::Settings).on_hover_text("Setări (Ctrl+,)");
+                        icon_button(ui, p, IconKind::Gear, self.page == Page::Settings).on_hover_text(tr("Settings (Ctrl+,)", "Setări (Ctrl+,)"));
                     if gear.clicked() {
                         self.toggle_settings();
                     }
                     if self.page == Page::Search {
-                        let tip = if self.preview.open { "Ascunde previzualizarea (Tab)" } else { "Arată previzualizarea (Tab)" };
+                        let tip = if self.preview.open {
+                            tr("Hide the preview (Tab)", "Ascunde previzualizarea (Tab)")
+                        } else {
+                            tr("Show the preview (Tab)", "Arată previzualizarea (Tab)")
+                        };
                         if icon_button(ui, p, IconKind::Preview, self.preview.open).on_hover_text(tip).clicked() {
                             self.toggle_preview();
                         }
@@ -443,7 +452,7 @@ impl WheretiApp {
                     let (sep, _) = ui.allocate_exact_size(Vec2::new(13.0, 20.0), Sense::hover());
                     ui.painter().vline(sep.center().x, sep.y_range(), Stroke::new(1.0, p.border));
                     if !self.query.is_empty() {
-                        if icon_button(ui, p, IconKind::Close, false).on_hover_text("Golește (Esc)").clicked() {
+                        if icon_button(ui, p, IconKind::Close, false).on_hover_text(tr("Clear (Esc)", "Golește (Esc)")).clicked() {
                             self.query.clear();
                             self.run_search();
                             self.focus_search = true;
@@ -486,8 +495,11 @@ impl WheretiApp {
                 p,
                 Icon::Plug,
                 p.error,
-                "Serviciul whereti nu rulează",
-                &format!("Pornește-l dintr-un terminal de administrator: whereti-service start   ({msg})"),
+                tr("The whereti service is not running", "Serviciul whereti nu rulează"),
+                &trf!(
+                    "Start it from an Administrator terminal: whereti-service start   ({msg})",
+                    "Pornește-l dintr-un terminal de administrator: whereti-service start   ({msg})"
+                ),
                 &[],
             );
             return;
@@ -497,15 +509,25 @@ impl WheretiApp {
             ui.vertical_centered(|ui| {
                 ui.add(egui::Spinner::new().size(18.0).color(p.text3));
                 ui.add_space(6.0);
-                ui.label(egui::RichText::new("Caut și în conținutul fișierelor…").size(13.0).color(p.text3));
+                ui.label(egui::RichText::new(tr("Looking inside files too…", "Caut și în conținutul fișierelor…")).size(13.0).color(p.text3));
             });
             return;
         }
         if self.rows.is_empty() {
             let (title, sub) = if self.query.trim().is_empty() && self.filter == Filter::All {
-("Nimic deschis recent", "Fișierele pe care le deschizi și cele descărcate apar aici.".to_string())
+(
+                    tr("Nothing opened recently", "Nimic deschis recent"),
+                    tr("Files you open and download show up here.", "Fișierele pe care le deschizi și cele descărcate apar aici.").to_string(),
+                )
             } else {
-                ("Nimic găsit", format!("Niciun fișier nu conține „{}” în nume sau în text. Încearcă:", self.query.trim()))
+                (
+                    tr("Nothing found", "Nimic găsit"),
+                    trf!(
+                        "No file has “{}” in its name or text. Try:",
+                        "Niciun fișier nu conține „{}” în nume sau în text. Încearcă:",
+                        self.query.trim()
+                    ),
+                )
             };
             let icon = if self.query.trim().is_empty() && self.filter == Filter::All { Icon::Clock } else { Icon::Search };
             if let Some(example) = empty_state(ui, p, icon, p.text3, title, &sub, &["factura", "ext:pdf", "dm:today", "*.jpg"]) {
@@ -518,11 +540,11 @@ impl WheretiApp {
         }
         ui.add_space(10.0);
         let header = if self.recent_mode {
-            "RECENTE".to_string()
+            tr("RECENT", "RECENTE").to_string()
         } else if self.content_start == Some(0) {
-            "NICIUN NUME NU SE POTRIVEȘTE".to_string()
+            tr("NO NAME MATCHES", "NICIUN NUME NU SE POTRIVEȘTE").to_string()
         } else {
-            format!("{} REZULTATE", shell::count(self.total))
+            trf!("{} RESULTS", "{} REZULTATE", shell::count(self.total))
         };
         ui.horizontal(|ui| {
             ui.add_space(12.0);
@@ -624,10 +646,10 @@ impl WheretiApp {
     /// "GĂSIT ÎN CONȚINUT · 12" (+ indexing progress while it runs).
     fn content_section_label(&self) -> String {
         let shown = self.content_start.map_or(0, |s| self.rows.len() - s) as u64;
-        let mut label = format!("GĂSIT ÎN CONȚINUT · {}", shell::count(shown));
+        let mut label = trf!("FOUND IN CONTENTS · {}", "GĂSIT ÎN CONȚINUT · {}", shell::count(shown));
         if let Some(c) = self.status.as_ref().map(|s| &s.content) {
             if content_active(c) {
-                label.push_str(&format!("   ·   indexare în curs, {}", content_progress(c, self.eta.left(c))));
+                label.push_str(&trf!("   ·   indexing, {}", "   ·   indexare în curs, {}", content_progress(c, self.eta.left(c))));
             }
         }
         label
@@ -641,14 +663,19 @@ impl WheretiApp {
 
         // Right: the index state. It always gets its room first.
         let (dot, state) = match (&self.offline, &self.status) {
-            (Some(_), _) => (p.error, "serviciul nu rulează".to_string()),
+            (Some(_), _) => (p.error, tr("the service is not running", "serviciul nu rulează").to_string()),
             (None, Some(s)) if s.state == "ready" && content_active(&s.content) => (
                 p.warn,
-                format!("{} fișiere · conținut {}", shell::count(s.entries), content_progress(&s.content, self.eta.left(&s.content))),
+                trf!(
+                    "{} files · contents {}",
+                    "{} fișiere · conținut {}",
+                    shell::count(s.entries),
+                    content_progress(&s.content, self.eta.left(&s.content))
+                ),
             ),
-            (None, Some(s)) if s.state == "ready" => (p.ok, format!("{} fișiere indexate · actualizat", shell::count(s.entries))),
-            (None, Some(s)) => (p.warn, format!("{} fișiere · {}", shell::count(s.entries), state_ro(&s.state))),
-            (None, None) => (p.text3, "se conectează…".to_string()),
+            (None, Some(s)) if s.state == "ready" => (p.ok, trf!("{} files indexed · up to date", "{} fișiere indexate · actualizat", shell::count(s.entries))),
+            (None, Some(s)) => (p.warn, trf!("{} files · {}", "{} fișiere · {}", shell::count(s.entries), state_ro(&s.state))),
+            (None, None) => (p.text3, tr("connecting…", "se conectează…").to_string()),
         };
         let right_w = width(ui, &state) + 14.0 + 16.0;
 
@@ -664,9 +691,15 @@ impl WheretiApp {
         if left.is_none() && self.offline.is_none() && self.page == Page::Search {
             let ms = format!("{:.0} ms", self.round_trip.as_secs_f64() * 1000.0);
             let options = [
-                format!("{ms}  ·  Enter deschide  ·  Ctrl+Enter arată în Explorer  ·  click dreapta pentru meniu  ·  trage în altă aplicație"),
-                format!("{ms}  ·  Enter deschide  ·  Ctrl+Enter arată în Explorer  ·  click dreapta pentru meniu"),
-                format!("{ms}  ·  Enter deschide  ·  Ctrl+Enter arată în Explorer"),
+                trf!(
+                    "{ms}  ·  Enter opens  ·  Ctrl+Enter shows in Explorer  ·  right-click for the menu  ·  drag into any app",
+                    "{ms}  ·  Enter deschide  ·  Ctrl+Enter arată în Explorer  ·  click dreapta pentru meniu  ·  trage în altă aplicație"
+                ),
+                trf!(
+                    "{ms}  ·  Enter opens  ·  Ctrl+Enter shows in Explorer  ·  right-click for the menu",
+                    "{ms}  ·  Enter deschide  ·  Ctrl+Enter arată în Explorer  ·  click dreapta pentru meniu"
+                ),
+                trf!("{ms}  ·  Enter opens  ·  Ctrl+Enter shows in Explorer", "{ms}  ·  Enter deschide  ·  Ctrl+Enter arată în Explorer"),
                 ms,
             ];
             left = options.into_iter().find(|t| width(ui, t) <= room).map(|t| (t, p.text3));
@@ -799,12 +832,12 @@ impl eframe::App for WheretiApp {
 
 pub(crate) fn state_ro(state: &str) -> String {
     match state {
-        "ready" => "actualizat".into(),
-        "loading" => "se încarcă indexul".into(),
-        "indexing" => "se construiește indexul".into(),
-        "catching up" => "se aduce la zi".into(),
-        "reindexing" => "se reconstruiește indexul".into(),
-        s if s.starts_with("rescanning") => s.replace("rescanning", "se rescanează"),
+        "ready" => tr("up to date", "actualizat").into(),
+        "loading" => tr("loading the index", "se încarcă indexul").into(),
+        "indexing" => tr("building the index", "se construiește indexul").into(),
+        "catching up" => tr("catching up", "se aduce la zi").into(),
+        "reindexing" => tr("rebuilding the index", "se reconstruiește indexul").into(),
+        s if s.starts_with("rescanning") && crate::i18n::ro() => s.replace("rescanning", "se rescanează"),
         s => s.to_string(),
     }
 }
@@ -813,7 +846,7 @@ pub(crate) fn state_ro(state: &str) -> String {
 pub(crate) fn content_progress(c: &whereti_ipc::ContentStatus, left: Option<Duration>) -> String {
     let all = c.done + c.queued;
     let pct = (c.done * 100).checked_div(all).unwrap_or(100);
-    let mut s = format!("{} din {} documente ({pct}%)", shell::count(c.done), shell::count(all));
+    let mut s = trf!("{} of {} documents ({pct}%)", "{} din {} documente ({pct}%)", shell::count(c.done), shell::count(all));
     if let Some(d) = left.filter(|_| c.state == "indexing") {
         s.push_str(&format!(" · {}", time_left(d)));
     }
@@ -825,11 +858,11 @@ pub(crate) fn content_progress(c: &whereti_ipc::ContentStatus, left: Option<Dura
 pub(crate) fn time_left(d: Duration) -> String {
     let secs = d.as_secs();
     if secs < 60 {
-        format!("~{} s rămase", secs.max(5).div_ceil(5) * 5)
+        trf!("~{} s left", "~{} s rămase", secs.max(5).div_ceil(5) * 5)
     } else if secs < 3600 {
-        format!("~{} min rămase", secs.div_ceil(60))
+        trf!("~{} min left", "~{} min rămase", secs.div_ceil(60))
     } else {
-        format!("~{} h {} min rămase", secs / 3600, (secs % 3600) / 60)
+        trf!("~{} h {} min left", "~{} h {} min rămase", secs / 3600, (secs % 3600) / 60)
     }
 }
 
@@ -850,9 +883,9 @@ pub(crate) fn content_active(c: &whereti_ipc::ContentStatus) -> bool {
 /// "în pauză (pe baterie)" for a paused state, else empty.
 pub(crate) fn pause_note(c: &whereti_ipc::ContentStatus) -> &'static str {
     match c.state.as_str() {
-        "paused: battery" => " · în pauză: pe baterie",
-        "paused: fullscreen" => " · în pauză: rulează un joc sau o prezentare",
-        "paused: busy" => " · în pauză: procesorul e ocupat",
+        "paused: battery" => tr(" · paused: on battery", " · în pauză: pe baterie"),
+        "paused: fullscreen" => tr(" · paused: a game or presentation is running", " · în pauză: rulează un joc sau o prezentare"),
+        "paused: busy" => tr(" · paused: the processor is busy", " · în pauză: procesorul e ocupat"),
         _ => "",
     }
 }
@@ -1218,14 +1251,19 @@ pub(crate) fn now_minutes() -> i64 {
     unix as i64 + 134_774 * 1440
 }
 
-/// "azi, 14:32", "ieri, 09:10", "joi, 18:05", "12 oct.", "3 mar. 2024".
+/// "today, 14:32", "yesterday, 09:10", "Thu, 18:05", "Oct 12", "Mar 3, 2024"
+/// — or the Romanian "azi, 14:32", "ieri, 09:10", "joi, 18:05", "12 oct.", "3 mar. 2024".
 pub(crate) fn relative_time(minutes_utc: u32, tz: i32, now_utc: i64) -> String {
     if minutes_utc == 0 {
         return String::new();
     }
-    const MONTHS: [&str; 12] =
+    const MONTHS_RO: [&str; 12] =
         ["ian.", "feb.", "mar.", "apr.", "mai", "iun.", "iul.", "aug.", "sept.", "oct.", "nov.", "dec."];
-    const DAYS: [&str; 7] = ["luni", "marți", "miercuri", "joi", "vineri", "sâmbătă", "duminică"];
+    const DAYS_RO: [&str; 7] = ["luni", "marți", "miercuri", "joi", "vineri", "sâmbătă", "duminică"];
+    const MONTHS_EN: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    const DAYS_EN: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+    let ro = crate::i18n::ro();
+    let (months, days) = if ro { (MONTHS_RO, DAYS_RO) } else { (MONTHS_EN, DAYS_EN) };
     let local = minutes_utc as i64 + tz as i64;
     let today = (now_utc + tz as i64).div_euclid(1440);
     let day = local.div_euclid(1440);
@@ -1233,11 +1271,13 @@ pub(crate) fn relative_time(minutes_utc: u32, tz: i32, now_utc: i64) -> String {
     let (y, m, d) = whereti_query::civil_from_day(day);
     let (ty, _, _) = whereti_query::civil_from_day(today);
     match today - day {
-        0 => format!("azi, {hm}"),
-        1 => format!("ieri, {hm}"),
-        2..=6 => format!("{}, {hm}", DAYS[day.rem_euclid(7) as usize]), // day 0 (1601-01-01) was a Monday
-        _ if y == ty => format!("{d} {}", MONTHS[(m - 1) as usize]),
-        _ => format!("{d} {} {y}", MONTHS[(m - 1) as usize]),
+        0 => trf!("today, {hm}", "azi, {hm}"),
+        1 => trf!("yesterday, {hm}", "ieri, {hm}"),
+        2..=6 => format!("{}, {hm}", days[day.rem_euclid(7) as usize]), // day 0 (1601-01-01) was a Monday
+        _ if y == ty && ro => format!("{d} {}", months[(m - 1) as usize]),
+        _ if y == ty => format!("{} {d}", months[(m - 1) as usize]),
+        _ if ro => format!("{d} {} {y}", months[(m - 1) as usize]),
+        _ => format!("{} {d}, {y}", months[(m - 1) as usize]),
     }
 }
 
@@ -1246,7 +1286,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn english_is_the_default() {
+        let _guard = crate::i18n::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        crate::i18n::set(crate::i18n::Lang::English);
+        assert_eq!(time_left(Duration::from_secs(61)), "~2 min left");
+        assert_eq!(shell::count(2_509_598), "2,509,598");
+        assert_eq!(shell::size(12_595), "12.3 KB");
+        let now = (whereti_query::day_from_civil(2026, 10, 24) * 1440 + 720) as i64;
+        let at = |y, m, d, h: i64| (whereti_query::day_from_civil(y, m, d) * 1440 + h * 60) as u32;
+        assert_eq!(relative_time(at(2026, 10, 24, 11), 180, now), "today, 14:00");
+        assert_eq!(relative_time(at(2026, 10, 22, 6), 180, now), "Thu, 09:00");
+        assert_eq!(relative_time(at(2026, 3, 12, 6), 180, now), "Mar 12");
+        assert_eq!(relative_time(at(2024, 9, 3, 6), 180, now), "Sep 3, 2024");
+    }
+
+
+    #[test]
     fn time_left_and_progress_text() {
+        let _guard = crate::i18n::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        crate::i18n::set(crate::i18n::Lang::Romanian);
         assert_eq!(time_left(Duration::from_secs(3)), "~5 s rămase");
         assert_eq!(time_left(Duration::from_secs(42)), "~45 s rămase");
         assert_eq!(time_left(Duration::from_secs(61)), "~2 min rămase");
@@ -1262,6 +1320,8 @@ mod tests {
 
     #[test]
     fn relative_times_in_romanian() {
+        let _guard = crate::i18n::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        crate::i18n::set(crate::i18n::Lang::Romanian);
         let day = whereti_query::day_from_civil;
         let now = day(2026, 10, 24) * 1440 + 15 * 60; // Saturday 15:00 UTC
         let at = |y, m, d, h: i64| (day(y, m, d) * 1440 + h * 60) as u32;

@@ -38,18 +38,39 @@ pub const PREFERRED_HOTKEY: &str = HOTKEYS[0].0;
 pub struct Tray {
     pub icon: TrayIcon,
     open_item: MenuItem,
+    quit_item: MenuItem,
     manager: Option<GlobalHotKeyManager>,
     registered: Option<HotKey>,
     /// The shortcut in use, e.g. "Ctrl+Alt+Space"; `None` if none could be registered.
     pub hotkey: Option<&'static str>,
 }
 
+fn open_label(hotkey: Option<&str>) -> String {
+    let search = crate::i18n::tr("Search…", "Caută…");
+    match hotkey {
+        Some(k) => format!("{search}   {k}"),
+        None => search.to_string(),
+    }
+}
+
+fn quit_label() -> &'static str {
+    crate::i18n::tr("Quit", "Ieșire")
+}
+
 impl Tray {
+    /// Menu texts in the current language.
+    pub fn relabel(&self) {
+        self.open_item.set_text(open_label(self.hotkey));
+        self.quit_item.set_text(quit_label());
+    }
+
     /// Switches to another shortcut; keeps the old one if the new one is taken.
     pub fn set_hotkey(&mut self, label: &str) -> Result<&'static str, String> {
-        let Some(m) = &self.manager else { return Err("tastele rapide nu sunt disponibile".into()) };
+        let Some(m) = &self.manager else {
+            return Err(crate::i18n::tr("shortcuts are not available", "tastele rapide nu sunt disponibile").into());
+        };
         let Some(&(name, mods, code)) = HOTKEYS.iter().find(|h| h.0 == label) else {
-            return Err(format!("tastă necunoscută: {label}"));
+            return Err(crate::trf!("unknown shortcut: {label}", "tastă necunoscută: {label}"));
         };
         let new = HotKey::new(Some(mods), code);
         if let Some(old) = self.registered {
@@ -59,14 +80,14 @@ impl Tray {
             Ok(()) => {
                 self.registered = Some(new);
                 self.hotkey = Some(name);
-                self.open_item.set_text(format!("Caută…   {name}"));
+                self.open_item.set_text(open_label(Some(name)));
                 Ok(name)
             }
             Err(_) => {
                 if let Some(old) = self.registered {
                     let _ = m.register(old);
                 }
-                Err(format!("{name} e folosită de altă aplicație"))
+                Err(crate::trf!("{name} is used by another app", "{name} e folosită de altă aplicație"))
             }
         }
     }
@@ -104,12 +125,8 @@ pub fn install(
     }
 
     let menu = Menu::new();
-    let open_label = match hotkey {
-        Some(k) => format!("Caută…   {k}"),
-        None => "Caută…".to_string(),
-    };
-    let open_item = MenuItem::new(open_label, true, None);
-    let quit = MenuItem::new("Ieșire", true, None);
+    let open_item = MenuItem::new(open_label(hotkey), true, None);
+    let quit = MenuItem::new(quit_label(), true, None);
     menu.append_items(&[&open_item, &PredefinedMenuItem::separator(), &quit]).map_err(|e| e.to_string())?;
     let (open_id, quit_id) = (open_item.id().clone(), quit.id().clone());
 
@@ -138,7 +155,7 @@ pub fn install(
             wake();
         }
     }));
-    Ok(Tray { icon, open_item, manager, registered, hotkey })
+    Ok(Tray { icon, open_item, quit_item: quit, manager, registered, hotkey })
 }
 
 /// A 32×32 magnifying glass, drawn in code (no image files to ship).
