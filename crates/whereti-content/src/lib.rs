@@ -1,4 +1,4 @@
-//! The content index (PLAN.md §6.4): which files contain which words.
+﻿//! The content index (PLAN.md §6.4): which files contain which words.
 //!
 //! One Tantivy document per file. A file is identified by its volume and MFT
 //! record number (`key`), not by its path: renaming or moving a file inside
@@ -26,7 +26,7 @@ use tantivy::{doc, Index, IndexReader, IndexWriter, ReloadPolicy, Term};
 pub use tokenizer::{tokenize, WordTokenizer};
 
 /// Bump when the schema or the tokenizer changes: the index is rebuilt.
-const FORMAT: u32 = 1;
+const FORMAT: u32 = 2;
 const TOKENIZER: &str = "wt_words";
 const WRITER_HEAP: usize = 32 << 20;
 

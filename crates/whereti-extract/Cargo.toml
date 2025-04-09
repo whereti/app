@@ -7,8 +7,10 @@ repository.workspace = true
 
 [dependencies]
 calamine = "0.37.0"
+cfb = "0.15.0"
 chardetng = "1.0.0"
 encoding_rs = "0.8.42"
+mail-parser = { version = "0.11.9", features = ["full_encoding"] }
 pdf-extract = "0.12.1"
 quick-xml = "0.42.0"
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_Security"] }

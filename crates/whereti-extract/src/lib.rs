@@ -7,7 +7,11 @@
 //! Every format is bounded: output is capped at `max_chars`, and no archive
 //! entry is inflated beyond `MAX_ENTRY` (zip bombs).
 
+mod email;
+mod ole;
 mod rtf;
+#[cfg(test)]
+mod tests_mail_ole;
 pub mod worker;
 
 pub use rtf::rtf_to_text;
@@ -58,6 +62,14 @@ pub enum Kind {
     Pdf,
     Rtf,
     Html,
+    /// MIME e-mail (.eml)
+    Email,
+    /// Outlook message (.msg)
+    Outlook,
+    /// Word 97-2003 (.doc)
+    WordBinary,
+    /// PowerPoint 97-2003 (.ppt)
+    PowerPointBinary,
 }
 
 pub fn kind_of(ext: &str) -> Option<Kind> {
@@ -70,6 +82,10 @@ pub fn kind_of(ext: &str) -> Option<Kind> {
         "pdf" => Kind::Pdf,
         "rtf" => Kind::Rtf,
         "html" | "htm" | "xhtml" => Kind::Html,
+        "eml" => Kind::Email,
+        "msg" => Kind::Outlook,
+        "doc" | "dot" => Kind::WordBinary,
+        "ppt" | "pps" | "pot" => Kind::PowerPointBinary,
         e if TEXT_EXTS.contains(&e) => Kind::Text,
         _ => return None,
     })
@@ -78,7 +94,7 @@ pub fn kind_of(ext: &str) -> Option<Kind> {
 /// Extensions with a converter, besides plain text.
 const DOC_EXTS: &[&str] = &[
     "docx", "docm", "dotx", "dotm", "pptx", "pptm", "ppsx", "potx", "xlsx", "xlsm", "xlsb", "xls", "ods", "odt", "odp",
-    "pdf", "rtf", "html", "htm", "xhtml",
+    "pdf", "rtf", "html", "htm", "xhtml", "eml", "msg", "doc", "dot", "ppt", "pps", "pot",
 ];
 
 /// Every extension `extract` reads, lower case, without the dot.
@@ -108,6 +124,10 @@ pub fn extract(ext: &str, bytes: &[u8], max_chars: usize) -> Result<Extracted, E
         Kind::Pdf => pdf(bytes, &mut out)?,
         Kind::Rtf => out.push(&rtf_to_text(&String::from_utf8_lossy(bytes))),
         Kind::Html => out.push(&html_to_text(&decode_text(bytes)?)),
+        Kind::Email => email::eml(bytes, &mut out)?,
+        Kind::Outlook => ole::msg(bytes, &mut out)?,
+        Kind::WordBinary => ole::doc(bytes, &mut out)?,
+        Kind::PowerPointBinary => ole::ppt(bytes, &mut out)?,
     }
     Ok(out.finish())
 }

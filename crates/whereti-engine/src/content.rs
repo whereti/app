@@ -544,6 +544,8 @@ fn extract(c: &Candidate, sandbox: Option<&Sandbox>) -> Option<(Indexed, String)
         Ok(e) if e.text.trim().is_empty() => (what(Status::Empty), String::new()),
         Ok(e) => (what(Status::Ok), e.text),
         Err(SandboxError::Io(_)) => return None,
+        // the extension promised a format the file is not in (a Tcl .msg): no text, not a failure
+        Err(SandboxError::Extract(ExtractError::Unsupported)) => (what(Status::Empty), String::new()),
         Err(SandboxError::Extract(ExtractError::Protected)) => (what(Status::Protected), String::new()),
         Err(SandboxError::TooLarge(_)) => (what(Status::TooLarge), String::new()),
         Err(_) => (what(Status::Failed), String::new()),
