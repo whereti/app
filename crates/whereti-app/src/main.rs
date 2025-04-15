@@ -12,6 +12,7 @@ mod icons;
 mod preview;
 mod recent;
 mod searcher;
+mod snippets;
 mod settings;
 mod shell;
 mod theme;

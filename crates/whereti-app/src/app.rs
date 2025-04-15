@@ -24,6 +24,8 @@ use crate::theme::{self, Palette};
 use crate::tray::{Requests, Tray, PREFERRED_HOTKEY};
 
 const ROW_HEIGHT: f32 = 52.0;
+/// Content results have a third line: the snippet.
+const CONTENT_ROW_HEIGHT: f32 = 72.0;
 const RESULT_LIMIT: u32 = 500;
 const STATUS_EVERY: Duration = Duration::from_secs(2);
 /// While indexing, the status is asked for this often even with the window
@@ -114,6 +116,8 @@ pub struct WheretiApp {
     preview: Preview,
     /// Explorer's own file icons, cached per type.
     pub(crate) file_icons: FileIcons,
+    /// Text excerpts under content results.
+    snippets: crate::snippets::Snippets,
 }
 
 impl WheretiApp {
@@ -161,6 +165,10 @@ impl WheretiApp {
             tray,
             preview,
             file_icons: FileIcons::new(),
+            snippets: {
+                let wake_ctx = ctx.clone();
+                crate::snippets::Snippets::start(move || wake_ctx.request_repaint())
+            },
         };
         app.settings.apply_theme(ctx);
         match app.tray.as_ref().map(|t| t.hotkey) {
@@ -558,17 +566,37 @@ impl WheretiApp {
             });
         }
 
-        // Keep the selected row visible after keyboard moves.
+        // The list: name results, the section header, content results (taller,
+        // with a snippet). Heights differ, so the list is virtualised here:
+        // only the items in view are laid out and painted.
+        let content_start = self.content_start;
+        let items = self.rows.len() + content_start.is_some() as usize;
+        let height_of = |item: usize| match content_start {
+            Some(s) if item == s => ROW_HEIGHT,
+            Some(s) if item > s => CONTENT_ROW_HEIGHT,
+            _ => ROW_HEIGHT,
+        };
+        let mut tops = Vec::with_capacity(items + 1);
+        let mut y = 0.0;
+        for item in 0..items {
+            tops.push(y);
+            y += height_of(item);
+        }
+        tops.push(y);
+        let total = y;
+        let item_of = |row: usize| row + content_start.is_some_and(|s| row >= s) as usize;
+
         let mut area = egui::ScrollArea::vertical().auto_shrink([false, false]);
+        // Keep the selected row visible after keyboard moves.
         // (the first frame does not know the view height yet: wait for it)
-        let item_of = |row: usize, start: Option<usize>| row + start.is_some_and(|s| row >= s) as usize;
-        if self.scroll_to_selected && self.view_height > 0.0 {
-            let top = item_of(self.selected, self.content_start) as f32 * ROW_HEIGHT;
+        if self.scroll_to_selected && self.view_height > 0.0 && !self.rows.is_empty() {
+            let it = item_of(self.selected.min(self.rows.len() - 1));
+            let (top, bottom) = (tops[it], tops[it + 1]);
             let mut off = self.scroll_offset;
             if top < off {
                 off = top;
-            } else if top + ROW_HEIGHT > off + self.view_height {
-                off = top + ROW_HEIGHT - self.view_height;
+            } else if bottom > off + self.view_height {
+                off = bottom - self.view_height;
             }
             area = area.vertical_scroll_offset(off.max(0.0));
             self.scroll_to_selected = false;
@@ -577,29 +605,43 @@ impl WheretiApp {
         let mut dragged: Option<usize> = None;
         let mut menu_for: Option<usize> = None;
         let section = self.content_section_label();
+        let needles = highlight_needles(&self.query);
+        self.snippets.begin_frame(&needles);
         let rows = &self.rows;
         let file_icons = &mut self.file_icons;
+        let snippets = &mut self.snippets;
         let selected = self.selected;
         let tz = self.tz;
-        let needles = highlight_needles(&self.query);
         let now = now_minutes();
-        let content_start = self.content_start;
-        let items = rows.len() + content_start.is_some() as usize;
-        let out = area.show_rows(ui, ROW_HEIGHT, items, |ui, range| {
-            for item in range {
+        let list_id = ui.scope_id().with("results");
+        let out = area.show_viewport(ui, |ui, viewport| {
+            let (whole, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), total), Sense::hover());
+            let first = tops.partition_point(|&t| t + 80.0 < viewport.min.y).saturating_sub(1);
+            for (item, &top) in tops.iter().enumerate().take(items).skip(first) {
+                if top > viewport.max.y {
+                    break;
+                }
+                let rect = Rect::from_min_size(
+                    Pos2::new(whole.left(), whole.top() + top),
+                    Vec2::new(whole.width(), height_of(item)),
+                );
                 let i = match content_start {
                     Some(s) if item == s => {
-                        let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), ROW_HEIGHT), Sense::hover());
                         paint_section(ui, p, rect, &section);
                         continue;
                     }
                     Some(s) if item > s => item - 1,
                     _ => item,
                 };
-                let (rect, resp) =
-                    ui.allocate_exact_size(Vec2::new(ui.available_width(), ROW_HEIGHT), Sense::click_and_drag());
-                let icon = file_icons.get(ui.ctx(), &rows[i].path, rows[i].is_dir);
-                paint_row(ui, p, rect, &rows[i], icon.as_ref(), i == selected, resp.hovered(), tz, now, &needles);
+                let resp = ui.interact(rect, list_id.with(i), Sense::click_and_drag());
+                let row = &rows[i];
+                let icon = file_icons.get(ui.ctx(), &row.path, row.is_dir);
+                if content_start.is_some_and(|s| i >= s) {
+                    let line = snippets.get(&row.path);
+                    paint_content_row(ui, p, rect, row, icon.as_ref(), &line, i == selected, resp.hovered(), tz, now, &needles);
+                } else {
+                    paint_row(ui, p, rect, row, icon.as_ref(), i == selected, resp.hovered(), tz, now, &needles);
+                }
                 if resp.drag_started() {
                     dragged = Some(i);
                 } else if resp.secondary_clicked() {
@@ -611,6 +653,7 @@ impl WheretiApp {
                 }
             }
         });
+        self.snippets.end_frame();
         self.scroll_offset = out.state.clamped_offset().y;
         self.view_height = out.inner_rect.height();
         if let Some((i, open)) = clicked {
@@ -1115,6 +1158,112 @@ fn paint_row(
         FontId::proportional(12.0),
         p.text2,
     );
+}
+
+/// A content result: name, the snippet with the found words, the folder.
+#[allow(clippy::too_many_arguments)]
+fn paint_content_row(
+    ui: &egui::Ui,
+    p: &Palette,
+    rect: Rect,
+    row: &Row,
+    icon: Option<&egui::TextureHandle>,
+    line: &crate::snippets::Line,
+    selected: bool,
+    hovered: bool,
+    tz: i32,
+    now: i64,
+    needles: &[String],
+) {
+    let painter = ui.painter_at(rect);
+    let inner = rect.shrink2(Vec2::new(2.0, 2.0));
+    if selected {
+        painter.rect_filled(inner, 10.0, p.accent_soft);
+    } else if hovered {
+        painter.rect_filled(inner, 10.0, p.hover);
+    }
+    let (folder, name) = match row.path.rfind('\\') {
+        Some(i) if i + 1 < row.path.len() => (&row.path[..i], &row.path[i + 1..]),
+        _ => ("", row.path.as_str()),
+    };
+    let tile = Rect::from_center_size(Pos2::new(inner.left() + 26.0, inner.top() + 26.0), Vec2::splat(32.0));
+    match icon {
+        Some(t) => {
+            painter.image(t.id(), tile, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
+        }
+        None => paint_tile(&painter, p, tile.shrink(1.0), row.is_dir, name),
+    }
+    let right_w = 210.0;
+    let text_left = tile.right() + 14.0;
+    let text_w = (inner.right() - right_w - text_left).max(80.0);
+    let name_job = highlighted(name, needles, FontId::new(14.5, medium()), p.text, p.accent, text_w);
+    let name_g = ui.fonts_mut(|f| f.layout_job(name_job));
+    painter.galley(Pos2::new(text_left, inner.top() + 6.0), name_g, p.text);
+
+    // the snippet runs under the name and the date column, to the right edge
+    let snip_w = inner.right() - 14.0 - text_left;
+    let snip_pos = Pos2::new(text_left, inner.top() + 27.0);
+    match line {
+        crate::snippets::Line::Excerpt(sn) => {
+            let job = snippet_job(sn, p, snip_w);
+            let g = ui.fonts_mut(|f| f.layout_job(job));
+            painter.galley(snip_pos, g, p.text2);
+        }
+        crate::snippets::Line::NoExcerpt => {
+            painter.text(
+                snip_pos,
+                Align2::LEFT_TOP,
+                tr("The words are in this file", "Cuvintele apar în acest fișier"),
+                FontId::proportional(12.5),
+                p.text3,
+            );
+        }
+        crate::snippets::Line::Loading => {
+            // a quiet placeholder while the text is read
+            let bar = Rect::from_min_size(snip_pos + Vec2::new(0.0, 5.0), Vec2::new((snip_w * 0.55).min(320.0), 7.0));
+            painter.rect_filled(bar, 3.5, p.line);
+        }
+    }
+    let folder_text = middle_elide(ui, folder, FontId::proportional(12.0), text_w);
+    painter.text(Pos2::new(text_left, inner.top() + 47.0), Align2::LEFT_TOP, folder_text, FontId::proportional(12.0), p.text3);
+
+    let size = if row.is_dir { String::new() } else { shell::size(row.size) };
+    let y = inner.top() + 16.0;
+    painter.text(Pos2::new(inner.right() - 14.0, y), Align2::RIGHT_CENTER, size, FontId::proportional(12.0), p.text3);
+    painter.text(
+        Pos2::new(inner.right() - 92.0, y),
+        Align2::RIGHT_CENTER,
+        relative_time(row.modified, tz, now),
+        FontId::proportional(12.0),
+        p.text2,
+    );
+}
+
+/// One line of snippet text; the found words in accent colour and medium weight.
+fn snippet_job(sn: &crate::snippets::Snippet, p: &Palette, width: f32) -> LayoutJob {
+    let chars: Vec<(usize, char)> = sn.text.char_indices().collect();
+    let mut job = LayoutJob::default();
+    let mut i = 0;
+    while i < chars.len() {
+        let m = sn.marks[i];
+        let mut j = i;
+        while j < chars.len() && sn.marks[j] == m {
+            j += 1;
+        }
+        let end = chars.get(j).map_or(sn.text.len(), |c| c.0);
+        let format = if m {
+            TextFormat::simple(FontId::new(12.5, semibold()), p.accent)
+        } else {
+            TextFormat::simple(FontId::proportional(12.5), p.text2)
+        };
+        job.append(&sn.text[chars[i].0..end], 0.0, format);
+        i = j;
+    }
+    job.wrap.max_width = width;
+    job.wrap.max_rows = 1;
+    job.wrap.break_anywhere = true;
+    job.wrap.overflow_character = Some('…');
+    job
 }
 
 /// Folder glyph, or a coloured tile with the extension (PDF, DOCX, JPG…).

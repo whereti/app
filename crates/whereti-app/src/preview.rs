@@ -404,6 +404,11 @@ fn worker(jobs: Receiver<String>, out: Sender<Loaded>, wake: impl Fn()) {
 const FOLDER_ENTRIES: usize = 60;
 
 fn load(path: &str, sandbox: Option<&Sandbox>) -> Content {
+    load_with(path, sandbox, SHOW_CHARS)
+}
+
+/// The file's text (or what it is instead), at most `max_chars`.
+pub(crate) fn load_with(path: &str, sandbox: Option<&Sandbox>, max_chars: usize) -> Content {
     let p = Path::new(path);
     if p.is_dir() {
         let mut all: Vec<(String, bool)> = match std::fs::read_dir(p) {
@@ -424,11 +429,11 @@ fn load(path: &str, sandbox: Option<&Sandbox>) -> Content {
     let mono = kind == Kind::Text && !matches!(ext.as_str(), "txt" | "md" | "markdown" | "log" | "srt" | "vtt" | "rst" | "adoc" | "org" | "tex");
     let result = if kind == Kind::Text {
         // Plain text needs no parser: read only what is shown.
-        read_shared_head(p, (SHOW_CHARS * 4) as u64)
-            .and_then(|b| whereti_extract::extract(&ext, &b, SHOW_CHARS).map_err(SandboxError::Extract))
+        read_shared_head(p, (max_chars * 4) as u64)
+            .and_then(|b| whereti_extract::extract(&ext, &b, max_chars).map_err(SandboxError::Extract))
     } else {
         match sandbox {
-            Some(s) => s.extract_file(p, SHOW_CHARS),
+            Some(s) => s.extract_file(p, max_chars),
             None => return Content::Failed(tr("whereti-extract.exe is missing next to whereti.exe", "whereti-extract.exe lipsește de lângă whereti.exe").into()),
         }
     };
