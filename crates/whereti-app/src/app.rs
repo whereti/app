@@ -73,6 +73,8 @@ impl Filter {
 pub(crate) enum Page {
     Search,
     Settings,
+    /// First start: what whereti is doing while the index is built.
+    Welcome,
 }
 
 pub struct WheretiApp {
@@ -171,6 +173,14 @@ impl WheretiApp {
             },
         };
         app.settings.apply_theme(ctx);
+        // First start (or right after the installer): the welcome page, and
+        // whereti starts with Windows unless the user turns it off later.
+        if !app.settings.welcomed || std::env::args().any(|a| a == "--welcome") {
+            app.page = Page::Welcome;
+            if !app.settings.welcomed && !app.settings.autostart && shell::set_autostart(true).is_ok() {
+                app.settings.autostart = true;
+            }
+        }
         match app.tray.as_ref().map(|t| t.hotkey) {
             // Said once: the shortcut actually used is then remembered.
             Some(Some(k)) if k != PREFERRED_HOTKEY && app.settings.hotkey.is_none() => {
@@ -337,6 +347,12 @@ impl WheretiApp {
             }
             return;
         }
+        if self.page == Page::Welcome {
+            if esc || enter {
+                crate::welcome::finish(self);
+            }
+            return;
+        }
         if tab {
             self.toggle_preview();
         }
@@ -436,6 +452,9 @@ impl WheretiApp {
                     self.focus_search = false;
                 }
                 if resp.changed() {
+                    if self.page == Page::Welcome {
+                        crate::welcome::finish(self);
+                    }
                     self.page = Page::Search;
                     self.run_search();
                 }
@@ -519,6 +538,25 @@ impl WheretiApp {
                 ui.add_space(6.0);
                 ui.label(egui::RichText::new(tr("Looking inside files too…", "Caut și în conținutul fișierelor…")).size(13.0).color(p.text3));
             });
+            return;
+        }
+        // Searching before the index is built: say so instead of "nothing found".
+        let building = self.status.as_ref().filter(|s| s.state != "ready");
+        if self.rows.is_empty() && building.is_some() {
+            let s = building.cloned().unwrap_or_default();
+            empty_state(
+                ui,
+                p,
+                Icon::Clock,
+                p.accent,
+                tr("The index is still being built", "Indexul încă se construiește"),
+                &trf!(
+                    "{} — results appear as soon as it is ready, usually within a minute.",
+                    "{} — rezultatele apar imediat ce e gata, de obicei într-un minut.",
+                    state_ro(&s.state)
+                ),
+                &[],
+            );
             return;
         }
         if self.rows.is_empty() {
@@ -869,6 +907,7 @@ impl eframe::App for WheretiApp {
             .show(ui, |ui| match self.page {
                 Page::Search => self.results(ui, &ctx, &p),
                 Page::Settings => crate::settings::show(self, ui, &p),
+                Page::Welcome => crate::welcome::show(self, ui, &p),
             });
     }
 }
@@ -878,6 +917,10 @@ pub(crate) fn state_ro(state: &str) -> String {
         "ready" => tr("up to date", "actualizat").into(),
         "loading" => tr("loading the index", "se încarcă indexul").into(),
         "indexing" => tr("building the index", "se construiește indexul").into(),
+        s if s.starts_with("indexing ") => {
+            let drive = s.trim_start_matches("indexing ").split_whitespace().next().unwrap_or("");
+            trf!("reading the file names on {drive}", "se citesc numele fișierelor de pe {drive}")
+        }
         "catching up" => tr("catching up", "se aduce la zi").into(),
         "reindexing" => tr("rebuilding the index", "se reconstruiește indexul").into(),
         s if s.starts_with("rescanning") && crate::i18n::ro() => s.replace("rescanning", "se rescanează"),
@@ -911,11 +954,22 @@ pub(crate) fn time_left(d: Duration) -> String {
 
 /// How far indexing is, if something is being indexed (0.0–1.0).
 fn indexing_fraction(s: &StatusReply) -> Option<f32> {
-    if s.state == "indexing" || s.state == "reindexing" {
-        return Some(0.0); // the name index has no counter: an empty bar
+    if let Some(f) = names_progress(&s.state) {
+        return Some(f);
+    }
+    if s.state == "reindexing" {
+        return Some(0.0);
     }
     let c = &s.content;
     (content_active(c) && c.done + c.queued > 0).then(|| c.done as f32 / (c.done + c.queued) as f32)
+}
+
+/// "indexing C: 1/2" → how far the first build is (drives done / all).
+pub(crate) fn names_progress(state: &str) -> Option<f32> {
+    let rest = state.strip_prefix("indexing")?;
+    let Some((k, n)) = rest.rsplit(' ').next().and_then(|t| t.split_once('/')) else { return Some(0.0) };
+    let (k, n): (f32, f32) = (k.parse().ok()?, n.parse().ok()?);
+    Some(((k - 1.0) / n.max(1.0)).clamp(0.0, 1.0))
 }
 
 /// Indexing, or paused in the middle of it.

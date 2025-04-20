@@ -28,6 +28,8 @@ pub struct SettingsState {
     pub hotkey: Option<String>,
     pub theme: ThemeChoice,
     pub autostart: bool,
+    /// The welcome page was seen and closed.
+    pub welcomed: bool,
     /// The preview panel is open.
     pub preview: bool,
     pub lang: Lang,
@@ -53,6 +55,7 @@ impl SettingsState {
             hotkey: None,
             theme: ThemeChoice::System,
             autostart: shell::autostart_enabled(),
+            welcomed: false,
             preview: true,
             lang: Lang::English,
             config: None,
@@ -73,6 +76,7 @@ impl SettingsState {
                     Some(("theme", "dark")) => s.theme = ThemeChoice::Dark,
                     Some(("preview", "off")) => s.preview = false,
                     Some(("language", "ro")) => s.lang = Lang::Romanian,
+                    Some(("welcomed", "yes")) => s.welcomed = true,
                     _ => {}
                 }
             }
@@ -87,9 +91,10 @@ impl SettingsState {
             ThemeChoice::Dark => "dark",
         };
         let mut text = format!(
-            "theme={theme}\npreview={}\nlanguage={}\n",
+            "theme={theme}\npreview={}\nlanguage={}\nwelcomed={}\n",
             if self.preview { "on" } else { "off" },
-            if self.lang == Lang::Romanian { "ro" } else { "en" }
+            if self.lang == Lang::Romanian { "ro" } else { "en" },
+            if self.welcomed { "yes" } else { "no" }
         );
         if let Some(h) = &self.hotkey {
             text.push_str(&format!("hotkey={h}\n"));

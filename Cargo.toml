@@ -1,6 +1,20 @@
 [workspace]
 resolver = "2"
 members = ["crates/*"]
+# The installer packs the release binaries of the others: it is built on its
+# own, after them (scripts/package.ps1), never by a plain `cargo build`.
+default-members = [
+    "crates/whereti-app",
+    "crates/whereti-cli",
+    "crates/whereti-content",
+    "crates/whereti-core",
+    "crates/whereti-engine",
+    "crates/whereti-extract",
+    "crates/whereti-ipc",
+    "crates/whereti-ntfs",
+    "crates/whereti-query",
+    "crates/whereti-service",
+]
 
 [workspace.package]
 version = "0.0.1"

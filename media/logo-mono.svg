@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-labelledby="title">
+  <title id="title">whereti</title>
+  <!-- One colour (currentColor) for favicons at 16 px, print and monochrome
+       UI: the magnifier, and the pin inside it with its centre cut out. -->
+  <g fill="none" stroke="currentColor" stroke-linecap="round">
+    <circle cx="232" cy="232" r="112" stroke-width="40"/>
+    <line x1="318" y1="318" x2="404" y2="404" stroke-width="54"/>
+  </g>
+  <path fill="currentColor" fill-rule="evenodd" d="M232 162 C 200 162 176 186 176 217 C 176 256 214 290 228 302
+           C 230.4 304 233.6 304 236 302 C 250 290 288 256 288 217 C 288 186 264 162 232 162 Z
+           M232 196 A 20 20 0 1 0 232 236 A 20 20 0 1 0 232 196 Z"/>
+  <style>
+    svg { color: #1B1B3A; }
+    @media (prefers-color-scheme: dark) { svg { color: #FFFFFF; } }
+  </style>
+</svg>

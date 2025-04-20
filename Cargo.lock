@@ -4959,6 +4959,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "whereti-setup"
+version = "0.0.1"
+dependencies = [
+ "eframe",
+ "windows",
+ "windows-service",
+]
+
+[[package]]
 name = "widestring"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

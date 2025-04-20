@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-labelledby="title">
+  <title id="title">whereti</title>
+  <defs>
+    <!-- background: deep blue to violet, lit from the top left -->
+    <linearGradient id="bg" x1="64" y1="32" x2="448" y2="480" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#2F6BFF"/>
+      <stop offset="0.55" stop-color="#4A4BF0"/>
+      <stop offset="1" stop-color="#6C2BD9"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="150" cy="110" r="300" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.28"/>
+      <stop offset="1" stop-color="#FFFFFF" stop-opacity="0"/>
+    </radialGradient>
+    <!-- the found thing: a warm pin -->
+    <linearGradient id="pin" x1="220" y1="150" x2="250" y2="300" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFD66B"/>
+      <stop offset="1" stop-color="#FF8A3D"/>
+    </linearGradient>
+    <!-- glass of the lens: a faint tint, brighter at the top -->
+    <linearGradient id="lens" x1="232" y1="120" x2="232" y2="344" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.22"/>
+      <stop offset="1" stop-color="#FFFFFF" stop-opacity="0.06"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="10" stdDeviation="12" flood-color="#14093F" flood-opacity="0.35"/>
+    </filter>
+    <filter id="pinShadow" x="-40%" y="-40%" width="180%" height="180%">
+      <feDropShadow dx="0" dy="6" stdDeviation="6" flood-color="#5A1E00" flood-opacity="0.35"/>
+    </filter>
+  </defs>
+
+  <!-- the tile -->
+  <rect width="512" height="512" rx="116" fill="url(#bg)"/>
+  <rect width="512" height="512" rx="116" fill="url(#glow)"/>
+  <rect x="1.5" y="1.5" width="509" height="509" rx="114.5" fill="none" stroke="#FFFFFF" stroke-opacity="0.16" stroke-width="3"/>
+
+  <!-- the magnifier -->
+  <g filter="url(#shadow)">
+    <circle cx="232" cy="232" r="112" fill="url(#lens)"/>
+    <circle cx="232" cy="232" r="112" fill="none" stroke="#FFFFFF" stroke-width="34"/>
+    <line x1="318" y1="318" x2="398" y2="398" stroke="#FFFFFF" stroke-width="48" stroke-linecap="round"/>
+  </g>
+  <!-- a soft highlight on the glass -->
+  <path d="M168 182 A 80 80 0 0 1 226 150" fill="none" stroke="#FFFFFF" stroke-opacity="0.55" stroke-width="12" stroke-linecap="round"/>
+
+  <!-- inside the lens: where it is -->
+  <g filter="url(#pinShadow)">
+    <path d="M232 162
+             C 200 162 176 186 176 217
+             C 176 256 214 290 228 302
+             C 230.4 304 233.6 304 236 302
+             C 250 290 288 256 288 217
+             C 288 186 264 162 232 162 Z" fill="url(#pin)"/>
+    <circle cx="232" cy="216" r="20" fill="#FFFFFF"/>
+  </g>
+</svg>

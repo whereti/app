@@ -710,7 +710,10 @@ impl Worker {
     fn build_fresh(&mut self) -> Result<NameIndex, String> {
         let t = Instant::now();
         let mut scans = Vec::new();
-        for letter in sync::fixed_drives() {
+        let drives = sync::fixed_drives();
+        for (k, letter) in drives.iter().copied().enumerate() {
+            // "indexing C: 1/2": the app shows it as progress on first start
+            self.shared.set_state(format!("indexing {letter}: {}/{}", k + 1, drives.len()));
             if let Some(s) = sync::scan_volume(letter, self.cfg.threads)? {
                 self.log(format!("{letter}: scanned {} entries", s.scan.entries.len()));
                 scans.push(s);

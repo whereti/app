@@ -17,6 +17,7 @@ mod settings;
 mod shell;
 mod theme;
 mod tray;
+mod welcome;
 mod win;
 
 use std::sync::Arc;
