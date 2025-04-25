@@ -19,3 +19,6 @@ windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_UI_Sh
 [[bin]]
 name = "whereti"
 path = "src/main.rs"
+
+[build-dependencies]
+winresource = "0.1.34"

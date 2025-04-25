@@ -31,7 +31,7 @@ fn main() -> eframe::Result<()> {
         shell::Instance::AlreadyRunning => return Ok(()),
     };
     let visible = !std::env::args().any(|a| a == "--hidden");
-    let icon = egui::IconData { rgba: tray::magnifier_rgba(), width: 32, height: 32 };
+    let icon = egui::IconData { rgba: tray::logo_rgba_64(), width: 64, height: 64 };
     let options = eframe::NativeOptions {
         renderer: eframe::Renderer::Glow,
         viewport: egui::ViewportBuilder::default()

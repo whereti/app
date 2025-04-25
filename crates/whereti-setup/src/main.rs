@@ -49,7 +49,7 @@ fn main() {
             .with_inner_size([560.0, 460.0])
             .with_resizable(false)
             .with_maximize_button(false)
-            .with_icon(Arc::new(egui::IconData { rgba: magnifier_rgba(), width: 32, height: 32 })),
+            .with_icon(Arc::new(egui::IconData { rgba: logo_rgba(), width: 64, height: 64 })),
         centered: true,
         ..Default::default()
     };
@@ -156,26 +156,9 @@ impl Setup {
     }
 }
 
-/// The whereti magnifier (the same drawing as the app's tray icon).
-fn magnifier_rgba() -> Vec<u8> {
-    let n = 32usize;
-    let mut px = vec![0u8; n * n * 4];
-    let (cx, cy, r) = (13.0f32, 13.0f32, 9.0f32);
-    for y in 0..n {
-        for x in 0..n {
-            let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
-            let d = ((fx - cx).powi(2) + (fy - cy).powi(2)).sqrt();
-            let ring = (d - r).abs() < 2.2;
-            let t = ((fx - cx) + (fy - cy)) / 2.0;
-            let off = ((fx - cx) - (fy - cy)).abs() / std::f32::consts::SQRT_2;
-            let handle = t > r * 0.72 && t < r * 1.75 && off < 2.6;
-            if ring || handle {
-                let i = (y * n + x) * 4;
-                px[i..i + 4].copy_from_slice(&[0x2B, 0x6C, 0xD9, 0xFF]);
-            }
-        }
-    }
-    px
+/// The whereti logo, 64×64 (rendered by tools/render-icons).
+fn logo_rgba() -> Vec<u8> {
+    include_bytes!("../../../media/icons/whereti-64.rgba").to_vec()
 }
 
 /// Compares "0.10.2" with "0.9.0" by numbers, not as text.

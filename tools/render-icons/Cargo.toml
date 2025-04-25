@@ -1,0 +1,13 @@
+[package]
+name = "render-icons"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Renders media/logo*.svg into the PNG sizes and the .ico the apps use (run by hand when the logo changes)"
+
+# Not part of the whereti workspace: a one-off tool, run with
+#   cargo run --release --manifest-path tools/render-icons/Cargo.toml
+[workspace]
+
+[dependencies]
+resvg = "0.49.0"

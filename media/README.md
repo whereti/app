@@ -7,10 +7,18 @@ tile; the pin in warm amber, the one thing that is "found".
 | File | Use |
 |---|---|
 | `logo.svg` | The app icon: a square tile with rounded corners (Windows 11 style). Stores, website, installer, social. Reads down to 32 px. |
+| `logo-small.svg` | The same icon drawn for 16–32 px (tray, taskbar, small icons): thicker lines, bigger pin, no glow or shadows. |
 | `logo-mono.svg` | One colour (`currentColor`; dark ink, white in dark mode). Favicons at 16 px, print, monochrome UI. |
 | `logo-wordmark.svg` | Icon + name, for light backgrounds. The ending **ti** carries the brand gradient. |
 | `logo-wordmark-dark.svg` | The same for dark backgrounds. |
 | `preview.html` | All of them at real sizes, on light and dark. |
+| `icons/` | Rendered from the SVGs: PNG 16–256 px, `whereti.ico` (all sizes, embedded in whereti.exe, the service and the installer), raw RGBA for the window and tray icons. |
+
+When the logo changes, render `icons/` again:
+
+```
+cargo run --release --manifest-path tools/render-icons/Cargo.toml
+```
 
 Colours: blue `#2F6BFF` → indigo `#4A4BF0` → violet `#6C2BD9`; pin amber
 `#FFD66B` → `#FF8A3D`; ink `#16162B`.

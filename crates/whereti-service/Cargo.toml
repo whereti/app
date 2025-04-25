@@ -9,3 +9,6 @@ repository.workspace = true
 whereti-engine = { version = "0.0.1", path = "../whereti-engine" }
 whereti-ipc = { version = "0.0.1", path = "../whereti-ipc" }
 windows-service = "0.8.1"
+
+[build-dependencies]
+winresource = "0.1.34"

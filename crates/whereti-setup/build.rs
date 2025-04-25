@@ -26,4 +26,16 @@ fn main() {
         println!("cargo:rerun-if-changed={}", path.display());
     }
     println!("cargo:rustc-env=WHERETI_PAYLOAD_DIR={}", dir.display());
+
+    // the whereti icon and file details on the installer itself
+    let ico = concat!(env!("CARGO_MANIFEST_DIR"), "/../../media/icons/whereti.ico");
+    println!("cargo:rerun-if-changed={ico}");
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        let mut res = winresource::WindowsResource::new();
+        res.set_icon(ico)
+            .set("ProductName", "whereti")
+            .set("FileDescription", "whereti setup")
+            .set("LegalCopyright", "MIT license");
+        res.compile().expect("embedding the icon (needs rc.exe from the Windows SDK)");
+    }
 }

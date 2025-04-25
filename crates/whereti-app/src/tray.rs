@@ -158,50 +158,38 @@ pub fn install(
     Ok(Tray { icon, open_item, quit_item: quit, manager, registered, hotkey })
 }
 
-/// A 32×32 magnifying glass, drawn in code (no image files to ship).
-pub fn magnifier_rgba() -> Vec<u8> {
-    let n = 32usize;
-    let mut px = vec![0u8; n * n * 4];
-    let (cx, cy, r) = (13.0f32, 13.0f32, 9.0f32);
-    for y in 0..n {
-        for x in 0..n {
-            let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
-            let d = ((fx - cx).powi(2) + (fy - cy).powi(2)).sqrt();
-            let ring = (d - r).abs() < 2.2;
-            // handle: a thick line from the ring towards the corner
-            let t = ((fx - cx) + (fy - cy)) / 2.0;
-            let off = ((fx - cx) - (fy - cy)).abs() / std::f32::consts::SQRT_2;
-            let handle = t > r * 0.72 && t < r * 1.75 && off < 2.6;
-            if ring || handle {
-                let i = (y * n + x) * 4;
-                px[i..i + 4].copy_from_slice(&[0x2B, 0x6C, 0xD9, 0xFF]);
-            }
-        }
-    }
-    px
+/// The whereti logo, 32×32 (rendered from media/logo-small.svg by
+/// tools/render-icons).
+pub fn logo_rgba_32() -> Vec<u8> {
+    include_bytes!("../../../media/icons/whereti-32.rgba").to_vec()
+}
+
+/// The logo at 64×64, for the window (taskbar, Alt+Tab).
+pub fn logo_rgba_64() -> Vec<u8> {
+    include_bytes!("../../../media/icons/whereti-64.rgba").to_vec()
 }
 
 fn magnifier_icon() -> Icon {
     icon_with_progress(None)
 }
 
-/// The magnifier, with a progress bar along the bottom while indexing
+/// The logo, with a progress bar along the bottom while indexing
 /// (`percent` = how far; `None` = the plain icon).
 pub fn icon_with_progress(percent: Option<u8>) -> Icon {
-    let mut px = magnifier_rgba();
+    let mut px = logo_rgba_32();
     if let Some(pct) = percent {
         let n = 32usize;
-        let filled = 2 + (28 * pct.min(100) as usize) / 100;
+        let filled = 3 + (26 * pct.min(100) as usize) / 100;
         for y in 26..31 {
-            for x in 1..31 {
+            for x in 2..30 {
                 let i = (y * n + x) * 4;
-                let edge = y == 26 || y == 30 || x == 1 || x == 30;
+                let edge = y == 26 || y == 30 || x == 2 || x == 29;
                 let color = if edge {
-                    [0xFF, 0xFF, 0xFF, 0xFF]
+                    [0x14, 0x10, 0x3A, 0xFF]
                 } else if x < filled {
-                    [0x1E, 0xA0, 0x4E, 0xFF] // green: done
+                    [0x3D, 0xDC, 0x84, 0xFF] // green: done
                 } else {
-                    [0x50, 0x50, 0x58, 0xFF]
+                    [0xE8, 0xE8, 0xF0, 0xFF]
                 };
                 px[i..i + 4].copy_from_slice(&color);
             }
