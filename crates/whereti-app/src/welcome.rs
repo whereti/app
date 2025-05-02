@@ -28,17 +28,12 @@ pub fn show(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
         let width = ui.available_width().min(660.0);
         let pad = ((ui.available_width() - width) / 2.0).max(0.0);
-        ui.add_space(18.0);
+        ui.add_space(10.0);
         ui.horizontal(|ui| {
             ui.add_space(pad);
             ui.vertical(|ui| {
                 ui.set_width(width);
                 // ---- greeting
-                let (r, _) = ui.allocate_exact_size(Vec2::new(56.0, 56.0), Sense::hover());
-                ui.painter().circle_filled(r.center(), 28.0, theme::with_alpha(p.accent, 0.10));
-                ui.painter().circle_stroke(r.center(), 28.0, Stroke::new(1.0, theme::with_alpha(p.accent, 0.30)));
-                icons::paint(ui.painter(), Rect::from_center_size(r.center(), Vec2::splat(26.0)), Icon::Search, p.accent);
-                ui.add_space(14.0);
                 ui.label(
                     egui::RichText::new(tr("Welcome to whereti", "Bine ai venit în whereti"))
                         .size(26.0)
@@ -54,7 +49,7 @@ pub fn show(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
                     .size(14.0)
                     .color(p.text2),
                 );
-                ui.add_space(20.0);
+                ui.add_space(14.0);
 
                 // ---- the three steps
                 let names_step = match (&offline, &status) {
@@ -115,14 +110,14 @@ pub fn show(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
                     .fill(p.surface)
                     .stroke(Stroke::new(1.0, p.border))
                     .corner_radius(CornerRadius::same(14))
-                    .inner_margin(Margin::symmetric(20, 10))
+                    .inner_margin(Margin::symmetric(20, 4))
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         step_row(ui, p, 1, &names_step, tr("Reading the file names", "Se citesc numele fișierelor"), &names_detail, false);
                         step_row(ui, p, 2, &content_step, tr("Reading the documents", "Se citesc documentele"), &content_detail, false);
                         step_row(ui, p, 3, &ready_step, tr("Ready to search", "Gata de căutare"), &ready_detail, true);
                     });
-                ui.add_space(18.0);
+                ui.add_space(12.0);
 
                 // ---- tips
                 ui.horizontal(|ui| {
@@ -132,7 +127,7 @@ pub fn show(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
                     tip(ui, p, w, Icon::Document, tr("Inside documents too", "Și în documente"), tr("Words in PDFs, Word and Excel files show up under the names.", "Cuvintele din PDF, Word și Excel apar sub nume."));
                     tip(ui, p, w, Icon::Panel, tr("Tab shows a preview", "Tab arată previzualizarea"), tr("Enter opens, Ctrl+Enter shows the file in Explorer.", "Enter deschide, Ctrl+Enter arată fișierul în Explorer."));
                 });
-                ui.add_space(22.0);
+                ui.add_space(14.0);
                 ui.horizontal(|ui| {
                     if primary_button(ui, p, tr("Start searching", "Începe să cauți")).clicked() {
                         finish(app);
@@ -147,7 +142,7 @@ pub fn show(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
                         .color(p.text3),
                     );
                 });
-                ui.add_space(24.0);
+                ui.add_space(8.0);
             });
         });
     });
@@ -171,9 +166,9 @@ fn drives(s: &whereti_ipc::StatusReply) -> String {
 
 #[allow(clippy::too_many_arguments)]
 fn step_row(ui: &mut egui::Ui, p: &Palette, n: usize, step: &Step, title: &str, detail: &str, last: bool) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 68.0), Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 56.0), Sense::hover());
     let painter = ui.painter();
-    let c = Pos2::new(rect.left() + 16.0, rect.top() + 24.0);
+    let c = Pos2::new(rect.left() + 16.0, rect.top() + 21.0);
     match step {
         Step::Done => {
             painter.circle_filled(c, 12.0, p.ok);
@@ -204,13 +199,13 @@ fn step_row(ui: &mut egui::Ui, p: &Palette, n: usize, step: &Step, title: &str, 
     }
     let x = rect.left() + 44.0;
     let title_color = if matches!(step, Step::Waiting) { p.text3 } else { p.text };
-    painter.text(Pos2::new(x, rect.top() + 14.0), egui::Align2::LEFT_TOP, title, FontId::new(15.0, semibold()), title_color);
+    painter.text(Pos2::new(x, rect.top() + 9.0), egui::Align2::LEFT_TOP, title, FontId::new(15.0, semibold()), title_color);
     let detail_g = ui.fonts_mut(|f| {
         f.layout(detail.to_string(), FontId::proportional(12.5), p.text2, rect.right() - x - 8.0)
     });
-    painter.galley(Pos2::new(x, rect.top() + 36.0), detail_g, p.text2);
+    painter.galley(Pos2::new(x, rect.top() + 30.0), detail_g, p.text2);
     if let Step::Working(Some(frac)) = step {
-        let bar = Rect::from_min_size(Pos2::new(rect.right() - 170.0, rect.top() + 20.0), Vec2::new(160.0, 6.0));
+        let bar = Rect::from_min_size(Pos2::new(rect.right() - 170.0, rect.top() + 16.0), Vec2::new(160.0, 6.0));
         painter.rect_filled(bar, 3.0, p.line);
         let mut done = bar;
         done.set_width((bar.width() * frac).max(6.0));
@@ -226,16 +221,18 @@ fn tip(ui: &mut egui::Ui, p: &Palette, width: f32, icon: Icon, title: &str, text
         .fill(p.bg)
         .stroke(Stroke::new(1.0, p.line))
         .corner_radius(CornerRadius::same(12))
-        .inner_margin(Margin::same(14))
+        .inner_margin(Margin::same(12))
         .show(ui, |ui| {
-            ui.set_width(width - 28.0);
-            ui.set_min_height(86.0);
+            ui.set_width(width - 24.0);
+            ui.set_min_height(64.0);
             // the tips sit in a row: lay each one out top to bottom
             ui.vertical(|ui| {
-                let (r, _) = ui.allocate_exact_size(Vec2::splat(20.0), Sense::hover());
-                icons::paint(ui.painter(), r, icon, p.accent);
-                ui.add_space(6.0);
-                ui.label(egui::RichText::new(title).size(13.5).family(semibold()).color(p.text));
+                ui.horizontal(|ui| {
+                    let (r, _) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::hover());
+                    icons::paint(ui.painter(), r, icon, p.accent);
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new(title).size(13.5).family(semibold()).color(p.text));
+                });
                 ui.add_space(2.0);
                 ui.add(egui::Label::new(egui::RichText::new(text).size(12.0).color(p.text2)).wrap());
             });
