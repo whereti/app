@@ -110,7 +110,7 @@ pub struct WheretiApp {
     tz: i32,
     pub(crate) accent: Color32,
     styled_theme: Option<Theme>,
-    hwnd: Option<windows::Win32::Foundation::HWND>,
+    pub(crate) hwnd: Option<windows::Win32::Foundation::HWND>,
     pub(crate) page: Page,
     pub(crate) settings: SettingsState,
     pub(crate) requests: Arc<Requests>,
@@ -185,8 +185,8 @@ impl WheretiApp {
             // Said once: the shortcut actually used is then remembered.
             Some(Some(k)) if k != PREFERRED_HOTKEY && app.settings.hotkey.is_none() => {
                 app.flash(trf!(
-                    "{PREFERRED_HOTKEY} is used by another app — the shortcut is {k}",
-                    "{PREFERRED_HOTKEY} e folosită de altă aplicație — tasta rapidă este {k}"
+                    "{PREFERRED_HOTKEY} is used by another app, so the shortcut is {k}",
+                    "{PREFERRED_HOTKEY} e folosită de altă aplicație, așa că tasta rapidă este {k}"
                 ));
                 app.settings.hotkey = Some(k.to_string());
                 app.settings.save();
@@ -293,7 +293,7 @@ impl WheretiApp {
                             let _ = t.icon.set_icon(Some(crate::tray::icon_with_progress(progress)));
                             self.tray_progress = progress;
                         }
-                        let mut tip = trf!("whereti — {} files · {}", "whereti — {} fișiere · {}", shell::count(s.entries), state_ro(&s.state));
+                        let mut tip = trf!("whereti: {} files · {}", "whereti: {} fișiere · {}", shell::count(s.entries), state_ro(&s.state));
                         if content_active(&s.content) {
                             tip.push_str(&trf!("\nContents: {}", "\nConținut: {}", content_progress(&s.content, eta)));
                         }
@@ -551,8 +551,8 @@ impl WheretiApp {
                 p.accent,
                 tr("The index is still being built", "Indexul încă se construiește"),
                 &trf!(
-                    "{} — results appear as soon as it is ready, usually within a minute.",
-                    "{} — rezultatele apar imediat ce e gata, de obicei într-un minut.",
+                    "{}. Results appear as soon as it is ready, usually within a minute.",
+                    "{}. Rezultatele apar imediat ce e gata, de obicei într-un minut.",
                     state_ro(&s.state)
                 ),
                 &[],
@@ -1334,7 +1334,7 @@ pub(crate) fn paint_tile(painter: &egui::Painter, p: &Palette, tile: Rect, is_di
     let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).filter(|e| e.len() <= 5).unwrap_or_default();
     let color = type_color(&ext, p.dark);
     painter.rect_filled(tile, 9.0, theme::with_alpha(color, if p.dark { 0.24 } else { 0.14 }));
-    let label: String = if ext.is_empty() { "—".into() } else { ext.to_uppercase().chars().take(4).collect() };
+    let label: String = if ext.is_empty() { String::new() } else { ext.to_uppercase().chars().take(4).collect() };
     let size = if label.chars().count() >= 4 { 9.5 } else { 10.5 };
     painter.text(tile.center(), Align2::CENTER_CENTER, label, FontId::new(size, semibold()), color);
 }
@@ -1455,7 +1455,7 @@ pub(crate) fn now_minutes() -> i64 {
 }
 
 /// "today, 14:32", "yesterday, 09:10", "Thu, 18:05", "Oct 12", "Mar 3, 2024"
-/// — or the Romanian "azi, 14:32", "ieri, 09:10", "joi, 18:05", "12 oct.", "3 mar. 2024".
+/// - or the Romanian "azi, 14:32", "ieri, 09:10", "joi, 18:05", "12 oct.", "3 mar. 2024".
 pub(crate) fn relative_time(minutes_utc: u32, tz: i32, now_utc: i64) -> String {
     if minutes_utc == 0 {
         return String::new();

@@ -1,12 +1,12 @@
 //! Content indexing and search (PLAN.md §6, §7.3).
 //!
-//! **What is indexed — with nothing to set up:**
+//! **What is indexed - with nothing to set up:**
 //! - **documents** (PDF, Word, Excel, PowerPoint, OpenDocument, RTF, e-mails)
 //!   **everywhere** on the indexed drives, except system and noise folders
-//!   (Program Files, AppData, ProgramData, node_modules, .git, caches…) —
+//!   (Program Files, AppData, ProgramData, node_modules, .git, caches…) -
 //!   a typical PC has a few thousand;
 //! - **text and code** (txt, md, csv, html, sources) only inside the content
-//!   folders — by default every user's Desktop, Documents and Downloads —
+//!   folders - by default every user's Desktop, Documents and Downloads -
 //!   because projects and caches hold hundreds of thousands of them.
 //!
 //! **How it stays current:** the name index already knows every file and is
@@ -403,7 +403,7 @@ impl Content {
     }
 
     /// Content search (PLAN.md §6.5). The words come from `content:` terms,
-    /// or — without them — from the plain words of the query; every other
+    /// or - without them - from the plain words of the query; every other
     /// condition (ext:, path:, dm:, size:…) filters the files found.
     pub fn search(&self, idx: &NameIndex, query: &Query, limit: usize, caller: &dyn Caller) -> ContentReply {
         let t = Instant::now();
@@ -441,7 +441,7 @@ impl Content {
         }
         let status = self.status();
         let note = (status.state != "ready").then(|| {
-            format!("content index: {} — {} documents so far, {} waiting", status.state, status.files, status.queued)
+            format!("content index: {} - {} documents so far, {} waiting", status.state, status.files, status.queued)
         });
         ContentReply {
             rows,

@@ -1,6 +1,6 @@
-# whereti — brand
+# whereti - brand
 
-The mark: a **magnifier** (search) with a **location pin** inside the lens —
+The mark: a **magnifier** (search) with a **location pin** inside the lens -
 *where is it?*, answered inside the search. White on a deep blue → violet
 tile; the pin in warm amber, the one thing that is "found".
 

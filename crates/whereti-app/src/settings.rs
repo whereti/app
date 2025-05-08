@@ -1,4 +1,5 @@
-//! Settings (PLAN.md §10.9): one page, changes apply immediately.
+//! Settings (PLAN.md §10.9): General, Search and About, like Windows
+//! Settings; every change applies immediately.
 //!
 //! App preferences (shortcut, theme) live in `%APPDATA%\whereti\settings.txt`;
 //! "start with Windows" is the standard per-user Run key; exclusions belong
@@ -7,9 +8,11 @@
 use std::path::PathBuf;
 
 use eframe::egui::{self, Align, Color32, CornerRadius, FontId, Frame, Margin, Sense, Stroke, ThemePreference, Vec2};
+
+use crate::icons::Icon;
 use whereti_ipc::ConfigReply;
 
-use crate::app::{chip, icon_button, semibold, state_ro, IconKind, Page, WheretiApp};
+use crate::app::{icon_button, semibold, state_ro, IconKind, Page, WheretiApp};
 use crate::i18n::{tr, Lang};
 use crate::shell;
 use crate::trf;
@@ -35,13 +38,9 @@ pub struct SettingsState {
     pub lang: Lang,
     config: Option<ConfigReply>,
     exclusions: Vec<String>,
-    new_exclusion: String,
-    exclusions_dirty: bool,
-    content_folders: Vec<String>,
-    new_content_folder: String,
-    content_dirty: bool,
-    /// The automatic exclusion rules are shown one by one.
-    show_auto: bool,
+    /// The part of Settings shown.
+    pub section: Section,
+    logo: Option<egui::TextureHandle>,
 }
 
 fn settings_file() -> PathBuf {
@@ -60,12 +59,8 @@ impl SettingsState {
             lang: Lang::English,
             config: None,
             exclusions: Vec::new(),
-            new_exclusion: String::new(),
-            exclusions_dirty: false,
-            content_folders: Vec::new(),
-            new_content_folder: String::new(),
-            content_dirty: false,
-            show_auto: false,
+            section: Section::General,
+            logo: None,
         };
         if let Ok(text) = std::fs::read_to_string(settings_file()) {
             // Tolerate a UTF-8 BOM and stray spaces: the file may be edited by hand.
@@ -115,42 +110,78 @@ impl SettingsState {
     }
 
     pub fn on_config(&mut self, c: ConfigReply) {
-        if !self.exclusions_dirty {
-            self.exclusions = c.exclusions.clone();
-        }
-        if !self.content_dirty {
-            self.content_folders = c.content_folders.clone();
-        }
+        self.exclusions = c.exclusions.clone();
         self.config = Some(c);
     }
 }
 
-/// The settings page, drawn in the central panel.
+/// Which part of Settings is open.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Section {
+    #[default]
+    General,
+    Search,
+    About,
+}
+
+/// The settings page: a menu on the left (like Windows Settings), the
+/// chosen section on the right. Every change applies at once.
 pub fn show(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
     let ctx = ui.ctx().clone();
-    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
         ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            ui.add_space(8.0);
-            if icon_button(ui, p, IconKind::Back, false).on_hover_text(tr("Back (Esc)", "Înapoi (Esc)")).clicked() {
-                app.page = Page::Search;
-                app.focus_search = true;
-            }
-            ui.add_space(4.0);
-            ui.label(egui::RichText::new(tr("Settings", "Setări")).size(20.0).family(semibold()).color(p.text));
-        });
-        ui.add_space(12.0);
+        if icon_button(ui, p, IconKind::Back, false).on_hover_text(tr("Back (Esc)", "Înapoi (Esc)")).clicked() {
+            app.page = Page::Search;
+            app.focus_search = true;
+        }
+        ui.add_space(6.0);
+        ui.label(
+            egui::RichText::new(tr("Settings", "Setări")).size(22.0).family(egui::FontFamily::Name("display".into())).color(p.text),
+        );
+    });
+    ui.add_space(14.0);
 
-        // ---- General
-        section(ui, p, tr("General", "General"), |ui| {
-            setting_row(ui, p, tr("Language", "Limbă"), tr("The language of the whole app.", "Limba întregii aplicații."), |ui| {
-                let mut picked = None;
-                for (lang, label) in [(Lang::Romanian, "Română"), (Lang::English, "English")] {
-                    if chip(ui, p, label, app.settings.lang == lang).clicked() {
-                        picked = Some(lang);
-                    }
-                }
-                if let Some(l) = picked.filter(|l| *l != app.settings.lang) {
+    let full = ui.available_rect_before_wrap();
+    let nav_w = 196.0;
+    let nav = egui::Rect::from_min_size(full.min + Vec2::new(6.0, 0.0), Vec2::new(nav_w, full.height()));
+    let body = egui::Rect::from_min_max(egui::pos2(nav.right() + 24.0, full.top()), full.max - Vec2::new(20.0, 0.0));
+
+    // ---- the menu
+    let mut nav_ui = ui.new_child(egui::UiBuilder::new().max_rect(nav).layout(egui::Layout::top_down(Align::Min)));
+    for (section, icon, label) in [
+        (Section::General, Icon::Settings, tr("General", "General")),
+        (Section::Search, Icon::Search, tr("Search", "Căutare")),
+        (Section::About, Icon::Sparkle, tr("About", "Despre")),
+    ] {
+        if nav_item(&mut nav_ui, p, icon, label, app.settings.section == section).clicked() {
+            app.settings.section = section;
+        }
+        nav_ui.add_space(2.0);
+    }
+
+    // ---- the section
+    let mut body_ui = ui.new_child(egui::UiBuilder::new().max_rect(body).layout(egui::Layout::top_down(Align::Min)));
+    egui::ScrollArea::vertical().id_salt("settings-body").auto_shrink([false, false]).show(&mut body_ui, |ui| {
+        ui.set_max_width(ui.available_width().min(720.0));
+        match app.settings.section {
+            Section::General => general(app, ui, p, &ctx),
+            Section::Search => search(app, ui, p),
+            Section::About => about(app, ui, p),
+        }
+        ui.add_space(16.0);
+    });
+    ui.allocate_rect(full, Sense::hover());
+}
+
+fn general(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette, ctx: &egui::Context) {
+    heading(ui, p, tr("General", "General"), tr("How whereti looks and starts.", "Cum arată și cum pornește whereti."));
+    card(ui, p, |ui| {
+        row(ui, p, tr("Language", "Limbă"), tr("The language of the whole app.", "Limba întregii aplicații."), |ui| {
+            let current = if app.settings.lang == Lang::Romanian { 1 } else { 0 };
+            if let Some(i) = segmented(ui, p, &["English", "Română"], current) {
+                let l = if i == 1 { Lang::Romanian } else { Lang::English };
+                if l != app.settings.lang {
                     app.settings.lang = l;
                     crate::i18n::set(l);
                     app.settings.save();
@@ -159,38 +190,60 @@ pub fn show(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
                     }
                     app.run_search(); // dates and counts in the new language
                 }
-            });
-            divider(ui, p);
-            setting_row(ui, p, tr("Shortcut", "Tastă rapidă"), tr("Opens whereti from any app.", "Deschide whereti din orice aplicație."), |ui| {
-                let current = app.hotkey_label();
-                let mut chosen = None;
-                for (label, _, _) in HOTKEYS.iter().rev() {
-                    if chip(ui, p, label, current == Some(*label)).clicked() && current != Some(*label) {
-                        chosen = Some(*label);
-                    }
-                }
-                if let Some(label) = chosen {
-                    let result = match app.tray.as_mut() {
-                        Some(t) => t.set_hotkey(label),
-                        None => Err(tr("the tray icon is not available", "iconița din tray nu e disponibilă").into()),
-                    };
-                    match result {
-                        Ok(k) => {
-                            app.settings.hotkey = Some(k.to_string());
-                            app.settings.save();
-                            app.flash(trf!("The shortcut is now {k}", "Tasta rapidă este acum {k}"));
+            }
+        });
+        line(ui, p);
+        row(ui, p, tr("Theme", "Temă"), tr("Follow Windows, or always light or dark.", "Ca Windows, sau mereu luminoasă ori întunecată."), |ui| {
+            let options = [tr("Windows", "Windows"), tr("Light", "Luminoasă"), tr("Dark", "Întunecată")];
+            let current = match app.settings.theme {
+                ThemeChoice::System => 0,
+                ThemeChoice::Light => 1,
+                ThemeChoice::Dark => 2,
+            };
+            if let Some(i) = segmented(ui, p, &options, current) {
+                app.settings.theme = [ThemeChoice::System, ThemeChoice::Light, ThemeChoice::Dark][i];
+                app.settings.apply_theme(ctx);
+                app.settings.save();
+            }
+        });
+    });
+    ui.add_space(14.0);
+    card(ui, p, |ui| {
+        row(ui, p, tr("Shortcut", "Tastă rapidă"), tr("Opens whereti from any app.", "Deschide whereti din orice aplicație."), |ui| {
+            let current = app.hotkey_label().unwrap_or("-");
+            let mut chosen = None;
+            egui::ComboBox::from_id_salt("hotkey")
+                .selected_text(egui::RichText::new(current).size(13.0).color(p.text))
+                .width(190.0)
+                .show_ui(ui, |ui| {
+                    for (label, _, _) in HOTKEYS {
+                        if ui.selectable_label(current == label, label).clicked() && current != label {
+                            chosen = Some(label);
                         }
-                        Err(e) => app.flash(e),
                     }
+                });
+            if let Some(label) = chosen {
+                let result = match app.tray.as_mut() {
+                    Some(t) => t.set_hotkey(label),
+                    None => Err(tr("the tray icon is not available", "iconița din tray nu e disponibilă").into()),
+                };
+                match result {
+                    Ok(k) => {
+                        app.settings.hotkey = Some(k.to_string());
+                        app.settings.save();
+                        app.flash(trf!("The shortcut is now {k}", "Tasta rapidă este acum {k}"));
+                    }
+                    Err(e) => app.flash(e),
                 }
-            });
-            divider(ui, p);
-            setting_row(
-                ui,
-                p,
-                tr("Start with Windows", "Pornește cu Windows"),
-                tr("whereti waits in the tray, ready to search.", "whereti așteaptă în tray, gata de căutare."),
-                |ui| {
+            }
+        });
+        line(ui, p);
+        row(
+            ui,
+            p,
+            tr("Start with Windows", "Pornește cu Windows"),
+            tr("whereti waits next to the clock, ready to search.", "whereti așteaptă lângă ceas, gata de căutare."),
+            |ui| {
                 let mut on = app.settings.autostart;
                 if toggle(ui, p, &mut on).clicked() {
                     match shell::set_autostart(on) {
@@ -198,276 +251,284 @@ pub fn show(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
                         Err(e) => app.flash(e),
                     }
                 }
-            });
-            divider(ui, p);
-            setting_row(ui, p, tr("Theme", "Temă"), tr("Follow the Windows theme, or pick one.", "Urmează tema Windows sau alege una."), |ui| {
-                let mut picked = None;
-                for (choice, label) in
-                    [
-                    (ThemeChoice::Dark, tr("Dark", "Întunecată")),
-                    (ThemeChoice::Light, tr("Light", "Luminoasă")),
-                    (ThemeChoice::System, tr("Like Windows", "Ca Windows")),
-                ]
-                {
-                    if chip(ui, p, label, app.settings.theme == choice).clicked() {
-                        picked = Some(choice);
-                    }
-                }
-                if let Some(c) = picked {
-                    app.settings.theme = c;
-                    app.settings.apply_theme(&ctx);
-                    app.settings.save();
-                }
-            });
-        });
+            },
+        );
+    });
+}
 
-        // ---- Index
-        ui.add_space(14.0);
-        section(ui, p, tr("Index", "Index"), |ui| {
-            let (dot, line) = match (&app.offline, &app.status) {
-                (Some(_), _) => (p.error, tr("The whereti service is not running", "Serviciul whereti nu rulează").to_string()),
-                (None, Some(s)) => {
-                    let vols = s.volumes.iter().map(|v| format!("{}:", v.letter)).collect::<Vec<_>>().join(" ");
-                    let color = if s.state == "ready" { p.ok } else { p.warn };
-                    (color, trf!("{} files on {vols} · {}", "{} fișiere pe {vols} · {}", shell::count(s.entries), state_ro(&s.state)))
-                }
-                (None, None) => (p.text3, tr("connecting…", "se conectează…").to_string()),
-            };
-            ui.horizontal(|ui| {
+fn search(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
+    heading(
+        ui,
+        p,
+        tr("Search", "Căutare"),
+        tr("What whereti knows about your files.", "Ce știe whereti despre fișierele tale."),
+    );
+    let status = app.status.clone();
+    card(ui, p, |ui| {
+        // files and folders
+        let (dot, value) = match (&app.offline, &status) {
+            (Some(_), _) => (p.error, tr("The whereti service is not running", "Serviciul whereti nu rulează").to_string()),
+            (None, Some(s)) => {
+                let drives = s.volumes.iter().map(|v| format!("{}:", v.letter)).collect::<Vec<_>>().join(" ");
+                let color = if s.state == "ready" { p.ok } else { p.warn };
+                let text = if s.state == "ready" {
+                    trf!("{} on {drives}", "{} pe {drives}", shell::count(s.entries))
+                } else {
+                    state_ro(&s.state)
+                };
+                (color, text)
+            }
+            (None, None) => (p.text3, tr("connecting…", "se conectează…").to_string()),
+        };
+        row(ui, p, tr("Files and folders", "Fișiere și foldere"), tr("Found by name, instantly.", "Găsite după nume, instant."), |ui| {
+            ui.label(egui::RichText::new(value).size(13.0).color(p.text));
+            let (r, _) = ui.allocate_exact_size(Vec2::new(10.0, 18.0), Sense::hover());
+            ui.painter().circle_filled(r.center(), 4.0, dot);
+        });
+        line(ui, p);
+        // documents
+        let c = status.as_ref().map(|s| s.content.clone());
+        let desc = tr(
+            "PDF, Word, Excel, PowerPoint, e-mails and text files, found by what is written in them.",
+            "PDF, Word, Excel, PowerPoint, e-mailuri și fișiere text, găsite după ce scrie în ele.",
+        );
+        row(ui, p, tr("Inside documents", "În documente"), desc, |ui| {
+            if let Some(c) = &c {
+                let (dot, text) = match c.state.as_str() {
+                    "ready" => (p.ok, trf!("{} documents", "{} documente", shell::count(c.files))),
+                    s if s.starts_with("error") => (p.error, tr("not available", "indisponibil").to_string()),
+                    _ => (p.warn, tr("reading…", "se citesc…").to_string()),
+                };
+                ui.label(egui::RichText::new(text).size(13.0).color(p.text));
                 let (r, _) = ui.allocate_exact_size(Vec2::new(10.0, 18.0), Sense::hover());
                 ui.painter().circle_filled(r.center(), 4.0, dot);
-                ui.label(egui::RichText::new(line).size(13.5).color(p.text));
-            });
-            divider(ui, p);
-            content_block(app, ui, p);
-            divider(ui, p);
-            ui.label(egui::RichText::new(tr("Excluded folders", "Foldere excluse")).size(14.0).family(semibold()).color(p.text));
+            }
+        });
+        if let Some(c) = c.filter(crate::app::content_active) {
+            ui.add_space(2.0);
+            let all = (c.done + c.queued).max(1);
+            let (r, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 6.0), Sense::hover());
+            ui.painter().rect_filled(r, 3.0, p.line);
+            let mut done = r;
+            done.set_width((r.width() * c.done as f32 / all as f32).max(6.0));
+            ui.painter().rect_filled(done, 3.0, p.accent);
+            ui.add_space(6.0);
+            let text = crate::app::content_progress(&c, app.content_eta(&c));
+            ui.label(egui::RichText::new(text).size(12.0).color(p.text2));
+            ui.add_space(8.0);
+        }
+    });
+    ui.add_space(14.0);
+
+    // ---- folders to skip
+    card(ui, p, |ui| {
+        ui.add_space(12.0);
+        ui.label(egui::RichText::new(tr("Folders whereti skips", "Foldere ignorate")).size(14.5).family(semibold()).color(p.text));
+        ui.add_space(2.0);
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(tr(
+                    "Nothing inside them shows up in results. Use it for private folders, or old archives you never look for.",
+                    "Nimic din ele nu apare în rezultate. Util pentru foldere private sau arhive vechi pe care nu le cauți.",
+                ))
+                .size(12.5)
+                .color(p.text2),
+            )
+            .wrap(),
+        );
+        ui.add_space(10.0);
+        let defaults: Vec<String> = app.settings.config.as_ref().map(|c| c.default_exclusions.clone()).unwrap_or_default();
+        let is_default = |x: &String| defaults.iter().any(|d| d.eq_ignore_ascii_case(x));
+        let own: Vec<String> = app.settings.exclusions.iter().filter(|x| !is_default(x)).cloned().collect();
+        let mut changed = false;
+        if !own.is_empty() {
+            if let Some(i) = path_list(ui, p, &own, &mut app.file_icons) {
+                let gone = own[i].clone();
+                app.settings.exclusions.retain(|x| x != &gone);
+                changed = true;
+            }
+            ui.add_space(10.0);
+        }
+        if button(ui, p, tr("Add a folder…", "Adaugă un folder…"), false).clicked() {
+            if let Some(path) = app.hwnd.and_then(crate::win::pick_folder) {
+                if !app.settings.exclusions.iter().any(|x| x.eq_ignore_ascii_case(&path)) {
+                    app.settings.exclusions.push(path);
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            // applied at once: the service rebuilds its index in a few seconds
+            app.searcher.set_exclusions(app.settings.exclusions.clone());
+        }
+        ui.add_space(12.0);
+        line(ui, p);
+        ui.add_space(10.0);
+        ui.horizontal_wrapped(|ui| {
+            let (r, _) = ui.allocate_exact_size(Vec2::new(16.0, 16.0), Sense::hover());
+            crate::icons::paint(ui.painter(), r, crate::icons::Icon::Lock, p.text3);
             ui.label(
                 egui::RichText::new(tr(
-                    "They never show up in results. After “Apply”, the index is rebuilt in a few seconds.",
-                    "Nu apar deloc în rezultate. După „Aplică”, indexul se reconstruiește în câteva secunde.",
+                    "Windows, program files and temporary or cache folders are skipped automatically.",
+                    "Windows, fișierele programelor și folderele temporare sau de cache sunt ignorate automat.",
                 ))
-                    .size(12.5)
-                    .color(p.text2),
+                .size(12.0)
+                .color(p.text3),
             );
+        });
+        ui.add_space(12.0);
+    });
+}
+
+fn about(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
+    heading(ui, p, tr("About", "Despre"), "");
+    card(ui, p, |ui| {
+        ui.add_space(16.0);
+        ui.horizontal(|ui| {
+            let logo = app.settings.logo.get_or_insert_with(|| {
+                let image = egui::ColorImage::from_rgba_unmultiplied([64, 64], &crate::tray::logo_rgba_64());
+                ui.ctx().load_texture("logo", image, egui::TextureOptions::LINEAR)
+            });
+            let (r, _) = ui.allocate_exact_size(Vec2::splat(56.0), Sense::hover());
+            let uv = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
+            ui.painter().image(logo.id(), r, uv, Color32::WHITE);
             ui.add_space(10.0);
-            let defaults: Vec<String> =
-                app.settings.config.as_ref().map(|c| c.default_exclusions.clone()).unwrap_or_default();
-            let is_default = |x: &String| defaults.iter().any(|d| d.eq_ignore_ascii_case(x));
-            let auto: Vec<String> = app.settings.exclusions.iter().filter(|x| is_default(x)).cloned().collect();
-            let own: Vec<String> = app.settings.exclusions.iter().filter(|x| !is_default(x)).cloned().collect();
-            let generated = auto.iter().filter(|x| x.starts_with("**\\")).count();
-            let system = auto.len() - generated;
-            ui.horizontal(|ui| {
-                let (r, _) = ui.allocate_exact_size(Vec2::new(18.0, 18.0), Sense::hover());
-                crate::icons::paint(ui.painter(), r, crate::icons::Icon::Lock, p.text3);
+            ui.vertical(|ui| {
                 ui.add_space(4.0);
                 ui.label(
-                    egui::RichText::new(trf!(
-                        "Left out automatically: {system} system folders and {generated} kinds of generated folders (node_modules, .git, caches…)",
-                        "Excluse automat: {system} foldere ale sistemului și {generated} tipuri de foldere generate (node_modules, .git, cache-uri…)"
-                    ))
-                    .size(12.5)
-                    .color(p.text2),
+                    egui::RichText::new(format!("whereti {}", env!("CARGO_PKG_VERSION")))
+                        .size(18.0)
+                        .family(egui::FontFamily::Name("display".into()))
+                        .color(p.text),
                 );
-                let label = if app.settings.show_auto { tr("Hide", "Ascunde") } else { tr("Show the list", "Arată lista") };
-                if link(ui, p, label).clicked() {
-                    app.settings.show_auto = !app.settings.show_auto;
-                }
-            });
-            let mut remove: Option<String> = None;
-            if app.settings.show_auto {
-                ui.add_space(8.0);
-                ui.horizontal_wrapped(|ui| {
-                    ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
-                    for rule in &auto {
-                        if removable_chip(ui, p, &rule_label(rule)).on_hover_text(rule.as_str()).clicked() {
-                            remove = Some(rule.clone());
-                        }
-                    }
-                });
-            }
-            if !own.is_empty() {
-                ui.add_space(10.0);
-                ui.label(egui::RichText::new(tr("Added by you", "Adăugate de tine")).size(12.5).family(semibold()).color(p.text2));
-                ui.add_space(4.0);
-                if let Some(i) = path_list(ui, p, &own, &mut app.file_icons) {
-                    remove = Some(own[i].clone());
-                }
-            }
-            if let Some(r) = remove {
-                app.settings.exclusions.retain(|x| x != &r);
-                app.settings.exclusions_dirty = true;
-            }
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                let edit = egui::TextEdit::singleline(&mut app.settings.new_exclusion)
-                    .hint_text(egui::RichText::new(tr(r"A folder, e.g. D:\Old archive", r"Un folder, de ex. D:\Arhivă veche")).color(p.text3))
-                    .font(FontId::proportional(13.5))
-                    .margin(Vec2::new(10.0, 6.0))
-                    .desired_width(320.0);
-                let resp = ui.add(edit);
-                let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                if (button(ui, p, tr("Add", "Adaugă"), false).clicked() || enter) && !app.settings.new_exclusion.trim().is_empty() {
-                    let path = app.settings.new_exclusion.trim().to_string();
-                    if !app.settings.exclusions.contains(&path) {
-                        app.settings.exclusions.push(path);
-                        app.settings.exclusions_dirty = true;
-                    }
-                    app.settings.new_exclusion.clear();
-                }
-            });
-            ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                let dirty = app.settings.exclusions_dirty;
-                if button(ui, p, tr("Apply", "Aplică"), true).clicked() && dirty {
-                    app.searcher.set_exclusions(app.settings.exclusions.clone());
-                    app.settings.exclusions_dirty = false;
-                }
-                if button(ui, p, tr("Restore defaults", "Restabilește implicitele"), false).clicked() {
-                    if let Some(c) = &app.settings.config {
-                        app.settings.exclusions = c.default_exclusions.clone();
-                        app.settings.exclusions_dirty = true;
-                    }
-                }
-                if dirty {
-                    ui.label(egui::RichText::new(tr("Changes not applied", "Modificări neaplicate")).size(12.5).color(p.warn));
-                }
+                ui.label(
+                    egui::RichText::new(tr("Instant file search for Windows.", "Căutare instantă de fișiere pentru Windows."))
+                        .size(13.0)
+                        .color(p.text2),
+                );
             });
         });
-
-        // ---- About
         ui.add_space(14.0);
-        section(ui, p, tr("About", "Despre"), |ui| {
-            ui.label(
-                egui::RichText::new(format!("whereti {}", env!("CARGO_PKG_VERSION"))).size(14.0).family(semibold()).color(p.text),
-            );
-            ui.label(
-                egui::RichText::new(tr(
-                    "Instant file search for Windows. Open source, MIT license. Nothing leaves your PC.",
-                    "Căutare instantă de fișiere pentru Windows. Open source, licență MIT. Nimic nu părăsește PC-ul tău.",
-                ))
-                    .size(12.5)
-                    .color(p.text2),
-            );
-            ui.add_space(4.0);
-            ui.label(egui::RichText::new(tr("The supporter license is coming soon.", "Licența de susținător vine în curând.")).size(12.5).color(p.text3));
+        line(ui, p);
+        for (title, text) in [
+            (
+                tr("Private", "Privat"),
+                tr("Everything stays on your PC. No account, no tracking, no internet needed.", "Totul rămâne pe PC-ul tău. Fără cont, fără urmărire, fără internet."),
+            ),
+            (tr("Open source", "Open source"), tr("Free, under the MIT license.", "Gratuit, sub licența MIT.")),
+            (
+                tr("Supporter license", "Licență de susținător"),
+                tr("Coming soon, for those who want to support the project.", "În curând, pentru cine vrea să susțină proiectul."),
+            ),
+        ] {
+            info_row(ui, p, title, text);
+        }
+    });
+}
+
+// ---------------------------------------------------------------- pieces
+
+fn nav_item(ui: &mut egui::Ui, p: &Palette, icon: Icon, label: &str, selected: bool) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 38.0), Sense::click());
+    let painter = ui.painter();
+    if selected {
+        painter.rect_filled(rect, 8.0, p.accent_soft);
+        let bar = egui::Rect::from_center_size(egui::pos2(rect.left() + 2.0, rect.center().y), Vec2::new(3.0, 16.0));
+        painter.rect_filled(bar, 1.5, p.accent);
+    } else if resp.hovered() {
+        painter.rect_filled(rect, 8.0, p.hover);
+    }
+    let color = if selected { p.text } else { p.text2 };
+    let ir = egui::Rect::from_center_size(egui::pos2(rect.left() + 22.0, rect.center().y), Vec2::splat(18.0));
+    crate::icons::paint(painter, ir, icon, if selected { p.accent } else { p.text3 });
+    let font = FontId::new(13.5, if selected { semibold() } else { crate::app::medium() });
+    painter.text(egui::pos2(rect.left() + 42.0, rect.center().y), egui::Align2::LEFT_CENTER, label, font, color);
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+fn heading(ui: &mut egui::Ui, p: &Palette, title: &str, sub: &str) {
+    ui.label(egui::RichText::new(title).size(18.0).family(semibold()).color(p.text));
+    if !sub.is_empty() {
+        ui.label(egui::RichText::new(sub).size(12.5).color(p.text2));
+    }
+    ui.add_space(12.0);
+}
+
+/// A white card with a hairline border; rows inside, separated by `line`.
+fn card(ui: &mut egui::Ui, p: &Palette, body: impl FnOnce(&mut egui::Ui)) {
+    Frame::NONE
+        .fill(p.surface)
+        .stroke(Stroke::new(1.0, p.border))
+        .corner_radius(CornerRadius::same(12))
+        .inner_margin(Margin::symmetric(18, 2))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 0.0;
+            body(ui);
         });
-        ui.add_space(20.0);
-    });
 }
 
-/// Content indexing: state, progress with time left, and the folders.
-fn content_block(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
-    ui.label(egui::RichText::new(tr("Search in contents", "Căutare în conținut")).size(14.0).family(semibold()).color(p.text));
-    if let Some(c) = app.status.as_ref().map(|s| s.content.clone()) {
-        let facts = trf!(
-            "{} documents indexed · {} on disk{}",
-            "{} documente indexate · {} pe disc{}",
-            shell::count(c.files),
-            shell::size(c.disk_bytes),
-            if c.failed > 0 { trf!(" · {} could not be read", " · {} nu au putut fi citite", shell::count(c.failed)) } else { String::new() }
-        );
-        let state = match c.state.as_str() {
-            "ready" => tr("up to date", "la zi").to_string(),
-            "indexing" => tr("indexing", "se indexează").to_string(),
-            "paused: battery" => tr("paused: on battery", "în pauză: pe baterie").to_string(),
-            "paused: fullscreen" => tr("paused: a game or presentation is running", "în pauză: rulează un joc sau o prezentare").to_string(),
-            "paused: busy" => tr("paused: the processor is busy", "în pauză: procesorul e ocupat").to_string(),
-            "scanning" => tr("checking the folders", "verifică folderele").to_string(),
-            "starting" => tr("starting", "pornește").to_string(),
-            other => other.to_string(),
-        };
-        ui.label(egui::RichText::new(format!("{facts} · {state}")).size(12.5).color(p.text2));
-        if crate::app::content_active(&c) {
-            ui.add_space(6.0);
-            let all = (c.done + c.queued).max(1);
-            let frac = c.done as f32 / all as f32;
-            let (r, _) = ui.allocate_exact_size(Vec2::new(ui.available_width().min(420.0), 8.0), Sense::hover());
-            ui.painter().rect_filled(r, 4.0, p.border);
-            let mut done = r;
-            done.set_width(r.width() * frac);
-            ui.painter().rect_filled(done, 4.0, p.accent);
-            ui.add_space(4.0);
-            let text = crate::app::content_progress(&c, app.content_eta(&c));
-            ui.label(egui::RichText::new(text).size(12.5).color(p.text2));
-        }
-    }
-    ui.add_space(10.0);
-    ui.label(
-        egui::RichText::new(tr(
-            "Documents (PDF, Word, Excel, PowerPoint, OpenDocument, RTF, e-mails) are searched on every drive, \
-             outside system and program folders — nothing to set up.",
-            "Documentele (PDF, Word, Excel, PowerPoint, OpenDocument, RTF, e-mailuri) sunt căutate pe toate discurile, \
-             fără folderele de sistem și de programe — nu trebuie setat nimic.",
-        ))
-        .size(12.5)
-        .color(p.text2),
-    );
-    ui.add_space(10.0);
-    ui.label(egui::RichText::new(tr("Text and code files", "Fișiere text și cod")).size(13.5).family(semibold()).color(p.text));
-    ui.label(
-        egui::RichText::new(tr(
-            ".txt, .md, .csv, .html files and source code are searched only in these folders (projects hold hundreds of \
-             thousands). Add a folder to search inside its code too.",
-            "Fișierele .txt, .md, .csv, .html și codul sursă sunt căutate doar în aceste foldere (proiectele au sute de mii). \
-             Adaugă un folder dacă vrei să cauți și în codul lui.",
-        ))
-        .size(12.5)
-        .color(p.text2),
-    );
-    ui.add_space(8.0);
-    let folders = app.settings.content_folders.clone();
-    if let Some(i) = path_list(ui, p, &folders, &mut app.file_icons) {
-        app.settings.content_folders.remove(i);
-        app.settings.content_dirty = true;
-    }
-    ui.add_space(4.0);
+/// Title and description on the left, the control on the right.
+fn row(ui: &mut egui::Ui, p: &Palette, title: &str, desc: &str, control: impl FnOnce(&mut egui::Ui)) {
+    ui.add_space(12.0);
     ui.horizontal(|ui| {
-        let edit = egui::TextEdit::singleline(&mut app.settings.new_content_folder)
-            .hint_text(egui::RichText::new(tr(r"D:\Projects", r"D:\Proiecte")).color(p.text3))
-            .font(FontId::proportional(13.5))
-            .margin(Vec2::new(10.0, 6.0))
-            .desired_width(320.0);
-        let resp = ui.add(edit);
-        let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-        if (button(ui, p, tr("Add", "Adaugă"), false).clicked() || enter) && !app.settings.new_content_folder.trim().is_empty() {
-            let path = app.settings.new_content_folder.trim().trim_end_matches('\\').to_string();
-            if !app.settings.content_folders.iter().any(|x| x.eq_ignore_ascii_case(&path)) {
-                app.settings.content_folders.push(path);
-                app.settings.content_dirty = true;
-            }
-            app.settings.new_content_folder.clear();
-        }
+        let text_w = (ui.available_width() - 280.0).max(200.0);
+        ui.vertical(|ui| {
+            ui.set_width(text_w);
+            ui.label(egui::RichText::new(title).size(14.0).family(semibold()).color(p.text));
+            ui.add_space(2.0);
+            ui.add(egui::Label::new(egui::RichText::new(desc).size(12.5).color(p.text2)).wrap());
+        });
+        ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            control(ui);
+        });
     });
-    ui.add_space(10.0);
-    ui.horizontal(|ui| {
-        let dirty = app.settings.content_dirty;
-        if button(ui, p, tr("Apply", "Aplică"), true).clicked() && dirty {
-            app.searcher.set_content_folders(app.settings.content_folders.clone());
-            app.settings.content_dirty = false;
-        }
-        if button(ui, p, tr("Restore defaults", "Restabilește implicitele"), false).clicked() {
-            if let Some(c) = &app.settings.config {
-                app.settings.content_folders = c.default_content_folders.clone();
-                app.settings.content_dirty = true;
-            }
-        }
-        if dirty {
-            ui.label(egui::RichText::new(tr("Changes not applied", "Modificări neaplicate")).size(12.5).color(p.warn));
-        }
-    });
+    ui.add_space(12.0);
 }
 
-/// "**\\node_modules" → "node_modules"; "\\Folder" → "Folder (on every drive)".
-fn rule_label(rule: &str) -> String {
-    if let Some(name) = rule.strip_prefix("**\\") {
-        name.to_string()
-    } else if let Some(rest) = rule.strip_prefix('\\') {
-        trf!("{rest} (on every drive)", "{rest} (pe orice disc)")
-    } else {
-        rule.to_string()
+/// A title and a text using the whole width (nothing to set).
+fn info_row(ui: &mut egui::Ui, p: &Palette, title: &str, text: &str) {
+    ui.add_space(12.0);
+    ui.label(egui::RichText::new(title).size(14.0).family(semibold()).color(p.text));
+    ui.add_space(2.0);
+    ui.add(egui::Label::new(egui::RichText::new(text).size(12.5).color(p.text2)).wrap());
+    ui.add_space(12.0);
+}
+
+fn line(ui: &mut egui::Ui, p: &Palette) {
+    let r = ui.available_rect_before_wrap();
+    ui.painter().hline(r.x_range(), r.top(), Stroke::new(1.0, p.line));
+    ui.add_space(1.0);
+}
+
+/// A segmented control (like the ones in Windows Settings); returns the
+/// option clicked.
+fn segmented(ui: &mut egui::Ui, p: &Palette, options: &[&str], selected: usize) -> Option<usize> {
+    let font = FontId::new(13.0, crate::app::medium());
+    let widths: Vec<f32> =
+        options.iter().map(|o| ui.painter().layout_no_wrap(o.to_string(), font.clone(), p.text).size().x + 26.0).collect();
+    let total: f32 = widths.iter().sum::<f32>() + 6.0;
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(total, 34.0), Sense::hover());
+    ui.painter().rect(rect, 9.0, p.bg, Stroke::new(1.0, p.border), egui::StrokeKind::Inside);
+    let mut x = rect.left() + 3.0;
+    let mut clicked = None;
+    for (i, (label, w)) in options.iter().zip(&widths).enumerate() {
+        let r = egui::Rect::from_min_size(egui::pos2(x, rect.top() + 3.0), Vec2::new(*w, rect.height() - 6.0));
+        let resp = ui.interact(r, ui.scope_id().with(("seg", label)), Sense::click());
+        if i == selected {
+            ui.painter().rect(r, 7.0, p.surface, Stroke::new(1.0, p.border), egui::StrokeKind::Inside);
+        } else if resp.hovered() {
+            ui.painter().rect_filled(r, 7.0, p.hover);
+        }
+        let color = if i == selected { p.text } else { p.text2 };
+        ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, label, font.clone(), color);
+        if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+            clicked = Some(i);
+        }
+        x += w;
     }
+    clicked
 }
 
 /// A compact list of folders: icon, path, × on hover; fine lines between
@@ -496,7 +557,7 @@ fn path_list(ui: &mut egui::Ui, p: &Palette, paths: &[String], icons: &mut crate
                         let uv = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
                         ui.painter().image(t.id(), icon_rect, uv, Color32::WHITE);
                     }
-                    None => crate::icons::paint(ui.painter(), icon_rect, crate::icons::Icon::Folder, p.text3),
+                    None => crate::icons::paint(ui.painter(), icon_rect, Icon::Folder, p.text3),
                 }
                 ui.painter().text(
                     egui::pos2(rect.left() + 40.0, rect.center().y),
@@ -511,9 +572,9 @@ fn path_list(ui: &mut egui::Ui, p: &Palette, paths: &[String], icons: &mut crate
                     if xr.hovered() {
                         ui.painter().rect_filled(x, 6.0, p.border);
                     }
-                    crate::icons::paint(ui.painter(), x.shrink(7.0), crate::icons::Icon::Close, p.text2);
+                    crate::icons::paint(ui.painter(), x.shrink(7.0), Icon::Close, p.text2);
                 }
-                if xr.on_hover_text(tr("Remove", "Scoate")).clicked() {
+                if xr.on_hover_text(tr("Stop skipping it", "Nu-l mai ignora")).clicked() {
                     removed = Some(i);
                 }
             }
@@ -521,70 +582,11 @@ fn path_list(ui: &mut egui::Ui, p: &Palette, paths: &[String], icons: &mut crate
     removed
 }
 
-/// A small chip with a × at the end; the whole chip removes.
-fn removable_chip(ui: &mut egui::Ui, p: &Palette, text: &str) -> egui::Response {
-    let galley = ui.painter().layout_no_wrap(text.to_string(), FontId::proportional(12.5), p.text2);
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(galley.size().x + 36.0, 26.0), Sense::click());
-    let fill = if resp.hovered() { p.hover } else { p.bg };
-    ui.painter().rect(rect, 13.0, fill, Stroke::new(1.0, p.line), egui::StrokeKind::Inside);
-    ui.painter().galley(egui::pos2(rect.left() + 11.0, rect.center().y - galley.size().y / 2.0), galley, p.text2);
-    let x = egui::Rect::from_center_size(egui::pos2(rect.right() - 14.0, rect.center().y), Vec2::splat(10.0));
-    crate::icons::paint(ui.painter(), x, crate::icons::Icon::Close, if resp.hovered() { p.text } else { p.text3 });
-    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
-}
-
-/// Accent text that acts as a button.
-fn link(ui: &mut egui::Ui, p: &Palette, text: &str) -> egui::Response {
-    let resp = ui.add(egui::Label::new(egui::RichText::new(text).size(12.5).color(p.accent)).sense(Sense::click()));
-    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
-}
-
-/// A titled card.
-fn section(ui: &mut egui::Ui, p: &Palette, title: &str, body: impl FnOnce(&mut egui::Ui)) {
-    ui.horizontal(|ui| {
-        ui.add_space(10.0);
-        ui.label(egui::RichText::new(title.to_uppercase()).size(11.0).family(semibold()).color(p.text3));
-    });
-    ui.add_space(6.0);
-    Frame::NONE
-        .fill(p.surface)
-        .stroke(Stroke::new(1.0, p.border))
-        .corner_radius(CornerRadius::same(12))
-        .inner_margin(Margin::same(16))
-        .outer_margin(Margin { left: 8, right: 8, top: 0, bottom: 0 })
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.spacing_mut().item_spacing.y = 2.0;
-            body(ui);
-        });
-}
-
-/// Title and description on the left, the control on the right.
-fn setting_row(ui: &mut egui::Ui, p: &Palette, title: &str, desc: &str, control: impl FnOnce(&mut egui::Ui)) {
-    ui.horizontal(|ui| {
-        ui.vertical(|ui| {
-            ui.label(egui::RichText::new(title).size(14.0).family(semibold()).color(p.text));
-            ui.label(egui::RichText::new(desc).size(12.5).color(p.text2));
-        });
-        ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-            ui.spacing_mut().item_spacing.x = 6.0;
-            control(ui);
-        });
-    });
-}
-
-fn divider(ui: &mut egui::Ui, p: &Palette) {
-    ui.add_space(10.0);
-    let r = ui.available_rect_before_wrap();
-    ui.painter().hline(r.x_range(), r.top(), Stroke::new(1.0, p.border));
-    ui.add_space(11.0);
-}
-
 /// A pill button; `primary` = solid accent.
 fn button(ui: &mut egui::Ui, p: &Palette, text: &str, primary: bool) -> egui::Response {
     let color = if primary { p.on_accent } else { p.text };
     let galley = ui.painter().layout_no_wrap(text.to_string(), FontId::new(13.5, semibold()), color);
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(galley.size().x + 30.0, 32.0), Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(galley.size().x + 30.0, 34.0), Sense::click());
     let fill = match (primary, resp.hovered()) {
         (true, false) => p.accent,
         (true, true) => crate::theme::mix(p.accent, Color32::BLACK, 0.12),

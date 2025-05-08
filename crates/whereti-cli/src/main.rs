@@ -1,4 +1,4 @@
-//! `wt` — whereti command line.
+//! `wt` - whereti command line.
 //!
 //! Phase 0: `wt scan C:` reads a volume with both methods (direct MFT and
 //! FSCTL_ENUM_USN_DATA), times them, measures memory and checks they agree.
@@ -20,7 +20,7 @@ use whereti_ntfs::parse::ROOT_RECORD;
 use whereti_ntfs::{usn_enum, Volume};
 
 #[derive(Parser)]
-#[command(name = "wt", version, about = "whereti — instant file search for Windows")]
+#[command(name = "wt", version, about = "whereti: instant file search for Windows")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -226,7 +226,7 @@ fn scan(args: ScanArgs) -> Result<ExitCode, String> {
             Ok(entries) => {
                 let elapsed = t.elapsed();
                 println!("[ENUM_USN_DATA]  {} in {}", per_sec(entries.len(), elapsed), dur(elapsed));
-                println!("  note     names, parents and attributes only — no sizes or dates");
+                println!("  note     names, parents and attributes only - no sizes or dates");
                 println!();
                 usn = Some(entries);
             }
@@ -273,9 +273,9 @@ fn parse_letter(v: &str) -> Result<char, String> {
 
 fn open_error(letter: char, e: std::io::Error) -> String {
     if e.raw_os_error() == Some(5) {
-        format!("access denied to {letter}: — run wt from an Administrator terminal")
+        format!("access denied to {letter}: - run wt from an Administrator terminal")
     } else {
-        format!("cannot open {letter}: — {e}")
+        format!("cannot open {letter}: - {e}")
     }
 }
 

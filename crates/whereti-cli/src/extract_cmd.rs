@@ -1,4 +1,4 @@
-//! `wt extract FILE...` — text extraction through the sandboxed worker.
+//! `wt extract FILE...` - text extraction through the sandboxed worker.
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -29,7 +29,7 @@ pub struct ExtractArgs {
 
 pub fn run(args: ExtractArgs) -> Result<(), String> {
     let mut sandbox = Sandbox::beside_current_exe()
-        .ok_or("whereti-extract.exe is missing next to wt.exe — build it with `cargo build -p whereti-extract`")?;
+        .ok_or("whereti-extract.exe is missing next to wt.exe - build it with `cargo build -p whereti-extract`")?;
     sandbox.timeout = std::time::Duration::from_millis(args.timeout_ms);
     sandbox.memory_limit = args.memory_mb << 20;
     let (mut ok, mut failed) = (0, 0);

@@ -1,6 +1,6 @@
 //! E-mail as text: `.eml` (MIME, via `mail-parser`) and Outlook `.msg`
-//! (see `ole::msg`). The text starts with the headers people search for —
-//! subject, sender, recipients, date — then the body (plain text, or the
+//! (see `ole::msg`). The text starts with the headers people search for -
+//! subject, sender, recipients, date - then the body (plain text, or the
 //! HTML part turned into text) and the attachment names.
 
 use mail_parser::{MessageParser, MimeHeaders};

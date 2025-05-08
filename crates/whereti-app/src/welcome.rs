@@ -43,8 +43,8 @@ pub fn show(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
                 ui.add_space(4.0);
                 ui.label(
                     egui::RichText::new(tr(
-                        "Instant search for every file on your PC — by its name, and by what is written inside.",
-                        "Căutare instantă pentru orice fișier de pe PC — după nume și după ce scrie în el.",
+                        "Instant search for every file on your PC, by its name and by what is written inside.",
+                        "Căutare instantă pentru orice fișier de pe PC, după nume și după ce scrie în el.",
                     ))
                     .size(14.0)
                     .color(p.text2),
@@ -83,8 +83,8 @@ pub fn show(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
                 let content_detail = match (&content, names_ready) {
                     (_, false) => tr("Starts as soon as the names are read.", "Începe imediat ce sunt citite numele.").to_string(),
                     (Some(c), true) if c.state == "ready" => trf!(
-                        "{} documents — PDF, Word, Excel, PowerPoint, e-mails",
-                        "{} documente — PDF, Word, Excel, PowerPoint, e-mailuri",
+                        "{} documents: PDF, Word, Excel, PowerPoint, e-mails",
+                        "{} documente: PDF, Word, Excel, PowerPoint, e-mailuri",
                         shell::count(c.files)
                     ),
                     (Some(c), true) if content_active(c) => content_progress(c, app.content_eta(c)),

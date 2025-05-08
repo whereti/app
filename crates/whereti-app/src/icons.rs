@@ -1,4 +1,4 @@
-//! Interface icons, drawn as fine lines (1.5 px, round ends) at any size —
+//! Interface icons, drawn as fine lines (1.5 px, round ends) at any size -
 //! no image files to ship, sharp at every DPI. Drawn on a 24-unit grid like
 //! common line icon sets, then scaled into the target rect.
 

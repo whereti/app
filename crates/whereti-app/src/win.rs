@@ -150,3 +150,22 @@ pub fn context_menu(hwnd: HWND, path: &str) -> Result<(), String> {
         shown
     }
 }
+
+/// The Windows folder picker; the chosen folder's path, or `None`.
+pub fn pick_folder(owner: HWND) -> Option<String> {
+    use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_INPROC_SERVER};
+    use windows::Win32::UI::Shell::{FileOpenDialog, IFileOpenDialog, FOS_FORCEFILESYSTEM, FOS_PICKFOLDERS, SIGDN_FILESYSPATH};
+    // SAFETY: standard COM dialog calls on objects we own; the path string
+    // is freed with CoTaskMemFree.
+    unsafe {
+        let dialog: IFileOpenDialog = CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER).ok()?;
+        let options = dialog.GetOptions().ok()?;
+        dialog.SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM).ok()?;
+        dialog.Show(Some(owner)).ok()?; // cancelled: an error, so None
+        let item = dialog.GetResult().ok()?;
+        let name = item.GetDisplayName(SIGDN_FILESYSPATH).ok()?;
+        let path = name.to_string().ok();
+        CoTaskMemFree(Some(name.0 as *const _));
+        path
+    }
+}

@@ -194,7 +194,7 @@ impl NameIndex {
             Term::Regex(r) => match regex::RegexBuilder::new(r).case_insensitive(true).build() {
                 Ok(re) => Matcher::Regex(re),
                 Err(_) => {
-                    warnings.push(format!("invalid regex \"{r}\" — searched as plain text"));
+                    warnings.push(format!("invalid regex \"{r}\" - searched as plain text"));
                     Matcher::Text(Box::new(Finder::new(fold(r).as_bytes()).into_owned()))
                 }
             },
@@ -371,7 +371,7 @@ impl NameIndex {
                 // The order is (score, alphabetical rank). Put every hit in a
                 // bucket by score and by the top bits of its rank, count the
                 // buckets, and fully order only the hits in the buckets that
-                // can reach the top `limit` — thousands, not millions.
+                // can reach the top `limit` - thousands, not millions.
                 let needle = needle.map(str::as_bytes);
                 let relevance = opts.sort == SortBy::Relevance;
                 let shift = (32 - (self.len().max(1) as u32).leading_zeros()).saturating_sub(8);

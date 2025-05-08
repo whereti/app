@@ -389,7 +389,7 @@ impl Worker {
                 idx
             }
             Err(e) => {
-                self.log(format!("no usable index ({e}) — building one"));
+                self.log(format!("no usable index ({e}) - building one"));
                 self.shared.set_state("indexing");
                 let idx = self.build_fresh()?;
                 self.dirty = true;

@@ -1,5 +1,5 @@
 //! "Recente": the files the user actually opened, like Explorer's "Recent
-//! files" and the Start menu — not every file some program wrote.
+//! files" and the Start menu - not every file some program wrote.
 //!
 //! Windows keeps a shortcut in `%APPDATA%\Microsoft\Windows\Recent` for each
 //! file opened from Explorer, Office, the file dialogs and most apps; its

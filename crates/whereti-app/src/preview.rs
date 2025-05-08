@@ -151,7 +151,11 @@ impl Preview {
         if let Some(l) = self.loaded() {
             if let Content::Text { text, truncated, .. } = &l.content {
                 let words = text.split_whitespace().count();
-                facts.push(trf!("{} words{}", "{} cuvinte{}", shell::count(words as u64), if *truncated { "+" } else { "" }));
+                let plus = if *truncated { "+" } else { "" };
+                facts.push(match words {
+                    1 => trf!("1 word{plus}", "1 cuvânt{plus}"),
+                    n => trf!("{} words{plus}", "{} cuvinte{plus}", shell::count(n as u64)),
+                });
             }
         }
         ui.label(egui::RichText::new(facts.join("  ·  ")).size(12.0).color(p.text3));
@@ -212,8 +216,8 @@ impl Preview {
                             ui.add_space(4.0);
                             ui.label(
                                 egui::RichText::new(trf!(
-                                    "and {} more — Enter opens it in Explorer",
-                                    "și încă {} — Enter îl deschide în Explorer",
+                                    "and {} more. Enter opens it in Explorer.",
+                                    "și încă {}. Enter îl deschide în Explorer.",
                                     shell::count((folders + files - shown) as u64)
                                 ))
                                     .size(12.0)

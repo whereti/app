@@ -4,7 +4,7 @@
 //! record number (`key`), not by its path: renaming or moving a file inside
 //! the indexed folders costs nothing, the name index gives the current path.
 //!
-//! The text itself is **not stored** — only the word positions — so the index
+//! The text itself is **not stored** - only the word positions - so the index
 //! stays small; previews re-extract the file. Next to each document we keep
 //! the file's size and last-write time as indexed, to know when it changed,
 //! and how the extraction went (`Status`), so failures are not retried until

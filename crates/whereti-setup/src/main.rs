@@ -1,4 +1,4 @@
-//! whereti-setup.exe — installs, updates and removes whereti.
+//! whereti-setup.exe - installs, updates and removes whereti.
 //!
 //!   whereti-setup.exe              the installer window
 //!   whereti-setup.exe /S           silent install (winget, scripts)
@@ -9,7 +9,7 @@
 //! installs the service and registers whereti in Settings → Apps runs
 //! elevated, after one UAC prompt (`--do-install` / `--do-uninstall`).
 //! Afterwards the normal part sets "start with Windows" for this user and
-//! opens whereti — as the user, not as administrator.
+//! opens whereti - as the user, not as administrator.
 
 #![windows_subsystem = "windows"]
 
@@ -334,8 +334,8 @@ impl eframe::App for Setup {
                     }
                     ui.add_space(4.0);
                     body(ui, self.t(
-                        "Instant search for every file on your PC — by its name, and by what is written inside PDF, Word, Excel and other documents.",
-                        "Căutare instantă pentru orice fișier de pe PC — după nume și după ce scrie în PDF-uri, Word, Excel și alte documente.",
+                        "Instant search for every file on your PC, by its name and by what is written inside PDF, Word, Excel and other documents.",
+                        "Căutare instantă pentru orice fișier de pe PC, după nume și după ce scrie în PDF-uri, Word, Excel și alte documente.",
                     ));
                     ui.add_space(16.0);
                     Frame::NONE
@@ -417,8 +417,8 @@ impl eframe::App for Setup {
                     title(ui, self.t("whereti is installed", "whereti e instalat"));
                     ui.add_space(4.0);
                     body(ui, self.t(
-                        "It is building its index now — that takes about a minute, and whereti shows the progress. You can search right away.",
-                        "Își construiește acum indexul — durează cam un minut, iar whereti arată progresul. Poți căuta imediat.",
+                        "It is building its index now. That takes about a minute, and whereti shows the progress. You can search right away.",
+                        "Își construiește acum indexul. Durează cam un minut, iar whereti arată progresul. Poți căuta imediat.",
                     ));
                     ui.add_space(22.0);
                     ui.horizontal(|ui| {

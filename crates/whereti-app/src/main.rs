@@ -1,4 +1,4 @@
-//! whereti.exe — the search window and tray icon (PLAN.md §10).
+//! whereti.exe - the search window and tray icon (PLAN.md §10).
 //!
 //! The app holds no index: it asks the whereti service over the named pipe.
 //! It starts hidden in the tray with `--hidden` (autostart).
@@ -70,7 +70,7 @@ fn main() -> eframe::Result<()> {
     )
 }
 
-/// Segoe UI Variable — the font of the Windows 11 apps — in several weights
+/// Segoe UI Variable - the font of the Windows 11 apps - in several weights
 /// from the one variable font file, with egui's fonts as fallback (emoji,
 /// symbols). On Windows 10 (no variable font): classic Segoe UI files.
 fn setup_fonts(ctx: &egui::Context) {

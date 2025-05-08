@@ -8,7 +8,7 @@ fn main() {
         let mut res = winresource::WindowsResource::new();
         res.set_icon(ico)
             .set("ProductName", "whereti")
-            .set("FileDescription", "whereti — instant file search")
+            .set("FileDescription", "whereti, instant file search")
             .set("LegalCopyright", "MIT license");
         res.compile().expect("embedding the icon (needs rc.exe from the Windows SDK)");
     }

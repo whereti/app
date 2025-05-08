@@ -1,4 +1,4 @@
-//! `wt inspect <path>` — what Windows, the MFT and the index say about one file.
+//! `wt inspect <path>` - what Windows, the MFT and the index say about one file.
 //! A diagnostic for index differences (Administrator).
 
 use std::os::windows::fs::OpenOptionsExt;

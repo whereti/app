@@ -1,4 +1,4 @@
-//! `wt index` — scan volumes, build the compact name index, save it.
+//! `wt index` - scan volumes, build the compact name index, save it.
 
 use std::path::PathBuf;
 use std::time::Instant;

@@ -36,9 +36,9 @@ pub struct VerifyArgs {
 fn load(path: &std::path::Path) -> Result<NameIndex, String> {
     snapshot::load(path).map_err(|e| {
         if e.kind() == io::ErrorKind::NotFound {
-            format!("no index at {} — run `wt index` first", path.display())
+            format!("no index at {} - run `wt index` first", path.display())
         } else {
-            format!("cannot load {}: {e} — run `wt index` again", path.display())
+            format!("cannot load {}: {e} - run `wt index` again", path.display())
         }
     })
 }

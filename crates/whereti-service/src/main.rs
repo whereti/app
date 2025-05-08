@@ -1,4 +1,4 @@
-//! whereti-service.exe — the Windows service that keeps the index current
+//! whereti-service.exe - the Windows service that keeps the index current
 //! and answers searches over a named pipe (PLAN.md §3, §8).
 //!
 //!   whereti-service install     register (automatic start, restart on failure)

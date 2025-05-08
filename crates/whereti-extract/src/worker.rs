@@ -165,7 +165,7 @@ impl Sandbox {
             code => Err(SandboxError::Failed(format!(
                 "the extractor stopped (code {}){}",
                 code.map_or("?".into(), |c| format!("{c:#x}")),
-                if out.is_empty() && err.contains("memory") { " — out of memory" } else { "" }
+                if out.is_empty() && err.contains("memory") { " - out of memory" } else { "" }
             ))),
         }
     }

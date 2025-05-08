@@ -1,8 +1,8 @@
 //! Keeping an index in sync with the volumes (PLAN.md §4.4, §7.2).
 //!
 //! Applying a journal batch has two phases, so a shared index is locked only
-//! briefly: (1) read the journal and the current MFT records — slow, no lock;
-//! (2) apply the prefetched states to the index — fast, under the write lock.
+//! briefly: (1) read the journal and the current MFT records - slow, no lock;
+//! (2) apply the prefetched states to the index - fast, under the write lock.
 //!
 //! Two journal facts shape this code:
 //! - Creating or deleting a file changes its folder's date, but the journal
@@ -179,9 +179,9 @@ pub fn open_volumes(index: &NameIndex) -> Result<Vec<Volume>, String> {
 
 pub fn open_error(letter: char, e: io::Error) -> String {
     if e.raw_os_error() == Some(5) {
-        format!("access denied to {letter}: — run from an Administrator terminal")
+        format!("access denied to {letter}: - run from an Administrator terminal")
     } else {
-        format!("cannot open {letter}: — {e}")
+        format!("cannot open {letter}: - {e}")
     }
 }
 

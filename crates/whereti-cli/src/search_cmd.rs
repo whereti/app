@@ -139,17 +139,17 @@ fn run_local(args: &SearchArgs) -> Result<(), String> {
     let t = Instant::now();
     let index = snapshot::load(&path).map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound => {
-            format!("no index at {} — run `wt index` from an Administrator terminal first", path.display())
+            format!("no index at {} - run `wt index` from an Administrator terminal first", path.display())
         }
         std::io::ErrorKind::PermissionDenied if args.index.is_some() => {
             format!("{} is readable only by administrators", path.display())
         }
         std::io::ErrorKind::PermissionDenied => format!(
-            "the whereti service is not running, and {} is readable only by administrators — \
+            "the whereti service is not running, and {} is readable only by administrators - \
              start the service (`whereti-service start`) or run `wt serve` as Administrator",
             path.display()
         ),
-        _ => format!("cannot load {}: {e} — run `wt index` again", path.display()),
+        _ => format!("cannot load {}: {e} - run `wt index` again", path.display()),
     })?;
     let load_time = t.elapsed();
 
@@ -231,7 +231,7 @@ pub struct StatusArgs {
     log: bool,
 }
 
-/// `wt status` — what the service is doing.
+/// `wt status` - what the service is doing.
 pub fn status(args: StatusArgs) -> Result<(), String> {
     let mut client = Client::connect(Duration::from_millis(500)).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
@@ -303,7 +303,7 @@ pub struct ExclusionsArgs {
     path: Option<String>,
 }
 
-/// `wt exclusions [list|add|remove] [PATH]` — what the index leaves out.
+/// `wt exclusions [list|add|remove] [PATH]` - what the index leaves out.
 pub fn exclusions(args: ExclusionsArgs) -> Result<(), String> {
     let mut client = Client::connect(Duration::from_millis(500)).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
@@ -341,7 +341,7 @@ pub fn exclusions(args: ExclusionsArgs) -> Result<(), String> {
     }
     match client.call(&Request::SetExclusions { paths }).map_err(|e| e.to_string())? {
         Response::Ok => {
-            println!("saved — the service is rebuilding the index (a few seconds); `wt status` shows progress");
+            println!("saved - the service is rebuilding the index (a few seconds); `wt status` shows progress");
             Ok(())
         }
         Response::Error(e) => Err(e),
@@ -358,7 +358,7 @@ pub struct ContentArgs {
     path: Option<String>,
 }
 
-/// `wt content [list|add|remove|reset] [FOLDER]` — folders indexed by content.
+/// `wt content [list|add|remove|reset] [FOLDER]` - folders indexed by content.
 pub fn content(args: ContentArgs) -> Result<(), String> {
     let mut client = Client::connect(Duration::from_millis(500)).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
@@ -397,7 +397,7 @@ pub fn content(args: ContentArgs) -> Result<(), String> {
     }
     match client.call(&Request::SetContentFolders { paths }).map_err(|e| e.to_string())? {
         Response::Ok => {
-            println!("saved — the service indexes the difference in the background; `wt status` shows progress");
+            println!("saved - the service indexes the difference in the background; `wt status` shows progress");
             Ok(())
         }
         Response::Error(e) => Err(e),

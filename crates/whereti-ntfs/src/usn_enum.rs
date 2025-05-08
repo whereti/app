@@ -1,4 +1,4 @@
-//! Enumeration through `FSCTL_ENUM_USN_DATA` — the documented API that
+//! Enumeration through `FSCTL_ENUM_USN_DATA` - the documented API that
 //! Everything uses. It returns name, parent and attributes, but no size or dates.
 
 use std::io;
