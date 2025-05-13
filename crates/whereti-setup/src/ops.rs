@@ -183,7 +183,7 @@ fn register_uninstall(dir: &Path) -> Result<(), String> {
     let strings = [
         ("DisplayName", "whereti".to_string()),
         ("DisplayVersion", VERSION.to_string()),
-        ("Publisher", "whereti".to_string()),
+        ("Publisher", "Software Hive S.R.L.".to_string()),
         ("InstallLocation", dir.display().to_string()),
         ("DisplayIcon", format!("\"{}\",0", dir.join("whereti.exe").display())),
         ("UninstallString", uninstall.clone()),

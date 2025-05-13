@@ -9,7 +9,8 @@ fn main() {
         res.set_icon(ico)
             .set("ProductName", "whereti")
             .set("FileDescription", "whereti, instant file search")
-            .set("LegalCopyright", "MIT license");
+            .set("CompanyName", "Software Hive S.R.L.")
+            .set("LegalCopyright", "Copyright (C) 2026 Software Hive S.R.L. MIT license.");
         res.compile().expect("embedding the icon (needs rc.exe from the Windows SDK)");
     }
 }

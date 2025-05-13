@@ -424,6 +424,8 @@ fn about(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
             info_row(ui, p, title, text);
         }
     });
+    ui.add_space(10.0);
+    ui.label(egui::RichText::new("© 2026 Software Hive S.R.L.").size(12.0).color(p.text3));
 }
 
 // ---------------------------------------------------------------- pieces
