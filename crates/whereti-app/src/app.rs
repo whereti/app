@@ -181,7 +181,7 @@ impl WheretiApp {
                 app.settings.autostart = true;
             }
         }
-        match app.tray.as_ref().map(|t| t.hotkey) {
+        match app.tray.as_ref().map(|t| t.hotkey.clone()) {
             // Said once: the shortcut actually used is then remembered.
             Some(Some(k)) if k != PREFERRED_HOTKEY && app.settings.hotkey.is_none() => {
                 app.flash(trf!(
@@ -202,8 +202,8 @@ impl WheretiApp {
         self.eta.left(c)
     }
 
-    pub(crate) fn hotkey_label(&self) -> Option<&'static str> {
-        self.tray.as_ref().and_then(|t| t.hotkey)
+    pub(crate) fn hotkey_label(&self) -> Option<String> {
+        self.tray.as_ref().and_then(|t| t.hotkey.clone())
     }
 
     /// What is sent: the typed text plus the filter, or "recent files" when
@@ -319,6 +319,13 @@ impl WheretiApp {
     }
 
     fn handle_keys(&mut self, ctx: &egui::Context) {
+        // Settings is listening for a new shortcut: every key goes there.
+        if self.settings.recording {
+            if self.page == Page::Settings && self.settings.section == crate::settings::Section::General {
+                return;
+            }
+            crate::settings::stop_recording(self);
+        }
         let page = ((self.view_height / ROW_HEIGHT) as usize).max(1);
         let search_page = self.page == Page::Search;
         let (down, up, pg_down, pg_up, ctrl_enter, enter, copy, esc, settings, menu, tab) = ctx.input_mut(|i| {
@@ -485,7 +492,7 @@ impl WheretiApp {
                             self.focus_search = true;
                         }
                     } else if let Some(k) = self.hotkey_label() {
-                        key_hint(ui, p, k);
+                        key_hint(ui, p, &k);
                     }
                 });
             });
@@ -1106,7 +1113,7 @@ pub(crate) fn chip(ui: &mut egui::Ui, p: &Palette, text: &str, selected: bool) -
 }
 
 /// "Ctrl+Shift+Space" drawn as small key caps with a hairline.
-fn key_hint(ui: &mut egui::Ui, p: &Palette, keys: &str) {
+pub(crate) fn key_hint(ui: &mut egui::Ui, p: &Palette, keys: &str) {
     for part in keys.split('+').rev() {
         let galley = ui.painter().layout_no_wrap(part.to_string(), FontId::new(11.0, medium()), p.text3);
         let size = Vec2::new(galley.size().x + 12.0, 21.0);

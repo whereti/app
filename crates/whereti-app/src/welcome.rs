@@ -92,7 +92,7 @@ pub fn show(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
                     _ => tr("looking for documents…", "se caută documentele…").to_string(),
                 };
                 let ready_step = if content_ready { Step::Done } else if names_ready { Step::Working(None) } else { Step::Waiting };
-                let hotkey = app.hotkey_label().unwrap_or("Ctrl+Shift+Space");
+                let hotkey = app.hotkey_label().unwrap_or_else(|| crate::tray::PREFERRED_HOTKEY.to_string());
                 let ready_detail = if names_ready {
                     trf!(
                         "Press {hotkey} in any app to open whereti. You can search already.",

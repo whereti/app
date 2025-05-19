@@ -40,6 +40,8 @@ pub struct SettingsState {
     exclusions: Vec<String>,
     /// The part of Settings shown.
     pub section: Section,
+    /// Waiting for the keys of a new shortcut.
+    pub recording: bool,
     logo: Option<egui::TextureHandle>,
 }
 
@@ -60,13 +62,14 @@ impl SettingsState {
             config: None,
             exclusions: Vec::new(),
             section: Section::General,
+            recording: false,
             logo: None,
         };
         if let Ok(text) = std::fs::read_to_string(settings_file()) {
             // Tolerate a UTF-8 BOM and stray spaces: the file may be edited by hand.
             for line in text.trim_start_matches('\u{feff}').lines() {
                 match line.trim().split_once('=').map(|(k, v)| (k.trim(), v.trim())) {
-                    Some(("hotkey", v)) if HOTKEYS.iter().any(|h| h.0 == v) => s.hotkey = Some(v.to_string()),
+                    Some(("hotkey", v)) if crate::tray::parse(v).is_some() => s.hotkey = Some(v.to_string()),
                     Some(("theme", "light")) => s.theme = ThemeChoice::Light,
                     Some(("theme", "dark")) => s.theme = ThemeChoice::Dark,
                     Some(("preview", "off")) => s.preview = false,
@@ -209,34 +212,7 @@ fn general(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette, ctx: &egui::Con
     });
     ui.add_space(14.0);
     card(ui, p, |ui| {
-        row(ui, p, tr("Shortcut", "Tastă rapidă"), tr("Opens whereti from any app.", "Deschide whereti din orice aplicație."), |ui| {
-            let current = app.hotkey_label().unwrap_or("-");
-            let mut chosen = None;
-            egui::ComboBox::from_id_salt("hotkey")
-                .selected_text(egui::RichText::new(current).size(13.0).color(p.text))
-                .width(190.0)
-                .show_ui(ui, |ui| {
-                    for (label, _, _) in HOTKEYS {
-                        if ui.selectable_label(current == label, label).clicked() && current != label {
-                            chosen = Some(label);
-                        }
-                    }
-                });
-            if let Some(label) = chosen {
-                let result = match app.tray.as_mut() {
-                    Some(t) => t.set_hotkey(label),
-                    None => Err(tr("the tray icon is not available", "iconița din tray nu e disponibilă").into()),
-                };
-                match result {
-                    Ok(k) => {
-                        app.settings.hotkey = Some(k.to_string());
-                        app.settings.save();
-                        app.flash(trf!("The shortcut is now {k}", "Tasta rapidă este acum {k}"));
-                    }
-                    Err(e) => app.flash(e),
-                }
-            }
-        });
+        shortcut(app, ui, p);
         line(ui, p);
         row(
             ui,
@@ -426,6 +402,114 @@ fn about(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
     });
     ui.add_space(10.0);
     ui.label(egui::RichText::new("© 2026 Software Hive S.R.L.").size(12.0).color(p.text3));
+}
+
+/// The shortcut row: the keys in use, "Change" to type new ones, and the
+/// usual choices as suggestions.
+fn shortcut(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
+    let current = app.hotkey_label();
+    let mut chosen: Option<String> = None;
+    if app.settings.recording {
+        // Keys pressed now are the new shortcut; Esc gives up.
+        let mut cancel = false;
+        ui.input_mut(|i| {
+            i.events.retain(|e| match e {
+                egui::Event::Key { key, pressed: true, modifiers, .. } => {
+                    if *key == egui::Key::Escape && modifiers.is_none() {
+                        cancel = true;
+                    } else if let Some(label) = crate::tray::label_for(*key, *modifiers) {
+                        chosen = Some(label);
+                    }
+                    false
+                }
+                egui::Event::Key { .. } | egui::Event::Text(_) => false,
+                _ => true,
+            })
+        });
+        if cancel {
+            stop_recording(app);
+        }
+    }
+    let recording = app.settings.recording;
+    let desc = if recording {
+        tr("Press the keys together, with Ctrl or Alt. Esc to cancel.", "Apasă tastele împreună, cu Ctrl sau Alt. Esc ca să renunți.")
+    } else {
+        tr("Opens whereti from any app.", "Deschide whereti din orice aplicație.")
+    };
+    row(ui, p, tr("Shortcut", "Tastă rapidă"), desc, |ui| {
+        if recording {
+            if button(ui, p, tr("Cancel", "Renunță"), false).clicked() {
+                stop_recording(app);
+            }
+            ui.add_space(8.0);
+            let text = egui::RichText::new(tr("Press keys…", "Apasă tastele…")).size(13.0).family(semibold()).color(p.accent);
+            Frame::new()
+                .fill(p.accent_soft)
+                .stroke(Stroke::new(1.0, p.accent))
+                .corner_radius(8.0)
+                .inner_margin(Margin::symmetric(12, 7))
+                .show(ui, |ui| ui.label(text));
+        } else {
+            if button(ui, p, tr("Change", "Schimbă"), false).clicked() {
+                app.settings.recording = true;
+                if let Some(t) = &app.tray {
+                    t.pause_hotkey(true);
+                }
+            }
+            ui.add_space(10.0);
+            match &current {
+                Some(k) => crate::app::key_hint(ui, p, k),
+                None => {
+                    ui.label(egui::RichText::new(tr("none", "niciuna")).size(13.0).color(p.text3));
+                }
+            }
+        }
+    });
+    // the usual choices, one click each
+    let others: Vec<&str> = HOTKEYS.iter().copied().filter(|h| current.as_deref() != Some(*h)).collect();
+    if !recording && !others.is_empty() {
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
+            ui.label(egui::RichText::new(tr("Suggestions:", "Sugestii:")).size(12.5).color(p.text2));
+            for h in others {
+                let chip = egui::Button::new(egui::RichText::new(h).size(12.5).color(p.text))
+                    .fill(p.bg)
+                    .stroke(Stroke::new(1.0, p.border))
+                    .corner_radius(12.0);
+                if ui.add(chip).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                    chosen = Some(h.to_string());
+                }
+            }
+        });
+        ui.add_space(12.0);
+    }
+    if let Some(label) = chosen {
+        if app.settings.recording {
+            stop_recording(app);
+        }
+        if current.as_deref() == Some(label.as_str()) {
+            return;
+        }
+        let result = match app.tray.as_mut() {
+            Some(t) => t.set_hotkey(&label),
+            None => Err(tr("the tray icon is not available", "iconița din tray nu e disponibilă").into()),
+        };
+        match result {
+            Ok(()) => {
+                app.settings.hotkey = Some(label.clone());
+                app.settings.save();
+                app.flash(trf!("The shortcut is now {label}", "Tasta rapidă este acum {label}"));
+            }
+            Err(e) => app.flash(e),
+        }
+    }
+}
+
+pub(crate) fn stop_recording(app: &mut WheretiApp) {
+    app.settings.recording = false;
+    if let Some(t) = &app.tray {
+        t.pause_hotkey(false);
+    }
 }
 
 // ---------------------------------------------------------------- pieces
