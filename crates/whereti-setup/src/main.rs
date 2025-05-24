@@ -17,12 +17,16 @@ mod ops;
 
 use std::sync::{Arc, Mutex};
 
+use whereti_i18n::{tr, trf};
+
 use eframe::egui::{
     self, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Frame, Margin, Pos2, Sense,
     Stroke, Vec2,
 };
 
 fn main() {
+    // the installer speaks the Windows display language
+    whereti_i18n::set(whereti_i18n::Lang::system());
     let args: Vec<String> = std::env::args().skip(1).collect();
     let has = |a: &str| args.iter().any(|x| x.eq_ignore_ascii_case(a));
     let report = args.iter().position(|a| a == "--report").and_then(|i| args.get(i + 1)).cloned();
@@ -59,7 +63,7 @@ fn main() {
         Box::new(move |cc| {
             setup_fonts(&cc.egui_ctx);
             let state = if uninstalling { State::ConfirmUninstall } else { State::Ready { update: ops::installed_version() } };
-            Ok(Box::new(Setup { state: Arc::new(Mutex::new(state)), autostart: true, ro: system_is_romanian() }))
+            Ok(Box::new(Setup { state: Arc::new(Mutex::new(state)), autostart: true }))
         }),
     );
     // No window could be opened (graphics driver…): say why somewhere findable.
@@ -105,33 +109,9 @@ enum State {
 struct Setup {
     state: Arc<Mutex<State>>,
     autostart: bool,
-    ro: bool,
-}
-
-/// Windows set to Romanian: the installer speaks Romanian (the app is
-/// English by default and has its own choice in Settings).
-fn system_is_romanian() -> bool {
-    windows_ui_language() & 0x3FF == 0x18
-}
-
-fn windows_ui_language() -> u16 {
-    #[link(name = "kernel32")]
-    extern "system" {
-        fn GetUserDefaultUILanguage() -> u16;
-    }
-    // SAFETY: no arguments, returns a LANGID.
-    unsafe { GetUserDefaultUILanguage() }
 }
 
 impl Setup {
-    fn t<'a>(&self, en: &'a str, ro: &'a str) -> &'a str {
-        if self.ro {
-            ro
-        } else {
-            en
-        }
-    }
-
     fn start(&self, ctx: &egui::Context, uninstall: bool) {
         let state = self.state.clone();
         let ctx = ctx.clone();
@@ -323,20 +303,17 @@ impl eframe::App for Setup {
                     match (&update, installed) {
                         (Some(_), Some(std::cmp::Ordering::Equal)) => title(
                             ui,
-                            &format!("whereti {} {}", ops::VERSION, self.t("is already installed", "e deja instalat")),
+                            &trf!("whereti {version} is already installed", version = ops::VERSION),
                         ),
                         (Some(v), Some(std::cmp::Ordering::Greater)) => title(
                             ui,
-                            &format!("{} ({v})", self.t("A newer whereti is installed", "E instalată o versiune mai nouă")),
+                            &trf!("A newer whereti is installed ({version})", version = v),
                         ),
-                        (Some(v), _) => title(ui, &format!("{} {v} → {}", self.t("Update whereti", "Actualizează whereti"), ops::VERSION)),
-                        (None, _) => title(ui, self.t("Install whereti", "Instalează whereti")),
+                        (Some(v), _) => title(ui, &trf!("Update whereti {old} → {new}", old = v, new = ops::VERSION)),
+                        (None, _) => title(ui, tr("Install whereti")),
                     }
                     ui.add_space(4.0);
-                    body(ui, self.t(
-                        "Instant search for every file on your PC, by its name and by what is written inside PDF, Word, Excel and other documents.",
-                        "Căutare instantă pentru orice fișier de pe PC, după nume și după ce scrie în PDF-uri, Word, Excel și alte documente.",
-                    ));
+                    body(ui, tr("Instant search for every file on your PC, by its name and by what is written inside PDF, Word, Excel and other documents."));
                     ui.add_space(16.0);
                     Frame::NONE
                         .fill(l.surface)
@@ -346,9 +323,9 @@ impl eframe::App for Setup {
                         .show(ui, |ui| {
                             ui.set_width(ui.available_width());
                             for line in [
-                                self.t("Free and open source (MIT). Nothing leaves your PC.", "Gratuit și open source (MIT). Nimic nu părăsește PC-ul."),
-                                self.t("Builds its index in the background, without slowing the PC.", "Își face indexul în fundal, fără să încetinească PC-ul."),
-                                self.t("Open it anywhere with Ctrl+Shift+Space.", "Se deschide de oriunde cu Ctrl+Shift+Space."),
+                                tr("Free and open source (MIT). Nothing leaves your PC."),
+                                tr("Builds its index in the background, without slowing the PC."),
+                                &trf!("Open it anywhere with {hotkey}.", hotkey = "Ctrl+Alt+Space"),
                             ] {
                                 ui.horizontal(|ui| {
                                     let (r, _) = ui.allocate_exact_size(Vec2::new(16.0, 18.0), Sense::hover());
@@ -359,28 +336,28 @@ impl eframe::App for Setup {
                             }
                         });
                     ui.add_space(12.0);
-                    let label = egui::RichText::new(self.t("Start whereti with Windows", "Pornește whereti odată cu Windows")).size(13.0).color(l.text);
+                    let label = egui::RichText::new(tr("Start whereti with Windows")).size(13.0).color(l.text);
                     ui.checkbox(&mut self.autostart, label);
                     ui.add_space(18.0);
                     ui.horizontal(|ui| {
                         if matches!(installed, Some(std::cmp::Ordering::Equal | std::cmp::Ordering::Greater)) {
                             // nothing to update: open it, or install this copy again on purpose
-                            if button(ui, &l, self.t("Open whereti", "Deschide whereti"), true).clicked() {
+                            if button(ui, &l, tr("Open whereti"), true).clicked() {
                                 ops::launch_app();
                                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                             }
                             ui.add_space(8.0);
                             let again = if installed == Some(std::cmp::Ordering::Equal) {
-                                self.t("Reinstall", "Reinstalează")
+                                tr("Reinstall")
                             } else {
-                                self.t("Install this older version", "Instalează versiunea mai veche")
+                                tr("Install this older version")
                             };
                             if button(ui, &l, again, false).clicked() {
                                 self.start(&ctx, false);
                             }
                             return;
                         }
-                        let label = if update.is_some() { self.t("Update", "Actualizează") } else { self.t("Install", "Instalează") };
+                        let label = if update.is_some() { tr("Update") } else { tr("Install") };
                         if button(ui, &l, label, true).clicked() {
                             self.start(&ctx, false);
                         }
@@ -389,7 +366,7 @@ impl eframe::App for Setup {
                             egui::RichText::new(format!(
                                 "{} · {}",
                                 ops::install_dir().display(),
-                                self.t("asks for administrator permission once", "cere o dată permisiunea de administrator")
+                                tr("asks for administrator permission once")
                             ))
                             .size(11.5)
                             .color(l.text3),
@@ -402,32 +379,29 @@ impl eframe::App for Setup {
                         spinner(ui, &l);
                         ui.add_space(16.0);
                         let text = if matches!(state, State::Working) {
-                            self.t("Installing whereti…", "Se instalează whereti…")
+                            tr("Installing whereti…")
                         } else {
-                            self.t("Removing whereti…", "Se elimină whereti…")
+                            tr("Removing whereti…")
                         };
                         title(ui, text);
                         ui.add_space(4.0);
-                        body(ui, self.t("This takes a few seconds.", "Durează câteva secunde."));
+                        body(ui, tr("This takes a few seconds."));
                     });
                 }
                 State::Installed => {
                     badge(ui, &l, 1);
                     ui.add_space(14.0);
-                    title(ui, self.t("whereti is installed", "whereti e instalat"));
+                    title(ui, tr("whereti is installed"));
                     ui.add_space(4.0);
-                    body(ui, self.t(
-                        "It is building its index now. That takes about a minute, and whereti shows the progress. You can search right away.",
-                        "Își construiește acum indexul. Durează cam un minut, iar whereti arată progresul. Poți căuta imediat.",
-                    ));
+                    body(ui, tr("It is building its index now. That takes about a minute, and whereti shows the progress. You can search right away."));
                     ui.add_space(22.0);
                     ui.horizontal(|ui| {
-                        if button(ui, &l, self.t("Open whereti", "Deschide whereti"), true).clicked() {
+                        if button(ui, &l, tr("Open whereti"), true).clicked() {
                             ops::launch_app();
                             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                         }
                         ui.add_space(8.0);
-                        if button(ui, &l, self.t("Close", "Închide"), false).clicked() {
+                        if button(ui, &l, tr("Close"), false).clicked() {
                             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                         }
                     });
@@ -435,30 +409,27 @@ impl eframe::App for Setup {
                 State::Failed(e) => {
                     badge(ui, &l, 2);
                     ui.add_space(14.0);
-                    title(ui, self.t("Something went wrong", "Ceva n-a mers"));
+                    title(ui, tr("Something went wrong"));
                     ui.add_space(4.0);
                     body(ui, &e);
                     ui.add_space(22.0);
-                    if button(ui, &l, self.t("Try again", "Încearcă din nou"), true).clicked() {
+                    if button(ui, &l, tr("Try again"), true).clicked() {
                         *self.state.lock().unwrap() = State::Ready { update: ops::installed_version() };
                     }
                 }
                 State::ConfirmUninstall => {
                     badge(ui, &l, 0);
                     ui.add_space(14.0);
-                    title(ui, self.t("Remove whereti?", "Elimini whereti?"));
+                    title(ui, tr("Remove whereti?"));
                     ui.add_space(4.0);
-                    body(ui, self.t(
-                        "The app, its search service and its index are removed. Your own files are not touched.",
-                        "Se elimină aplicația, serviciul de căutare și indexul. Fișierele tale nu sunt atinse.",
-                    ));
+                    body(ui, tr("The app, its search service and its index are removed. Your own files are not touched."));
                     ui.add_space(22.0);
                     ui.horizontal(|ui| {
-                        if button(ui, &l, self.t("Remove", "Elimină"), true).clicked() {
+                        if button(ui, &l, tr("Remove"), true).clicked() {
                             self.start(&ctx, true);
                         }
                         ui.add_space(8.0);
-                        if button(ui, &l, self.t("Cancel", "Anulează"), false).clicked() {
+                        if button(ui, &l, tr("Cancel"), false).clicked() {
                             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                         }
                     });
@@ -466,11 +437,11 @@ impl eframe::App for Setup {
                 State::Removed => {
                     badge(ui, &l, 1);
                     ui.add_space(14.0);
-                    title(ui, self.t("whereti was removed", "whereti a fost eliminat"));
+                    title(ui, tr("whereti was removed"));
                     ui.add_space(4.0);
-                    body(ui, self.t("Thank you for trying it.", "Mulțumim că l-ai încercat."));
+                    body(ui, tr("Thank you for trying it."));
                     ui.add_space(22.0);
-                    if button(ui, &l, self.t("Close", "Închide"), true).clicked() {
+                    if button(ui, &l, tr("Close"), true).clicked() {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
                 }

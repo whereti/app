@@ -4881,6 +4881,7 @@ dependencies = [
  "raw-window-handle",
  "tray-icon",
  "whereti-extract",
+ "whereti-i18n",
  "whereti-ipc",
  "whereti-query",
  "windows",
@@ -4957,6 +4958,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "whereti-i18n"
+version = "0.0.1"
+dependencies = [
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "whereti-ipc"
 version = "0.0.1"
 dependencies = [
@@ -4995,6 +5003,7 @@ name = "whereti-setup"
 version = "0.0.1"
 dependencies = [
  "eframe",
+ "whereti-i18n",
  "windows",
  "windows-service",
  "winresource",

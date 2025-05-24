@@ -113,7 +113,7 @@ pub struct Tray {
 }
 
 fn open_label(hotkey: Option<&str>) -> String {
-    let search = crate::i18n::tr("Search…", "Caută…");
+    let search = crate::i18n::tr("Search…");
     match hotkey {
         Some(k) => format!("{search}   {k}"),
         None => search.to_string(),
@@ -121,7 +121,7 @@ fn open_label(hotkey: Option<&str>) -> String {
 }
 
 fn quit_label() -> &'static str {
-    crate::i18n::tr("Quit", "Ieșire")
+    crate::i18n::tr("Quit")
 }
 
 impl Tray {
@@ -134,10 +134,10 @@ impl Tray {
     /// Switches to another shortcut; keeps the old one if the new one is taken.
     pub fn set_hotkey(&mut self, label: &str) -> Result<(), String> {
         let Some(m) = &self.manager else {
-            return Err(crate::i18n::tr("shortcuts are not available", "tastele rapide nu sunt disponibile").into());
+            return Err(crate::i18n::tr("shortcuts are not available").into());
         };
         let Some(new) = parse(label) else {
-            return Err(crate::i18n::tr("Use Ctrl or Alt with another key", "Folosește Ctrl sau Alt împreună cu altă tastă").into());
+            return Err(crate::i18n::tr("Use Ctrl or Alt with another key").into());
         };
         if let Some(old) = self.registered {
             let _ = m.unregister(old);
@@ -153,7 +153,7 @@ impl Tray {
                 if let Some(old) = self.registered {
                     let _ = m.register(old);
                 }
-                Err(crate::trf!("{label} is used by another app", "{label} e folosită de altă aplicație"))
+                Err(crate::trf!("{label} is used by another app", label))
             }
         }
     }

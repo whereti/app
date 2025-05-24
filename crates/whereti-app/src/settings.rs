@@ -15,7 +15,7 @@ use whereti_ipc::ConfigReply;
 use crate::app::{icon_button, semibold, state_ro, IconKind, Page, WheretiApp};
 use crate::i18n::{tr, Lang};
 use crate::shell;
-use crate::trf;
+use crate::{trf, trn};
 use crate::theme::Palette;
 use crate::tray::HOTKEYS;
 
@@ -35,7 +35,8 @@ pub struct SettingsState {
     pub welcomed: bool,
     /// The preview panel is open.
     pub preview: bool,
-    pub lang: Lang,
+    /// The chosen language; `None` = the Windows display language.
+    pub lang: Option<Lang>,
     config: Option<ConfigReply>,
     exclusions: Vec<String>,
     /// The part of Settings shown.
@@ -58,7 +59,7 @@ impl SettingsState {
             autostart: shell::autostart_enabled(),
             welcomed: false,
             preview: true,
-            lang: Lang::English,
+            lang: None,
             config: None,
             exclusions: Vec::new(),
             section: Section::General,
@@ -73,13 +74,18 @@ impl SettingsState {
                     Some(("theme", "light")) => s.theme = ThemeChoice::Light,
                     Some(("theme", "dark")) => s.theme = ThemeChoice::Dark,
                     Some(("preview", "off")) => s.preview = false,
-                    Some(("language", "ro")) => s.lang = Lang::Romanian,
+                    Some(("language", v)) => s.lang = Lang::from_code(v),
                     Some(("welcomed", "yes")) => s.welcomed = true,
                     _ => {}
                 }
             }
         }
         s
+    }
+
+    /// The language shown: the chosen one, or Windows'.
+    pub fn effective_lang(&self) -> Lang {
+        self.lang.unwrap_or_else(Lang::system)
     }
 
     pub fn save(&self) {
@@ -91,7 +97,7 @@ impl SettingsState {
         let mut text = format!(
             "theme={theme}\npreview={}\nlanguage={}\nwelcomed={}\n",
             if self.preview { "on" } else { "off" },
-            if self.lang == Lang::Romanian { "ro" } else { "en" },
+            self.lang.map_or("system", |l| l.locale().code),
             if self.welcomed { "yes" } else { "no" }
         );
         if let Some(h) = &self.hotkey {
@@ -134,13 +140,13 @@ pub fn show(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
     ui.add_space(6.0);
     ui.horizontal(|ui| {
         ui.add_space(6.0);
-        if icon_button(ui, p, IconKind::Back, false).on_hover_text(tr("Back (Esc)", "Înapoi (Esc)")).clicked() {
+        if icon_button(ui, p, IconKind::Back, false).on_hover_text(tr("Back (Esc)")).clicked() {
             app.page = Page::Search;
             app.focus_search = true;
         }
         ui.add_space(6.0);
         ui.label(
-            egui::RichText::new(tr("Settings", "Setări")).size(22.0).family(egui::FontFamily::Name("display".into())).color(p.text),
+            egui::RichText::new(tr("Settings")).size(22.0).family(egui::FontFamily::Name("display".into())).color(p.text),
         );
     });
     ui.add_space(14.0);
@@ -153,9 +159,9 @@ pub fn show(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
     // ---- the menu
     let mut nav_ui = ui.new_child(egui::UiBuilder::new().max_rect(nav).layout(egui::Layout::top_down(Align::Min)));
     for (section, icon, label) in [
-        (Section::General, Icon::Settings, tr("General", "General")),
-        (Section::Search, Icon::Search, tr("Search", "Căutare")),
-        (Section::About, Icon::Sparkle, tr("About", "Despre")),
+        (Section::General, Icon::Settings, tr("General")),
+        (Section::Search, Icon::Search, tr("Search")),
+        (Section::About, Icon::Sparkle, tr("About")),
     ] {
         if nav_item(&mut nav_ui, p, icon, label, app.settings.section == section).clicked() {
             app.settings.section = section;
@@ -178,15 +184,39 @@ pub fn show(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
 }
 
 fn general(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette, ctx: &egui::Context) {
-    heading(ui, p, tr("General", "General"), tr("How whereti looks and starts.", "Cum arată și cum pornește whereti."));
+    heading(ui, p, tr("General"), tr("How whereti looks and starts."));
     card(ui, p, |ui| {
-        row(ui, p, tr("Language", "Limbă"), tr("The language of the whole app.", "Limba întregii aplicații."), |ui| {
-            let current = if app.settings.lang == Lang::Romanian { 1 } else { 0 };
-            if let Some(i) = segmented(ui, p, &["English", "Română"], current) {
-                let l = if i == 1 { Lang::Romanian } else { Lang::English };
+        row(ui, p, tr("Language"), tr("The language of the whole app."), |ui| {
+            // "Same as Windows" first, then every language by its own name;
+            // "beta" until a native speaker has read the texts
+            let name = |l: Option<Lang>| {
+                let (text, beta) = match l {
+                    None => (crate::trf!("Same as Windows ({language})", language = Lang::system().locale().native), false),
+                    Some(l) => (l.locale().native.to_string(), !l.locale().reviewed),
+                };
+                let mut job = egui::text::LayoutJob::default();
+                job.append(&text, 0.0, egui::TextFormat::simple(FontId::new(13.0, crate::app::medium()), p.text));
+                if beta {
+                    job.append("beta", 8.0, egui::TextFormat::simple(FontId::new(11.0, crate::app::medium()), p.text3));
+                }
+                job
+            };
+            let mut chosen = None;
+            egui::ComboBox::from_id_salt("language")
+                .selected_text(name(app.settings.lang))
+                .width(230.0)
+                .height(420.0)
+                .show_ui(ui, |ui| {
+                    for l in std::iter::once(None).chain(Lang::ALL.into_iter().map(Some)) {
+                        if ui.selectable_label(app.settings.lang == l, name(l)).clicked() {
+                            chosen = Some(l);
+                        }
+                    }
+                });
+            if let Some(l) = chosen {
                 if l != app.settings.lang {
                     app.settings.lang = l;
-                    crate::i18n::set(l);
+                    crate::i18n::set(app.settings.effective_lang());
                     app.settings.save();
                     if let Some(t) = &app.tray {
                         t.relabel();
@@ -196,8 +226,8 @@ fn general(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette, ctx: &egui::Con
             }
         });
         line(ui, p);
-        row(ui, p, tr("Theme", "Temă"), tr("Follow Windows, or always light or dark.", "Ca Windows, sau mereu luminoasă ori întunecată."), |ui| {
-            let options = [tr("Windows", "Windows"), tr("Light", "Luminoasă"), tr("Dark", "Întunecată")];
+        row(ui, p, tr("Theme"), tr("Follow Windows, or always light or dark."), |ui| {
+            let options = [tr("Windows"), tr("Light"), tr("Dark")];
             let current = match app.settings.theme {
                 ThemeChoice::System => 0,
                 ThemeChoice::Light => 1,
@@ -217,8 +247,8 @@ fn general(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette, ctx: &egui::Con
         row(
             ui,
             p,
-            tr("Start with Windows", "Pornește cu Windows"),
-            tr("whereti waits next to the clock, ready to search.", "whereti așteaptă lângă ceas, gata de căutare."),
+            tr("Start with Windows"),
+            tr("whereti waits next to the clock, ready to search."),
             |ui| {
                 let mut on = app.settings.autostart;
                 if toggle(ui, p, &mut on).clicked() {
@@ -236,27 +266,27 @@ fn search(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
     heading(
         ui,
         p,
-        tr("Search", "Căutare"),
-        tr("What whereti knows about your files.", "Ce știe whereti despre fișierele tale."),
+        tr("Search"),
+        tr("What whereti knows about your files."),
     );
     let status = app.status.clone();
     card(ui, p, |ui| {
         // files and folders
         let (dot, value) = match (&app.offline, &status) {
-            (Some(_), _) => (p.error, tr("The whereti service is not running", "Serviciul whereti nu rulează").to_string()),
+            (Some(_), _) => (p.error, tr("The whereti service is not running").to_string()),
             (None, Some(s)) => {
                 let drives = s.volumes.iter().map(|v| format!("{}:", v.letter)).collect::<Vec<_>>().join(" ");
                 let color = if s.state == "ready" { p.ok } else { p.warn };
                 let text = if s.state == "ready" {
-                    trf!("{} on {drives}", "{} pe {drives}", shell::count(s.entries))
+                    trn!("{n} file on {drives}|{n} files on {drives}", s.entries, drives)
                 } else {
                     state_ro(&s.state)
                 };
                 (color, text)
             }
-            (None, None) => (p.text3, tr("connecting…", "se conectează…").to_string()),
+            (None, None) => (p.text3, tr("connecting…").to_string()),
         };
-        row(ui, p, tr("Files and folders", "Fișiere și foldere"), tr("Found by name, instantly.", "Găsite după nume, instant."), |ui| {
+        row(ui, p, tr("Files and folders"), tr("Found by name, instantly."), |ui| {
             ui.label(egui::RichText::new(value).size(13.0).color(p.text));
             let (r, _) = ui.allocate_exact_size(Vec2::new(10.0, 18.0), Sense::hover());
             ui.painter().circle_filled(r.center(), 4.0, dot);
@@ -264,16 +294,13 @@ fn search(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
         line(ui, p);
         // documents
         let c = status.as_ref().map(|s| s.content.clone());
-        let desc = tr(
-            "PDF, Word, Excel, PowerPoint, e-mails and text files, found by what is written in them.",
-            "PDF, Word, Excel, PowerPoint, e-mailuri și fișiere text, găsite după ce scrie în ele.",
-        );
-        row(ui, p, tr("Inside documents", "În documente"), desc, |ui| {
+        let desc = tr("PDF, Word, Excel, PowerPoint, e-mails and text files, found by what is written in them.");
+        row(ui, p, tr("Inside documents"), desc, |ui| {
             if let Some(c) = &c {
                 let (dot, text) = match c.state.as_str() {
-                    "ready" => (p.ok, trf!("{} documents", "{} documente", shell::count(c.files))),
-                    s if s.starts_with("error") => (p.error, tr("not available", "indisponibil").to_string()),
-                    _ => (p.warn, tr("reading…", "se citesc…").to_string()),
+                    "ready" => (p.ok, trn!("{n} document|{n} documents", c.files)),
+                    s if s.starts_with("error") => (p.error, tr("not available").to_string()),
+                    _ => (p.warn, tr("reading…").to_string()),
                 };
                 ui.label(egui::RichText::new(text).size(13.0).color(p.text));
                 let (r, _) = ui.allocate_exact_size(Vec2::new(10.0, 18.0), Sense::hover());
@@ -299,14 +326,11 @@ fn search(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
     // ---- folders to skip
     card(ui, p, |ui| {
         ui.add_space(12.0);
-        ui.label(egui::RichText::new(tr("Folders whereti skips", "Foldere ignorate")).size(14.5).family(semibold()).color(p.text));
+        ui.label(egui::RichText::new(tr("Folders whereti skips")).size(14.5).family(semibold()).color(p.text));
         ui.add_space(2.0);
         ui.add(
             egui::Label::new(
-                egui::RichText::new(tr(
-                    "Nothing inside them shows up in results. Use it for private folders, or old archives you never look for.",
-                    "Nimic din ele nu apare în rezultate. Util pentru foldere private sau arhive vechi pe care nu le cauți.",
-                ))
+                egui::RichText::new(tr("Nothing inside them shows up in results. Use it for private folders, or old archives you never look for."))
                 .size(12.5)
                 .color(p.text2),
             )
@@ -325,7 +349,7 @@ fn search(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
             }
             ui.add_space(10.0);
         }
-        if button(ui, p, tr("Add a folder…", "Adaugă un folder…"), false).clicked() {
+        if button(ui, p, tr("Add a folder…"), false).clicked() {
             if let Some(path) = app.hwnd.and_then(crate::win::pick_folder) {
                 if !app.settings.exclusions.iter().any(|x| x.eq_ignore_ascii_case(&path)) {
                     app.settings.exclusions.push(path);
@@ -344,10 +368,7 @@ fn search(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
             let (r, _) = ui.allocate_exact_size(Vec2::new(16.0, 16.0), Sense::hover());
             crate::icons::paint(ui.painter(), r, crate::icons::Icon::Lock, p.text3);
             ui.label(
-                egui::RichText::new(tr(
-                    "Windows, program files and temporary or cache folders are skipped automatically.",
-                    "Windows, fișierele programelor și folderele temporare sau de cache sunt ignorate automat.",
-                ))
+                egui::RichText::new(tr("Windows, program files and temporary or cache folders are skipped automatically."))
                 .size(12.0)
                 .color(p.text3),
             );
@@ -357,7 +378,7 @@ fn search(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
 }
 
 fn about(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
-    heading(ui, p, tr("About", "Despre"), "");
+    heading(ui, p, tr("About"), "");
     card(ui, p, |ui| {
         ui.add_space(16.0);
         ui.horizontal(|ui| {
@@ -378,7 +399,7 @@ fn about(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
                         .color(p.text),
                 );
                 ui.label(
-                    egui::RichText::new(tr("Instant file search for Windows.", "Căutare instantă de fișiere pentru Windows."))
+                    egui::RichText::new(tr("Instant file search for Windows."))
                         .size(13.0)
                         .color(p.text2),
                 );
@@ -388,13 +409,13 @@ fn about(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
         line(ui, p);
         for (title, text) in [
             (
-                tr("Private", "Privat"),
-                tr("Everything stays on your PC. No account, no tracking, no internet needed.", "Totul rămâne pe PC-ul tău. Fără cont, fără urmărire, fără internet."),
+                tr("Private"),
+                tr("Everything stays on your PC. No account, no tracking, no internet needed."),
             ),
-            (tr("Open source", "Open source"), tr("Free, under the MIT license.", "Gratuit, sub licența MIT.")),
+            (tr("Open source"), tr("Free, under the MIT license.")),
             (
-                tr("Supporter license", "Licență de susținător"),
-                tr("Coming soon, for those who want to support the project.", "În curând, pentru cine vrea să susțină proiectul."),
+                tr("Supporter license"),
+                tr("Coming soon, for those who want to support the project."),
             ),
         ] {
             info_row(ui, p, title, text);
@@ -432,17 +453,17 @@ fn shortcut(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
     }
     let recording = app.settings.recording;
     let desc = if recording {
-        tr("Press the keys together, with Ctrl or Alt. Esc to cancel.", "Apasă tastele împreună, cu Ctrl sau Alt. Esc ca să renunți.")
+        tr("Press the keys together, with Ctrl or Alt. Esc to cancel.")
     } else {
-        tr("Opens whereti from any app.", "Deschide whereti din orice aplicație.")
+        tr("Opens whereti from any app.")
     };
-    row(ui, p, tr("Shortcut", "Tastă rapidă"), desc, |ui| {
+    row(ui, p, tr("Shortcut"), desc, |ui| {
         if recording {
-            if button(ui, p, tr("Cancel", "Renunță"), false).clicked() {
+            if button(ui, p, tr("Cancel"), false).clicked() {
                 stop_recording(app);
             }
             ui.add_space(8.0);
-            let text = egui::RichText::new(tr("Press keys…", "Apasă tastele…")).size(13.0).family(semibold()).color(p.accent);
+            let text = egui::RichText::new(tr("Press keys…")).size(13.0).family(semibold()).color(p.accent);
             Frame::new()
                 .fill(p.accent_soft)
                 .stroke(Stroke::new(1.0, p.accent))
@@ -450,7 +471,7 @@ fn shortcut(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
                 .inner_margin(Margin::symmetric(12, 7))
                 .show(ui, |ui| ui.label(text));
         } else {
-            if button(ui, p, tr("Change", "Schimbă"), false).clicked() {
+            if button(ui, p, tr("Change"), false).clicked() {
                 app.settings.recording = true;
                 if let Some(t) = &app.tray {
                     t.pause_hotkey(true);
@@ -460,7 +481,7 @@ fn shortcut(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
             match &current {
                 Some(k) => crate::app::key_hint(ui, p, k),
                 None => {
-                    ui.label(egui::RichText::new(tr("none", "niciuna")).size(13.0).color(p.text3));
+                    ui.label(egui::RichText::new(tr("none")).size(13.0).color(p.text3));
                 }
             }
         }
@@ -470,7 +491,7 @@ fn shortcut(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
     if !recording && !others.is_empty() {
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
-            ui.label(egui::RichText::new(tr("Suggestions:", "Sugestii:")).size(12.5).color(p.text2));
+            ui.label(egui::RichText::new(tr("Suggestions:")).size(12.5).color(p.text2));
             for h in others {
                 let chip = egui::Button::new(egui::RichText::new(h).size(12.5).color(p.text))
                     .fill(p.bg)
@@ -492,13 +513,13 @@ fn shortcut(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
         }
         let result = match app.tray.as_mut() {
             Some(t) => t.set_hotkey(&label),
-            None => Err(tr("the tray icon is not available", "iconița din tray nu e disponibilă").into()),
+            None => Err(tr("the tray icon is not available").into()),
         };
         match result {
             Ok(()) => {
                 app.settings.hotkey = Some(label.clone());
                 app.settings.save();
-                app.flash(trf!("The shortcut is now {label}", "Tasta rapidă este acum {label}"));
+                app.flash(trf!("The shortcut is now {label}", label));
             }
             Err(e) => app.flash(e),
         }
@@ -660,7 +681,7 @@ fn path_list(ui: &mut egui::Ui, p: &Palette, paths: &[String], icons: &mut crate
                     }
                     crate::icons::paint(ui.painter(), x.shrink(7.0), Icon::Close, p.text2);
                 }
-                if xr.on_hover_text(tr("Stop skipping it", "Nu-l mai ignora")).clicked() {
+                if xr.on_hover_text(tr("Stop skipping it")).clicked() {
                     removed = Some(i);
                 }
             }

@@ -1,4 +1,4 @@
-﻿//! Preview panel (PLAN.md §10.6): the text of the selected file, with the
+//! Preview panel (PLAN.md §10.6): the text of the selected file, with the
 //! searched words highlighted, next to the results.
 //!
 //! Text comes from `whereti-extract`: plain text is read here, documents
@@ -19,7 +19,7 @@ use whereti_ipc::Row;
 use crate::app::{match_mask, paint_tile, relative_time, semibold};
 use crate::i18n::tr;
 use crate::shell;
-use crate::trf;
+use crate::{trf, trn};
 use crate::theme::{self, Palette};
 
 /// Characters shown (and searched for highlights) in the panel.
@@ -118,7 +118,7 @@ impl Preview {
         let icon = icon.as_ref();
         let Some(row) = row else {
             ui.add_space(40.0);
-            ui.vertical_centered(|ui| ui.label(egui::RichText::new(tr("Select a result", "Selectează un rezultat")).size(13.0).color(p.text3)));
+            ui.vertical_centered(|ui| ui.label(egui::RichText::new(tr("Select a result")).size(13.0).color(p.text3)));
             return;
         };
         let (folder, name) = match row.path.rfind('\\') {
@@ -147,15 +147,12 @@ impl Preview {
         if !row.is_dir {
             facts.push(shell::size(row.size));
         }
-        facts.push(trf!("modified {}", "modificat {}", relative_time(row.modified, tz, crate::app::now_minutes())));
+        facts.push(trf!("modified {when}", when = relative_time(row.modified, tz, crate::app::now_minutes())));
         if let Some(l) = self.loaded() {
             if let Content::Text { text, truncated, .. } = &l.content {
                 let words = text.split_whitespace().count();
                 let plus = if *truncated { "+" } else { "" };
-                facts.push(match words {
-                    1 => trf!("1 word{plus}", "1 cuvânt{plus}"),
-                    n => trf!("{} words{plus}", "{} cuvinte{plus}", shell::count(n as u64)),
-                });
+                facts.push(trn!("{n} word{plus}|{n} words{plus}", words, plus));
             }
         }
         ui.label(egui::RichText::new(facts.join("  ·  ")).size(12.0).color(p.text3));
@@ -166,16 +163,17 @@ impl Preview {
                 return;
             };
             let summary = match (*folders, *files) {
-                (0, 0) => tr("Empty folder", "Folder gol").to_string(),
-                (d, f) => [
-                    (d, tr("folder", "folder"), tr("folders", "foldere")),
-                    (f, tr("file", "fișier"), tr("files", "fișiere")),
-                ]
-                    .iter()
-                    .filter(|(n, _, _)| *n > 0)
-                    .map(|(n, one, many)| format!("{} {}", shell::count(*n as u64), if *n == 1 { one } else { many }))
-                    .collect::<Vec<_>>()
-                    .join(" · "),
+                (0, 0) => tr("Empty folder").to_string(),
+                (d, f) => {
+                    let mut parts = Vec::new();
+                    if d > 0 {
+                        parts.push(trn!("{n} folder|{n} folders", d));
+                    }
+                    if f > 0 {
+                        parts.push(trn!("{n} file|{n} files", f));
+                    }
+                    parts.join(" · ")
+                }
             };
             ui.label(egui::RichText::new(summary).size(12.0).family(semibold()).color(p.text2));
             ui.add_space(6.0);
@@ -215,11 +213,7 @@ impl Preview {
                         if folders + files > shown {
                             ui.add_space(4.0);
                             ui.label(
-                                egui::RichText::new(trf!(
-                                    "and {} more. Enter opens it in Explorer.",
-                                    "și încă {}. Enter îl deschide în Explorer.",
-                                    shell::count((folders + files - shown) as u64)
-                                ))
+                                egui::RichText::new(trn!("and {n} more. Enter opens it in Explorer.|and {n} more. Enter opens it in Explorer.", folders + files - shown))
                                     .size(12.0)
                                     .color(p.text3),
                             );
@@ -231,7 +225,7 @@ impl Preview {
         let Some(loaded) = self.loaded() else {
             ui.horizontal(|ui| {
                 ui.add(egui::Spinner::new().size(14.0).color(p.text3));
-                ui.label(egui::RichText::new(tr("Reading the text…", "Se citește textul…")).size(12.5).color(p.text3));
+                ui.label(egui::RichText::new(tr("Reading the text…")).size(12.5).color(p.text3));
             });
             return;
         };
@@ -241,18 +235,15 @@ impl Preview {
             Content::NoPreview => note(
                 ui,
                 p,
-                tr("No preview", "Fără previzualizare"),
-                tr("whereti shows the text of documents, text files and code.", "whereti afișează textul documentelor, al fișierelor text și al codului."),
+                tr("No preview"),
+                tr("whereti shows the text of documents, text files and code."),
             ),
-            Content::Failed(e) => note(ui, p, tr("The text cannot be read", "Textul nu poate fi citit"), e),
+            Content::Failed(e) => note(ui, p, tr("The text cannot be read"), e),
             Content::Text { text, .. } if text.trim().is_empty() => note(
                 ui,
                 p,
-                tr("The document has no text", "Documentul nu conține text"),
-                tr(
-                    "It is probably scanned (images only). Reading text from images (OCR) comes in a later version.",
-                    "Probabil e scanat (doar imagini). Recunoașterea textului din imagini (OCR) vine într-o versiune viitoare.",
-                ),
+                tr("The document has no text"),
+                tr("It is probably scanned (images only). Reading text from images (OCR) comes in a later version."),
             ),
             Content::Text { text, truncated, mono } => {
                 let (text, truncated, mono) = (text.clone(), *truncated, *mono);
@@ -284,12 +275,12 @@ impl Preview {
 
         ui.horizontal(|ui| {
             if hits > 0 {
-                let label = trf!("{} matches in the text", "{} potriviri în text", shell::count(hits as u64));
+                let label = trn!("{n} match in the text|{n} matches in the text", hits);
                 ui.label(egui::RichText::new(label).size(12.0).family(semibold()).color(p.accent));
             }
             ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
                 let ms = took.as_millis();
-                let note = if truncated { trf!("first {} characters · {ms} ms", "primele {} caractere · {ms} ms", shell::count(SHOW_CHARS as u64)) } else { format!("{ms} ms") };
+                let note = if truncated { trn!("first {n} character · {ms} ms|first {n} characters · {ms} ms", SHOW_CHARS, ms) } else { format!("{ms} ms") };
                 ui.label(egui::RichText::new(note).size(11.0).color(p.text3));
             });
         });
@@ -420,7 +411,7 @@ pub(crate) fn load_with(path: &str, sandbox: Option<&Sandbox>, max_chars: usize)
                 .flatten()
                 .map(|e| (e.file_name().to_string_lossy().into_owned(), e.file_type().is_ok_and(|t| t.is_dir())))
                 .collect(),
-            Err(e) => return Content::Failed(trf!("The folder cannot be opened: {e}", "Folderul nu poate fi deschis: {e}")),
+            Err(e) => return Content::Failed(trf!("The folder cannot be opened: {e}", e)),
         };
         let folders = all.iter().filter(|e| e.1).count();
         let files = all.len() - folders;
@@ -438,17 +429,17 @@ pub(crate) fn load_with(path: &str, sandbox: Option<&Sandbox>, max_chars: usize)
     } else {
         match sandbox {
             Some(s) => s.extract_file(p, max_chars),
-            None => return Content::Failed(tr("whereti-extract.exe is missing next to whereti.exe", "whereti-extract.exe lipsește de lângă whereti.exe").into()),
+            None => return Content::Failed(tr("whereti-extract.exe is missing next to whereti.exe").into()),
         }
     };
     match result {
         Ok(e) => Content::Text { text: e.text, truncated: e.truncated, mono },
         Err(SandboxError::Extract(ExtractError::Unsupported)) => Content::NoPreview,
-        Err(SandboxError::Extract(ExtractError::Protected)) => Content::Failed(tr("The document is password-protected.", "Documentul e protejat cu parolă.").into()),
-        Err(SandboxError::Extract(ExtractError::Damaged(e))) => Content::Failed(trf!("The file looks damaged ({e}).", "Fișierul pare deteriorat ({e}).")),
-        Err(SandboxError::TooLarge(n)) => Content::Failed(trf!("The file is too large to preview ({} MB).", "Fișierul e prea mare pentru previzualizare ({} MB).", n >> 20)),
-        Err(SandboxError::Io(e)) => Content::Failed(trf!("The file cannot be opened: {e}", "Fișierul nu poate fi deschis: {e}")),
-        Err(SandboxError::Failed(e)) => Content::Failed(format!("Extragerea s-a oprit: {e}")),
+        Err(SandboxError::Extract(ExtractError::Protected)) => Content::Failed(tr("The document is password-protected.").into()),
+        Err(SandboxError::Extract(ExtractError::Damaged(e))) => Content::Failed(trf!("The file looks damaged ({e}).", e)),
+        Err(SandboxError::TooLarge(n)) => Content::Failed(trf!("The file is too large to preview ({size} MB).", size = n >> 20)),
+        Err(SandboxError::Io(e)) => Content::Failed(trf!("The file cannot be opened: {e}", e)),
+        Err(SandboxError::Failed(e)) => Content::Failed(trf!("Reading the file stopped: {e}", e)),
     }
 }
 

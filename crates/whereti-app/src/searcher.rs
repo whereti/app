@@ -129,9 +129,9 @@ fn worker(jobs: Receiver<Msg>, out: Sender<Update>, wake: impl Fn()) {
         let result = (|| -> std::io::Result<()> {
             if let Some(paths) = p.exclusions {
                 let msg = match c.call(&Request::SetExclusions { paths })? {
-                    Response::Ok => crate::i18n::tr("Exclusions saved. The index is being rebuilt.", "Excluderile au fost salvate. Indexul se reconstruiește.").to_string(),
-                    Response::Error(e) => crate::trf!("Could not save the exclusions: {e}", "Nu s-au putut salva excluderile: {e}"),
-                    _ => crate::i18n::tr("Unexpected reply from the service", "Răspuns neașteptat de la serviciu").to_string(),
+                    Response::Ok => crate::i18n::tr("Exclusions saved. The index is being rebuilt.").to_string(),
+                    Response::Error(e) => crate::trf!("Could not save the exclusions: {e}", e),
+                    _ => crate::i18n::tr("Unexpected reply from the service").to_string(),
                 };
                 let _ = out.send(Update::Done(msg));
             }

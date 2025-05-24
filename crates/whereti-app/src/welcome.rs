@@ -7,9 +7,8 @@ use eframe::egui::{self, Align, Color32, CornerRadius, FontFamily, FontId, Frame
 use crate::app::{content_active, content_progress, names_progress, semibold, state_ro, Page, WheretiApp};
 use crate::i18n::tr;
 use crate::icons::{self, Icon};
-use crate::shell;
 use crate::theme::{self, Palette};
-use crate::trf;
+use crate::{trf, trn};
 
 enum Step {
     Waiting,
@@ -35,17 +34,14 @@ pub fn show(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
                 ui.set_width(width);
                 // ---- greeting
                 ui.label(
-                    egui::RichText::new(tr("Welcome to whereti", "Bine ai venit în whereti"))
+                    egui::RichText::new(tr("Welcome to whereti"))
                         .size(26.0)
                         .family(FontFamily::Name("display".into()))
                         .color(p.text),
                 );
                 ui.add_space(4.0);
                 ui.label(
-                    egui::RichText::new(tr(
-                        "Instant search for every file on your PC, by its name and by what is written inside.",
-                        "Căutare instantă pentru orice fișier de pe PC, după nume și după ce scrie în el.",
-                    ))
+                    egui::RichText::new(tr("Instant search for every file on your PC, by its name and by what is written inside."))
                     .size(14.0)
                     .color(p.text2),
                 );
@@ -59,16 +55,13 @@ pub fn show(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
                     (None, None) => Step::Working(None),
                 };
                 let names_detail = match (&offline, &status) {
-                    (Some(_), _) => tr(
-                        "The whereti service is not running. Reinstall whereti, or start the service.",
-                        "Serviciul whereti nu rulează. Reinstalează whereti sau pornește serviciul.",
-                    )
+                    (Some(_), _) => tr("The whereti service is not running. Reinstall whereti, or start the service.")
                     .to_string(),
                     (None, Some(s)) if s.state == "ready" => {
-                        trf!("{} files and folders, on {}", "{} fișiere și foldere, pe {}", shell::count(s.entries), drives(s))
+                        trn!("{n} file or folder, on {drives}|{n} files and folders, on {drives}", s.entries, drives = drives(s))
                     }
                     (None, Some(s)) => state_ro(&s.state),
-                    (None, None) => tr("connecting to the service…", "se conectează la serviciu…").to_string(),
+                    (None, None) => tr("connecting to the service…").to_string(),
                 };
                 let content_step = match (&content, names_ready) {
                     (_, false) => Step::Waiting,
@@ -81,28 +74,18 @@ pub fn show(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
                     _ => Step::Working(None),
                 };
                 let content_detail = match (&content, names_ready) {
-                    (_, false) => tr("Starts as soon as the names are read.", "Începe imediat ce sunt citite numele.").to_string(),
-                    (Some(c), true) if c.state == "ready" => trf!(
-                        "{} documents: PDF, Word, Excel, PowerPoint, e-mails",
-                        "{} documente: PDF, Word, Excel, PowerPoint, e-mailuri",
-                        shell::count(c.files)
-                    ),
+                    (_, false) => tr("Starts as soon as the names are read.").to_string(),
+                    (Some(c), true) if c.state == "ready" => trn!("{n} document: PDF, Word, Excel, PowerPoint, e-mails|{n} documents: PDF, Word, Excel, PowerPoint, e-mails", c.files),
                     (Some(c), true) if content_active(c) => content_progress(c, app.content_eta(c)),
                     (Some(c), true) if c.state.starts_with("error") => c.state.clone(),
-                    _ => tr("looking for documents…", "se caută documentele…").to_string(),
+                    _ => tr("looking for documents…").to_string(),
                 };
                 let ready_step = if content_ready { Step::Done } else if names_ready { Step::Working(None) } else { Step::Waiting };
                 let hotkey = app.hotkey_label().unwrap_or_else(|| crate::tray::PREFERRED_HOTKEY.to_string());
                 let ready_detail = if names_ready {
-                    trf!(
-                        "Press {hotkey} in any app to open whereti. You can search already.",
-                        "Apasă {hotkey} în orice aplicație ca să deschizi whereti. Poți căuta deja."
-                    )
+                    trf!("Press {hotkey} in any app to open whereti. You can search already.", hotkey)
                 } else {
-                    tr(
-                        "You can start typing now; results grow as the index is built.",
-                        "Poți începe să cauți de acum; rezultatele cresc pe măsură ce se construiește indexul.",
-                    )
+                    tr("You can start typing now; results grow as the index is built.")
                     .to_string()
                 };
 
@@ -113,9 +96,9 @@ pub fn show(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
                     .inner_margin(Margin::symmetric(20, 4))
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
-                        step_row(ui, p, 1, &names_step, tr("Reading the file names", "Se citesc numele fișierelor"), &names_detail, false);
-                        step_row(ui, p, 2, &content_step, tr("Reading the documents", "Se citesc documentele"), &content_detail, false);
-                        step_row(ui, p, 3, &ready_step, tr("Ready to search", "Gata de căutare"), &ready_detail, true);
+                        step_row(ui, p, 1, &names_step, tr("Reading the file names"), &names_detail, false);
+                        step_row(ui, p, 2, &content_step, tr("Reading the documents"), &content_detail, false);
+                        step_row(ui, p, 3, &ready_step, tr("Ready to search"), &ready_detail, true);
                     });
                 ui.add_space(12.0);
 
@@ -123,21 +106,18 @@ pub fn show(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 10.0;
                     let w = (ui.available_width() - 20.0) / 3.0;
-                    tip(ui, p, w, Icon::Search, tr("Type part of a name", "Scrie o parte din nume"), tr("“factura”, “*.pdf”, “ext:docx dm:today”", "„factura”, „*.pdf”, „ext:docx dm:today”"));
-                    tip(ui, p, w, Icon::Document, tr("Inside documents too", "Și în documente"), tr("Words in PDFs, Word and Excel files show up under the names.", "Cuvintele din PDF, Word și Excel apar sub nume."));
-                    tip(ui, p, w, Icon::Panel, tr("Tab shows a preview", "Tab arată previzualizarea"), tr("Enter opens, Ctrl+Enter shows the file in Explorer.", "Enter deschide, Ctrl+Enter arată fișierul în Explorer."));
+                    tip(ui, p, w, Icon::Search, tr("Type part of a name"), tr("“factura”, “*.pdf”, “ext:docx dm:today”"));
+                    tip(ui, p, w, Icon::Document, tr("Inside documents too"), tr("Words in PDFs, Word and Excel files show up under the names."));
+                    tip(ui, p, w, Icon::Panel, tr("Tab shows a preview"), tr("Enter opens, Ctrl+Enter shows the file in Explorer."));
                 });
                 ui.add_space(14.0);
                 ui.horizontal(|ui| {
-                    if primary_button(ui, p, tr("Start searching", "Începe să cauți")).clicked() {
+                    if primary_button(ui, p, tr("Start searching")).clicked() {
                         finish(app);
                     }
                     ui.add_space(12.0);
                     ui.label(
-                        egui::RichText::new(tr(
-                            "whereti keeps working in the tray, next to the clock.",
-                            "whereti lucrează mai departe în tray, lângă ceas.",
-                        ))
+                        egui::RichText::new(tr("whereti keeps working in the tray, next to the clock."))
                         .size(12.5)
                         .color(p.text3),
                     );

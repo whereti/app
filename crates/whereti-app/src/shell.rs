@@ -95,15 +95,7 @@ pub fn size(bytes: u64) -> String {
 
 /// "1,243,551" (English) or "1.243.551" (Romanian).
 pub fn count(n: u64) -> String {
-    let s = n.to_string();
-    let mut out = String::with_capacity(s.len() + s.len() / 3);
-    for (i, ch) in s.chars().enumerate() {
-        if i > 0 && (s.len() - i).is_multiple_of(3) {
-            out.push(crate::i18n::separators().0);
-        }
-        out.push(ch);
-    }
-    out
+    crate::i18n::number(n)
 }
 
 
@@ -178,7 +170,7 @@ mod tests {
     #[test]
     fn romanian_formats() {
         let _guard = crate::i18n::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        crate::i18n::set(crate::i18n::Lang::Romanian);
+        crate::i18n::set(crate::i18n::Lang::Ro);
         assert_eq!(count(1_243_551), "1.243.551");
         assert_eq!(size(1536), "1,5 KB");
         assert_eq!(size(12), "12 B");

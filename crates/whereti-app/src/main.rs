@@ -22,6 +22,9 @@ mod win;
 
 use std::sync::Arc;
 
+#[allow(unused_imports)]
+pub(crate) use whereti_i18n::{trf, trn};
+
 use eframe::egui::{self, FontData, FontDefinitions, FontFamily};
 
 fn main() -> eframe::Result<()> {
@@ -47,7 +50,7 @@ fn main() -> eframe::Result<()> {
         "whereti",
         options,
         Box::new(move |cc| {
-            setup_fonts(&cc.egui_ctx);
+            setup_fonts(&cc.egui_ctx, false);
             let ctx = cc.egui_ctx.clone();
             let requests = Arc::new(tray::Requests::default());
             let wake = {
@@ -62,7 +65,7 @@ fn main() -> eframe::Result<()> {
                 });
             }
             let saved = settings::SettingsState::load();
-            i18n::set(saved.lang);
+            i18n::set(saved.effective_lang());
             let preferred = saved.hotkey;
             let tray = tray::install(requests.clone(), wake, preferred.as_deref()).ok();
             Ok(Box::new(app::WheretiApp::new(&ctx, requests, tray, visible)))
@@ -73,11 +76,21 @@ fn main() -> eframe::Result<()> {
 /// Segoe UI Variable - the font of the Windows 11 apps - in several weights
 /// from the one variable font file, with egui's fonts as fallback (emoji,
 /// symbols). On Windows 10 (no variable font): classic Segoe UI files.
-fn setup_fonts(ctx: &egui::Context) {
+/// `cjk`: also Microsoft YaHei (Chinese, Japanese kana) and Malgun Gothic
+/// (Korean), loaded only once such a name shows up: they take ~30 MB.
+pub(crate) fn setup_fonts(ctx: &egui::Context, cjk: bool) {
     use egui::epaint::text::{FontTweak, VariationCoords};
     let mut fonts = FontDefinitions::default();
     let dir = std::path::PathBuf::from(std::env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".into())).join("Fonts");
-    let fallback = fonts.families.get(&FontFamily::Proportional).cloned().unwrap_or_default();
+    let mut fallback = fonts.families.get(&FontFamily::Proportional).cloned().unwrap_or_default();
+    if cjk {
+        for (name, file) in [("cjk-zh", "msyh.ttc"), ("cjk-ko", "malgun.ttf")] {
+            if let Ok(bytes) = std::fs::read(dir.join(file)) {
+                fonts.font_data.insert(name.into(), Arc::new(FontData::from_owned(bytes)));
+                fallback.insert(0, name.to_string());
+            }
+        }
+    }
     // (family, weight, optical size, classic Segoe UI file)
     let styles: [(&str, f32, f32, &str); 5] = [
         ("body", 400.0, 11.0, "segoeui.ttf"),
