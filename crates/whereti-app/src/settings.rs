@@ -403,6 +403,14 @@ fn about(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
                         .size(13.0)
                         .color(p.text2),
                 );
+                ui.add_space(6.0);
+                // who builds it, in plain sight
+                ui.label(
+                    egui::RichText::new(format!("{} · © 2026", trf!("Made by {company}", company = "Software Hive S.R.L.")))
+                        .size(12.5)
+                        .family(crate::app::medium())
+                        .color(p.text),
+                );
             });
         });
         ui.add_space(14.0);
@@ -421,8 +429,6 @@ fn about(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
             info_row(ui, p, title, text);
         }
     });
-    ui.add_space(10.0);
-    ui.label(egui::RichText::new("© 2026 Software Hive S.R.L.").size(12.0).color(p.text3));
 }
 
 /// The shortcut row: the keys in use, "Change" to type new ones, and the

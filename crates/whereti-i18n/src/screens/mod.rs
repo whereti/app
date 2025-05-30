@@ -3,22 +3,13 @@
 use crate::Entry;
 
 pub mod common;
-pub mod dates;
-pub mod preview;
 pub mod search;
-pub mod settings;
-pub mod setup;
-pub mod tray;
+pub mod preview;
+pub mod dates;
 pub mod welcome;
+pub mod settings;
+pub mod tray;
+pub mod setup;
 
 /// Every catalog.
-pub const ALL: &[&[Entry]] = &[
-    common::ENTRIES,
-    search::ENTRIES,
-    preview::ENTRIES,
-    dates::ENTRIES,
-    welcome::ENTRIES,
-    settings::ENTRIES,
-    tray::ENTRIES,
-    setup::ENTRIES,
-];
+pub const ALL: &[&[Entry]] = &[common::ENTRIES, search::ENTRIES, preview::ENTRIES, dates::ENTRIES, welcome::ENTRIES, settings::ENTRIES, tray::ENTRIES, setup::ENTRIES];

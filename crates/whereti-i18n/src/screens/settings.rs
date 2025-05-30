@@ -337,6 +337,17 @@ pub const ENTRIES: &[Entry] = &[
         ro: "Căutare instantă de fișiere pentru Windows.",
     },
     Entry {
+        en: "Made by {company}",
+        note: "Settings > About, under the app name: who builds whereti. {company} is the company name, never translated.",
+        de: "Entwickelt von {company}",
+        es: "Creado por {company}",
+        fr: "Créé par {company}",
+        it: "Realizzato da {company}",
+        pl: "Tworzy {company}",
+        pt_br: "Feito por {company}",
+        ro: "Realizat de {company}",
+    },
+    Entry {
         en: "Private",
         note: "Title of a feature line on the Settings > About page about privacy.",
         de: "Privat",
