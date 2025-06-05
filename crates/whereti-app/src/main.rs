@@ -9,6 +9,7 @@ mod app;
 mod file_icons;
 mod i18n;
 mod icons;
+mod links;
 mod preview;
 mod recent;
 mod searcher;

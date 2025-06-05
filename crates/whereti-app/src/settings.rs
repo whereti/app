@@ -428,6 +428,30 @@ fn about(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
         ] {
             info_row(ui, p, title, text);
         }
+        line(ui, p);
+        ui.add_space(10.0);
+        // the website, for help and news; whereti itself never goes online
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 18.0;
+            for (label, url) in [
+                ("whereti.com", crate::links::SITE),
+                (tr("Questions and help"), crate::links::HELP),
+                (tr("Privacy"), crate::links::PRIVACY),
+                (tr("Source code"), crate::links::SOURCE),
+                (tr("Support whereti"), crate::links::SUPPORTER),
+            ] {
+                let link = ui
+                    .add(egui::Label::new(egui::RichText::new(label).size(13.0).color(p.accent)).sense(Sense::click()))
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .on_hover_text(url);
+                if link.clicked() {
+                    if let Err(e) = shell::open(url) {
+                        app.flash(e);
+                    }
+                }
+            }
+        });
+        ui.add_space(6.0);
     });
 }
 

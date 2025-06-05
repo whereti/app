@@ -92,7 +92,9 @@ fn silent_install() -> Result<(), String> {
 
 fn silent_uninstall() -> Result<(), String> {
     ops::set_autostart(false);
-    elevated_or_not("--do-uninstall", ops::uninstall)
+    elevated_or_not("--do-uninstall", ops::uninstall)?;
+    ops::remove_user_settings();
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -120,7 +122,7 @@ impl Setup {
         std::thread::spawn(move || {
             let result = if uninstall {
                 ops::set_autostart(false);
-                elevated_or_not("--do-uninstall", ops::uninstall)
+                elevated_or_not("--do-uninstall", ops::uninstall).map(|()| ops::remove_user_settings())
             } else {
                 elevated_or_not("--do-install", ops::install).map(|()| ops::set_autostart(autostart))
             };

@@ -188,7 +188,9 @@ fn register_uninstall(dir: &Path) -> Result<(), String> {
         ("DisplayIcon", format!("\"{}\",0", dir.join("whereti.exe").display())),
         ("UninstallString", uninstall.clone()),
         ("QuietUninstallString", format!("{uninstall} /S")),
-        ("URLInfoAbout", "https://whereti.com".to_string()),
+        ("URLInfoAbout", "https://whereti.com/".to_string()),
+        ("HelpLink", "https://whereti.com/faq/".to_string()),
+        ("URLUpdateInfo", "https://whereti.com/download/".to_string()),
     ];
     let dwords = [("EstimatedSize", size_kb), ("NoModify", 1), ("NoRepair", 1)];
     // SAFETY: a key we create and close; values are NUL-terminated UTF-16 / u32.
@@ -342,5 +344,13 @@ pub fn run_elevated(args: &str) -> Result<(), String> {
         } else {
             Err(if msg.is_empty() { format!("the installer stopped (code {code})") } else { msg })
         }
+    }
+}
+
+/// The user's settings (`%APPDATA%\whereti`). Runs in the user's own,
+/// non-elevated part: the elevated one may be another account's profile.
+pub fn remove_user_settings() {
+    if let Some(appdata) = std::env::var_os("APPDATA") {
+        let _ = std::fs::remove_dir_all(PathBuf::from(appdata).join("whereti"));
     }
 }
