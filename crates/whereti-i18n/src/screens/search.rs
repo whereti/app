@@ -74,7 +74,7 @@ pub const ENTRIES: &[Entry] = &[
     },
     Entry {
         en: "{PREFERRED_HOTKEY} is used by another app, so the shortcut is {k}",
-        note: "Brief notice (toast) in the search window; {PREFERRED_HOTKEY} is the default shortcut and {k} the one used instead, e.g. \"Ctrl+Alt+Space\".",
+        note: "Brief notice (toast) in the search window; {PREFERRED_HOTKEY} is the default shortcut and {k} the one used instead, e.g. \"Ctrl+Shift+Space\".",
         de: "{PREFERRED_HOTKEY} wird von einer anderen App verwendet, daher ist die Tastenkombination {k}",
         es: "{PREFERRED_HOTKEY} lo usa otra aplicación, así que el método abreviado es {k}",
         fr: "{PREFERRED_HOTKEY} est utilisé par une autre application, le raccourci est donc {k}",

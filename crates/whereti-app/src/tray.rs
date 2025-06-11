@@ -28,7 +28,9 @@ impl Requests {
 }
 
 /// Shortcuts suggested in Settings. The first free one is used by default.
-pub const HOTKEYS: [&str; 4] = ["Ctrl+Alt+Space", "Ctrl+Shift+Space", "Alt+Shift+Space", "Ctrl+Alt+W"];
+/// Not Ctrl+Alt+Space first: Claude desktop uses it, and whichever app
+/// starts first would take it from the other.
+pub const HOTKEYS: [&str; 4] = ["Ctrl+Shift+Space", "Ctrl+Alt+Space", "Alt+Shift+Space", "Ctrl+Alt+W"];
 pub const PREFERRED_HOTKEY: &str = HOTKEYS[0];
 
 /// The keys a shortcut can end with: egui's key, the name shown, the key

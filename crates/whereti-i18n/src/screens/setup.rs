@@ -85,7 +85,7 @@ pub const ENTRIES: &[Entry] = &[
     },
     Entry {
         en: "Open it anywhere with {hotkey}.",
-        note: "Installer bullet point; {hotkey} is the keyboard shortcut \"Ctrl+Alt+Space\".",
+        note: "Installer bullet point; {hotkey} is the keyboard shortcut \"Ctrl+Shift+Space\".",
         de: "Überall mit {hotkey} öffnen.",
         es: "Ábrelo desde cualquier lugar con {hotkey}.",
         fr: "Ouvrez-le de partout avec {hotkey}.",

@@ -96,7 +96,7 @@ pub const ENTRIES: &[Entry] = &[
     },
     Entry {
         en: "Press {hotkey} in any app to open whereti. You can search already.",
-        note: "Detail line of the last step on the welcome page; {hotkey} is the keyboard shortcut like \"Ctrl+Alt+Space\".",
+        note: "Detail line of the last step on the welcome page; {hotkey} is the keyboard shortcut like \"Ctrl+Shift+Space\".",
         de: "Drücken Sie {hotkey} in einer beliebigen App, um whereti zu öffnen. Sie können schon suchen.",
         es: "Pulsa {hotkey} en cualquier aplicación para abrir whereti. Ya puedes buscar.",
         fr: "Appuyez sur {hotkey} dans n'importe quelle application pour ouvrir whereti. Vous pouvez déjà rechercher.",

@@ -327,7 +327,7 @@ impl eframe::App for Setup {
                             for line in [
                                 tr("Free and open source (MIT). Nothing leaves your PC."),
                                 tr("Builds its index in the background, without slowing the PC."),
-                                &trf!("Open it anywhere with {hotkey}.", hotkey = "Ctrl+Alt+Space"),
+                                &trf!("Open it anywhere with {hotkey}.", hotkey = "Ctrl+Shift+Space"),
                             ] {
                                 ui.horizontal(|ui| {
                                     let (r, _) = ui.allocate_exact_size(Vec2::new(16.0, 18.0), Sense::hover());

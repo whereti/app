@@ -8,7 +8,7 @@ use crate::Entry;
 pub const ENTRIES: &[Entry] = &[
     Entry {
         en: "Search…",
-        note: "Tray menu item that opens the search window; shown followed by the shortcut, e.g. \"Search… Ctrl+Alt+Space\"; keep the ellipsis.",
+        note: "Tray menu item that opens the search window; shown followed by the shortcut, e.g. \"Search… Ctrl+Shift+Space\"; keep the ellipsis.",
         de: "Suchen…",
         es: "Buscar…",
         fr: "Rechercher…",
@@ -52,7 +52,7 @@ pub const ENTRIES: &[Entry] = &[
     },
     Entry {
         en: "{label} is used by another app",
-        note: "Error message shown in a toast; {label} is a key combination like \"Ctrl+Alt+Space\" already taken by another program.",
+        note: "Error message shown in a toast; {label} is a key combination like \"Ctrl+Shift+Space\" already taken by another program.",
         de: "{label} wird von einer anderen App verwendet",
         es: "{label} lo usa otra aplicación",
         fr: "{label} est utilisé par une autre application",

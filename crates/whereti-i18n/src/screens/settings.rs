@@ -547,7 +547,7 @@ pub const ENTRIES: &[Entry] = &[
     },
     Entry {
         en: "The shortcut is now {label}",
-        note: "Brief notice (toast) after the shortcut changes; {label} is a key combination like \"Ctrl+Alt+Space\".",
+        note: "Brief notice (toast) after the shortcut changes; {label} is a key combination like \"Ctrl+Shift+Space\".",
         de: "Die Tastenkombination ist jetzt {label}",
         es: "El método abreviado ahora es {label}",
         fr: "Le raccourci est maintenant {label}",
