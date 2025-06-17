@@ -169,6 +169,20 @@ pub fn scan_volume(letter: char, threads: usize) -> Result<Option<VolumeScan>, S
     }))
 }
 
+/// Scans any drive: through the MFT when it is NTFS, else by walking its
+/// folders (crate::walk). An NTFS drive whose MFT cannot be read is walked too.
+pub fn scan_any(drive: &crate::walk::Drive, threads: usize) -> Result<VolumeScan, String> {
+    if drive.is_ntfs() {
+        match scan_volume(drive.letter, threads) {
+            Ok(Some(scan)) => return Ok(scan),
+            Ok(None) => {}
+            Err(e) if e.starts_with("access denied") => return Err(e),
+            Err(_) => {} // e.g. a BitLocker or damaged volume: walk it instead
+        }
+    }
+    crate::walk::walk(drive).map_err(|e| format!("{}: cannot read the drive: {e}", drive.letter))
+}
+
 pub fn open_volumes(index: &NameIndex) -> Result<Vec<Volume>, String> {
     index
         .volumes()
@@ -206,9 +220,10 @@ pub fn fixed_drives() -> Vec<char> {
         .collect()
 }
 
-/// New journal records for one volume, sent by a reader thread.
+/// New journal records for one volume, sent by a reader thread. Volumes are
+/// named by letter: their order in the index changes when drives come and go.
 pub struct JournalMsg {
-    pub vol: usize,
+    pub letter: char,
     pub changes: Vec<UsnChange>,
     pub next: i64,
     pub error: Option<String>,
@@ -218,7 +233,6 @@ pub struct JournalMsg {
 /// forwards them. Uses its own handle, so a blocked read never holds up the
 /// record reads on the caller's handle.
 pub fn follow_journal<M: From<JournalMsg> + Send + 'static>(
-    v: usize,
     letter: char,
     journal_id: u64,
     mut pos: i64,
@@ -227,7 +241,7 @@ pub fn follow_journal<M: From<JournalMsg> + Send + 'static>(
     let vol = match Volume::open(letter, false) {
         Ok(vol) => vol,
         Err(e) => {
-            let _ = tx.send(JournalMsg { vol: v, changes: Vec::new(), next: pos, error: Some(e.to_string()) }.into());
+            let _ = tx.send(JournalMsg { letter, changes: Vec::new(), next: pos, error: Some(e.to_string()) }.into());
             return;
         }
     };
@@ -245,14 +259,14 @@ pub fn follow_journal<M: From<JournalMsg> + Send + 'static>(
                 }
                 pos = next.max(pos);
                 if !changes.is_empty()
-                    && tx.send(JournalMsg { vol: v, changes, next: pos, error: None }.into()).is_err()
+                    && tx.send(JournalMsg { letter, changes, next: pos, error: None }.into()).is_err()
                 {
                     return;
                 }
             }
             Err(e) => {
                 let msg = format!("{letter}: journal: {e}");
-                let _ = tx.send(JournalMsg { vol: v, changes: Vec::new(), next: pos, error: Some(msg) }.into());
+                let _ = tx.send(JournalMsg { letter, changes: Vec::new(), next: pos, error: Some(msg) }.into());
                 return;
             }
         }

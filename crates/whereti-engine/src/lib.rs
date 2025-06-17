@@ -9,6 +9,7 @@ pub mod engine;
 pub mod log;
 pub mod sync;
 pub mod system;
+pub mod walk;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};

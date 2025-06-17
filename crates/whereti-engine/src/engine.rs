@@ -9,7 +9,7 @@
 //! - Nothing is lost on a crash: the journal position is saved with the
 //!   index, and the next start replays everything after it.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
@@ -17,7 +17,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use parking_lot::{Mutex, RwLock};
-use whereti_core::{build, snapshot, ApplyStats, Exclusions, NameIndex, SearchOptions, SortBy};
+use whereti_core::{build, snapshot, ApplyStats, Exclusions, NameIndex, SearchOptions, SortBy, VolumeScan};
 use whereti_ipc::{
     Caller, ConfigReply, Request, Response, Row, SearchReply, Sort, StatusReply, VolumeStatus, PROTOCOL_VERSION,
 };
@@ -27,6 +27,7 @@ use crate::content::{self, Content};
 use crate::log::Logger;
 use crate::sync::{self, Batch, JournalMsg, JournalRead, Prefetched};
 use crate::system::{self, Background};
+use crate::walk::{self, Drive, WALKED};
 
 /// Re-read files still open for writing this often.
 const OPEN_REFRESH: Duration = Duration::from_secs(30);
@@ -36,6 +37,12 @@ const BATCH_WINDOW: Duration = Duration::from_millis(250);
 const IDLE_FOR_RECONCILE: Duration = Duration::from_secs(60);
 /// Compact when renamed/added/removed entries exceed this share of the index.
 const COMPACT_AT: f64 = 0.01;
+/// How often the list of drives is checked (a USB stick plugged in or out).
+const DRIVE_CHECK: Duration = Duration::from_secs(3);
+/// Drives without a journal are walked again at most this often...
+const WALK_MIN: Duration = Duration::from_secs(60);
+/// ...and at least this often; in between, by how long a walk takes.
+const WALK_MAX: Duration = Duration::from_secs(30 * 60);
 /// The most results one search may return.
 const MAX_LIMIT: u32 = 10_000;
 /// Save once the journal has moved this share of its size since the last save,
@@ -284,8 +291,15 @@ struct Worker {
     shared: Arc<Shared>,
     cfg: Config,
     tx: mpsc::Sender<Msg>,
-    vols: Vec<Volume>,
+    /// Per volume in index order: the open volume, `None` for a walked drive
+    /// (or an NTFS drive that could not be opened).
+    vols: Vec<Option<Volume>>,
     open: Vec<HashSet<u64>>,
+    /// Drives with a journal reader thread running.
+    followed: HashSet<char>,
+    /// Walked drives: when, how long it took, and what was found.
+    walks: HashMap<char, (Instant, Duration, u64)>,
+    last_drive_check: Instant,
     /// Per volume: journal size, and journal position at the last save.
     journal_max: Vec<u64>,
     saved_usn: Vec<i64>,
@@ -306,6 +320,9 @@ impl Worker {
             tx,
             vols: Vec::new(),
             open: Vec::new(),
+            followed: HashSet::new(),
+            walks: HashMap::new(),
+            last_drive_check: now,
             journal_max: Vec::new(),
             saved_usn: Vec::new(),
             pool: system::maintenance_pool(),
@@ -403,14 +420,24 @@ impl Worker {
             Exclusions::previous_defaults(windows.as_deref()).paths.iter().map(|p| p.to_lowercase()).collect();
         let has: HashSet<String> = index.exclusions().iter().map(|p| p.to_lowercase()).collect();
         let upgrade_defaults = has == old;
-        self.vols = sync::open_volumes(&index)?;
-        self.open = vec![HashSet::new(); self.vols.len()];
-        self.journal_max = self.vols.iter().map(|v| v.query_usn_journal().map_or(0, |j| j.maximum_size)).collect();
-        self.saved_usn = index.volumes().iter().map(|v| v.next_usn).collect();
+        // Drives that are gone (an external disk unplugged while the PC was
+        // off) leave the index; drives that are new get scanned below.
+        let present = walk::drives();
+        let indexed: Vec<char> = index.volumes().iter().map(|v| v.letter()).collect();
+        let gone: Vec<char> = indexed.iter().copied().filter(|l| !present.iter().any(|d| d.letter == *l)).collect();
+        let index = if gone.is_empty() {
+            index
+        } else {
+            self.log(format!("{} no longer connected: left out of the index", letters_text(&gone)));
+            self.dirty = true;
+            self.pool.install(|| index.rebuild(Vec::new(), &gone))
+        };
+        let mut rescan: Vec<char> =
+            present.iter().map(|d| d.letter).filter(|l| !indexed.contains(l)).collect();
         *self.shared.index.write() = Some(index);
+        self.reopen();
 
         self.shared.set_state("catching up");
-        let mut rescan = Vec::new();
         for v in 0..self.vols.len() {
             let letter = self.letter(v);
             let t = Instant::now();
@@ -434,9 +461,7 @@ impl Worker {
         if !rescan.is_empty() {
             self.rescan(&rescan)?;
         }
-        for v in 0..self.vols.len() {
-            self.spawn_follower(v);
-        }
+        self.follow_all();
         self.shared.set_state("ready");
         self.log(format!("ready in {} ms", t.elapsed().as_millis()));
         if upgrade_defaults {
@@ -453,7 +478,8 @@ impl Worker {
     /// Replays the journal for volume `v`. `None` if it must be rescanned.
     fn catch_up(&mut self, v: usize) -> Result<Option<(usize, ApplyStats)>, String> {
         let info = self.shared.index.read().as_ref().expect("index").volumes()[v];
-        match sync::read_since(&info, &self.vols[v], &mut self.open[v])? {
+        let Some(vol) = self.vols[v].as_ref() else { return Ok(None) };
+        match sync::read_since(&info, vol, &mut self.open[v])? {
             JournalRead::Changes { batch, journal_records, journal_id, next_usn } => {
                 let stats = self.apply_batch(v, batch, journal_id, next_usn)?;
                 Ok(Some((journal_records, stats)))
@@ -468,7 +494,8 @@ impl Worker {
     /// Phase 1 (no lock): read current record states. Phase 2 (write lock):
     /// apply them and move the journal position.
     fn apply_batch(&mut self, v: usize, batch: Batch, journal_id: u64, next_usn: i64) -> Result<ApplyStats, String> {
-        let mut pre = Prefetched::read(&self.vols[v], &batch.records).map_err(|e| format!("reading MFT records: {e}"))?;
+        let vol = self.vols[v].as_ref().ok_or("the drive is not open")?;
+        let mut pre = Prefetched::read(vol, &batch.records).map_err(|e| format!("reading MFT records: {e}"))?;
         let records = batch.records.clone();
         let stats = {
             let mut guard = self.shared.index.write();
@@ -495,16 +522,22 @@ impl Worker {
 
     fn apply_msgs(&mut self, msgs: Vec<JournalMsg>) -> Result<(), String> {
         for v in 0..self.vols.len() {
-            let mine: Vec<&JournalMsg> = msgs.iter().filter(|m| m.vol == v).collect();
+            let letter = self.letter(v);
+            let mine: Vec<&JournalMsg> = msgs.iter().filter(|m| m.letter == letter).collect();
             if mine.is_empty() {
                 continue;
             }
-            let letter = self.letter(v);
             if let Some(err) = mine.iter().find_map(|m| m.error.as_ref()) {
-                self.log(format!("{err} → full rescan"));
+                self.followed.remove(&letter);
+                if walk::drives().iter().any(|d| d.letter == letter) {
+                    self.log(format!("{err} → full rescan"));
+                } else {
+                    self.log(format!("{letter}: disconnected"));
+                }
+                // rescan() also drops the drive when it is gone
                 self.rescan(&[letter])?;
-                self.spawn_follower(v);
-                continue;
+                self.follow_all();
+                return Ok(()); // volume order may have changed
             }
             let t = Instant::now();
             let mut batch = Batch::default();
@@ -537,10 +570,15 @@ impl Worker {
     }
 
     fn timers(&mut self) -> Result<(), String> {
+        if self.last_drive_check.elapsed() >= DRIVE_CHECK {
+            self.last_drive_check = Instant::now();
+            self.check_drives()?;
+            self.walk_due()?;
+        }
         if self.last_refresh.elapsed() >= OPEN_REFRESH {
             self.last_refresh = Instant::now();
             for v in 0..self.vols.len() {
-                if self.open[v].is_empty() {
+                if self.open[v].is_empty() || self.vols[v].is_none() {
                     continue;
                 }
                 let records: Vec<u64> = self.open[v].iter().copied().collect();
@@ -614,19 +652,32 @@ impl Worker {
         let t = Instant::now();
         let list: String = letters.iter().map(|l| format!("{l}:")).collect::<Vec<_>>().join(" ");
         self.shared.set_state(format!("rescanning {list}"));
+        let present = walk::drives();
         let mut fresh = Vec::new();
+        let mut gone = Vec::new();
         for &l in letters {
-            fresh.extend(sync::scan_volume(l, self.cfg.threads)?);
+            match present.iter().find(|d| d.letter == l) {
+                Some(d) => fresh.push(self.scan(d)?),
+                None => gone.push(l),
+            }
         }
         let rebuilt = {
             let guard = self.shared.index.read();
             let idx = guard.as_ref().expect("index");
-            self.pool.install(|| idx.rebuild_with(fresh))
+            self.pool.install(|| idx.rebuild(fresh, &gone))
         };
         *self.shared.index.write() = Some(rebuilt);
-        for (v, open) in self.open.iter_mut().enumerate() {
-            if letters.contains(&self.shared.index.read().as_ref().expect("index").volumes()[v].letter()) {
-                open.clear();
+        for l in &gone {
+            self.walks.remove(l);
+        }
+        let open_before = self.open_by_letter();
+        self.reopen();
+        for v in 0..self.vols.len() {
+            let l = self.letter(v);
+            if !letters.contains(&l) {
+                if let Some(o) = open_before.get(&l) {
+                    self.open[v] = o.clone();
+                }
             }
         }
         for v in 0..self.vols.len() {
@@ -657,14 +708,12 @@ impl Worker {
             guard.as_ref().expect("index").volumes().iter().map(|v| v.letter()).collect()
         };
         let mut scans = Vec::new();
-        for &l in &letters {
-            scans.extend(sync::scan_volume(l, self.cfg.threads)?);
+        for d in walk::drives().iter().filter(|d| letters.contains(&d.letter)) {
+            scans.push(self.scan(d)?);
         }
         let (fresh, stats) = self.pool.install(|| build(scans, &Exclusions { paths }));
         *self.shared.index.write() = Some(fresh);
-        for open in &mut self.open {
-            open.clear();
-        }
+        self.reopen();
         // replay what changed during the scans
         for v in 0..self.vols.len() {
             self.catch_up(v)?;
@@ -699,28 +748,153 @@ impl Worker {
         Ok(())
     }
 
-    fn spawn_follower(&self, v: usize) {
-        let info = self.shared.index.read().as_ref().expect("index").volumes()[v];
-        let tx = self.tx.clone();
-        let _ = std::thread::Builder::new()
-            .name(format!("journal-{}", info.letter()))
-            .spawn(move || sync::follow_journal::<Msg>(v, info.letter(), info.journal_id, info.next_usn, tx));
+    /// A journal reader for every NTFS drive that has none yet.
+    fn follow_all(&mut self) {
+        let infos: Vec<_> = self.shared.index.read().as_ref().expect("index").volumes().to_vec();
+        for (v, info) in infos.into_iter().enumerate() {
+            let letter = info.letter();
+            if self.vols[v].is_none() || info.journal_id == WALKED || !self.followed.insert(letter) {
+                continue;
+            }
+            let tx = self.tx.clone();
+            let _ = std::thread::Builder::new()
+                .name(format!("journal-{letter}"))
+                .spawn(move || sync::follow_journal::<Msg>(letter, info.journal_id, info.next_usn, tx));
+        }
+    }
+
+    /// Opens the volumes again after the index's drives changed, and sizes
+    /// the per-volume lists to match.
+    fn reopen(&mut self) {
+        let infos: Vec<_> = self.shared.index.read().as_ref().expect("index").volumes().to_vec();
+        self.vols = infos
+            .iter()
+            .map(|i| if i.journal_id == WALKED { None } else { Volume::open(i.letter(), false).ok() })
+            .collect();
+        self.open = vec![HashSet::new(); infos.len()];
+        self.journal_max = self
+            .vols
+            .iter()
+            .map(|v| v.as_ref().and_then(|v| v.query_usn_journal().ok()).map_or(0, |j| j.maximum_size))
+            .collect();
+        self.saved_usn = infos.iter().map(|v| v.next_usn).collect();
+    }
+
+    fn open_by_letter(&self) -> HashMap<char, HashSet<u64>> {
+        (0..self.open.len()).map(|v| (self.letter(v), self.open[v].clone())).collect()
+    }
+
+    /// Scans one drive (MFT or walk) and remembers walks for `walk_due`.
+    fn scan(&mut self, d: &Drive) -> Result<VolumeScan, String> {
+        let t = Instant::now();
+        let s = sync::scan_any(d, self.cfg.threads)?;
+        if s.journal_id == WALKED {
+            self.walks.insert(d.letter, (Instant::now(), t.elapsed(), walk::fingerprint(&s)));
+        }
+        Ok(s)
+    }
+
+    /// Adds drives that appeared and drops drives that are gone.
+    fn check_drives(&mut self) -> Result<(), String> {
+        let present = walk::drives();
+        let indexed: Vec<(char, u64, bool)> = {
+            let guard = self.shared.index.read();
+            guard.as_ref().expect("index").volumes().iter().map(|v| (v.letter(), v.serial, v.journal_id == WALKED)).collect()
+        };
+        let mut changed: Vec<char> = present
+            .iter()
+            .filter(|d| !indexed.iter().any(|(l, _, _)| *l == d.letter))
+            .map(|d| d.letter)
+            .collect();
+        for &(l, serial, walked) in &indexed {
+            match present.iter().find(|d| d.letter == l) {
+                None => changed.push(l),
+                // another stick under the same letter
+                Some(d) if walked && d.serial != serial => changed.push(l),
+                Some(_) => {}
+            }
+        }
+        if changed.is_empty() {
+            return Ok(());
+        }
+        changed.sort();
+        self.log(format!("drives changed: {}", letters_text(&changed)));
+        self.rescan(&changed)?;
+        self.follow_all();
+        Ok(())
+    }
+
+    /// Walks drives without a journal again when it is their turn, and
+    /// rebuilds only if the walk found a change. Small drives (a USB stick)
+    /// are walked every minute, big ones less often.
+    fn walk_due(&mut self) -> Result<(), String> {
+        if self.last_change.elapsed() < Duration::from_secs(5) {
+            return Ok(()); // the PC is busy writing files: later
+        }
+        let due: Vec<char> = self
+            .walks
+            .iter()
+            .filter(|(_, (at, took, _))| at.elapsed() >= (*took * 60).clamp(WALK_MIN, WALK_MAX))
+            .map(|(l, _)| *l)
+            .collect();
+        for letter in due {
+            let Some(d) = walk::drives().into_iter().find(|d| d.letter == letter) else { continue };
+            let before = self.walks.get(&letter).map(|w| w.2);
+            let _bg = Background::begin();
+            let s = match self.scan(&d) {
+                Ok(s) => s,
+                Err(e) => {
+                    self.log(e);
+                    continue;
+                }
+            };
+            if before == Some(walk::fingerprint(&s)) {
+                continue;
+            }
+            let t = Instant::now();
+            let rebuilt = {
+                let guard = self.shared.index.read();
+                let idx = guard.as_ref().expect("index");
+                self.pool.install(|| idx.rebuild(vec![s], &[]))
+            };
+            *self.shared.index.write() = Some(rebuilt);
+            let open_before = self.open_by_letter();
+            self.reopen();
+            for v in 0..self.vols.len() {
+                if let Some(o) = open_before.get(&self.letter(v)) {
+                    self.open[v] = o.clone();
+                }
+            }
+            self.dirty = true;
+            self.last_change = Instant::now();
+            *self.shared.last_change.lock() = Some(self.last_change);
+            if let Some(c) = self.shared.content.get() {
+                c.recheck();
+            }
+            self.log(format!("{letter}: changes found, index updated in {} ms", t.elapsed().as_millis()));
+        }
+        Ok(())
     }
 
     fn build_fresh(&mut self) -> Result<NameIndex, String> {
         let t = Instant::now();
         let mut scans = Vec::new();
-        let drives = sync::fixed_drives();
-        for (k, letter) in drives.iter().copied().enumerate() {
+        let drives = walk::drives();
+        for (k, d) in drives.iter().enumerate() {
+            let letter = d.letter;
             // "indexing C: 1/2": the app shows it as progress on first start
             self.shared.set_state(format!("indexing {letter}: {}/{}", k + 1, drives.len()));
-            if let Some(s) = sync::scan_volume(letter, self.cfg.threads)? {
-                self.log(format!("{letter}: scanned {} entries", s.scan.entries.len()));
-                scans.push(s);
+            match self.scan(d) {
+                Ok(s) => {
+                    self.log(format!("{letter}: scanned {} entries ({})", s.scan.entries.len(), d.fs));
+                    scans.push(s);
+                }
+                Err(e) if d.letter == system_drive() => return Err(e),
+                Err(e) => self.log(format!("{e}; skipped")),
             }
         }
         if scans.is_empty() {
-            return Err("no NTFS volume to index".into());
+            return Err("no drive to index".into());
         }
         let windows = (!self.cfg.include_windows).then(|| std::env::var("SystemRoot").ok()).flatten();
         let (idx, stats) = build(scans, &Exclusions::defaults(windows.as_deref()));
@@ -732,6 +906,16 @@ impl Worker {
         ));
         Ok(idx)
     }
+}
+
+/// "C: D:"
+fn letters_text(letters: &[char]) -> String {
+    letters.iter().map(|l| format!("{l}:")).collect::<Vec<_>>().join(" ")
+}
+
+/// The drive Windows runs from: if it cannot be indexed, nothing works.
+fn system_drive() -> char {
+    std::env::var("SystemDrive").ok().and_then(|s| s.chars().next()).unwrap_or('C').to_ascii_uppercase()
 }
 
 /// The exclusions of a fresh install (PLAN.md §5).

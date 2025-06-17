@@ -450,11 +450,18 @@ impl NameIndex {
     /// A clean index where the given volumes come from fresh scans and the
     /// others from this index (used when a volume's journal cannot be replayed).
     pub fn rebuild_with(&self, fresh: Vec<VolumeScan>) -> NameIndex {
+        self.rebuild(fresh, &[])
+    }
+
+    /// Like `rebuild_with`, and also drops the volumes in `remove` (a USB
+    /// stick taken out, a drive that is gone).
+    pub fn rebuild(&self, fresh: Vec<VolumeScan>, remove: &[char]) -> NameIndex {
         let exclusions = Exclusions { paths: self.exclusions.clone() };
         let mut scans: Vec<VolumeScan> = self
             .to_scans()
             .into_iter()
             .filter(|s| !fresh.iter().any(|f| f.letter.eq_ignore_ascii_case(&s.letter)))
+            .filter(|s| !remove.iter().any(|r| r.eq_ignore_ascii_case(&s.letter)))
             .collect();
         scans.extend(fresh);
         scans.sort_by_key(|s| s.letter.to_ascii_uppercase());
