@@ -284,6 +284,11 @@ pub fn launch_app() {
     let _ = Command::new(install_dir().join("whereti.exe")).arg("--welcome").spawn();
 }
 
+/// Opens whereti as usual, without the welcome page (after an update).
+pub fn open_app() {
+    let _ = Command::new(install_dir().join("whereti.exe")).spawn();
+}
+
 // ---------------------------------------------------------------- elevation
 
 pub fn is_elevated() -> bool {

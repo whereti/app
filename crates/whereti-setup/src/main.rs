@@ -43,6 +43,11 @@ fn main() {
     let uninstalling = has("/uninstall") || has("--uninstall");
     if has("/S") || has("/silent") {
         let result = if uninstalling { silent_uninstall() } else { silent_install() };
+        // `/open`: an update started from whereti itself, which the install
+        // closed; open the new version so the user is back where they were
+        if result.is_ok() && !uninstalling && has("/open") {
+            ops::open_app();
+        }
         std::process::exit(if result.is_ok() { 0 } else { 1 });
     }
 

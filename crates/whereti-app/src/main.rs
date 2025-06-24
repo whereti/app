@@ -18,6 +18,7 @@ mod settings;
 mod shell;
 mod theme;
 mod tray;
+mod update;
 mod welcome;
 mod win;
 

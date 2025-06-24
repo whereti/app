@@ -249,17 +249,6 @@ pub const ENTRIES: &[Entry] = &[
         ro: "Ceva n-a mers",
     },
     Entry {
-        en: "Try again",
-        note: "Installer button to retry after an error; short.",
-        de: "Erneut versuchen",
-        es: "Reintentar",
-        fr: "Réessayer",
-        it: "Riprova",
-        pl: "Spróbuj ponownie",
-        pt_br: "Tentar novamente",
-        ro: "Încearcă din nou",
-    },
-    Entry {
         en: "Remove whereti?",
         note: "Installer title of the uninstall confirmation question.",
         de: "whereti entfernen?",

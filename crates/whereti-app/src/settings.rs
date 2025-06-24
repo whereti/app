@@ -35,6 +35,8 @@ pub struct SettingsState {
     pub welcomed: bool,
     /// The preview panel is open.
     pub preview: bool,
+    /// Ask whereti.com once a day whether a new version exists.
+    pub updates: bool,
     /// The chosen language; `None` = the Windows display language.
     pub lang: Option<Lang>,
     config: Option<ConfigReply>,
@@ -60,6 +62,7 @@ impl SettingsState {
             welcomed: false,
             preview: true,
             lang: None,
+            updates: true,
             config: None,
             exclusions: Vec::new(),
             section: Section::General,
@@ -76,6 +79,7 @@ impl SettingsState {
                     Some(("preview", "off")) => s.preview = false,
                     Some(("language", v)) => s.lang = Lang::from_code(v),
                     Some(("welcomed", "yes")) => s.welcomed = true,
+                    Some(("updates", "off")) => s.updates = false,
                     _ => {}
                 }
             }
@@ -102,6 +106,9 @@ impl SettingsState {
         );
         if let Some(h) = &self.hotkey {
             text.push_str(&format!("hotkey={h}\n"));
+        }
+        if !self.updates {
+            text.push_str("updates=off\n");
         }
         let path = settings_file();
         if let Some(dir) = path.parent() {
@@ -256,6 +263,20 @@ fn general(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette, ctx: &egui::Con
                         Ok(()) => app.settings.autostart = on,
                         Err(e) => app.flash(e),
                     }
+                }
+            },
+        );
+        line(ui, p);
+        row(
+            ui,
+            p,
+            tr("Check for updates"),
+            tr("Once a day, whereti asks whereti.com if there is a new version. Only its version number is sent."),
+            |ui| {
+                let mut on = app.settings.updates;
+                if toggle(ui, p, &mut on).clicked() {
+                    app.settings.updates = on;
+                    app.settings.save();
                 }
             },
         );
@@ -415,10 +436,12 @@ fn about(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
         });
         ui.add_space(14.0);
         line(ui, p);
+        update_row(app, ui, p);
+        line(ui, p);
         for (title, text) in [
             (
                 tr("Private"),
-                tr("Everything stays on your PC. No account, no tracking, no internet needed."),
+                tr("Your files never leave your PC. No account, no tracking."),
             ),
             (tr("Open source"), tr("Free, under the MIT license.")),
             (
@@ -430,7 +453,7 @@ fn about(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
         }
         line(ui, p);
         ui.add_space(10.0);
-        // the website, for help and news; whereti itself never goes online
+        // the website, for help and news
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 18.0;
             for (label, url) in [
@@ -452,6 +475,61 @@ fn about(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
             }
         });
         ui.add_space(6.0);
+    });
+}
+
+/// The update state in About: up to date, a new version to install, the
+/// download, or what went wrong.
+fn update_row(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
+    use crate::update::Phase;
+    let ctx = ui.ctx().clone();
+    let phase = app.updater.phase();
+    let (title, desc): (String, String) = match &phase {
+        Phase::Offered(o) => (
+            trf!("whereti {version} is available", version = o.version),
+            o.notes.lines().next().filter(|l| !l.trim().is_empty()).map(str::to_string)
+                .unwrap_or_else(|| tr("A new version is ready to install.").to_string()),
+        ),
+        Phase::Downloading { done, total, .. } => (
+            tr("Downloading the update…").to_string(),
+            if *total > 0 { format!("{} %", done * 100 / total) } else { shell::size(*done) },
+        ),
+        Phase::Installing => (
+            tr("Installing the update").to_string(),
+            tr("Windows asks for permission, then whereti opens again.").to_string(),
+        ),
+        Phase::Failed(e) => (tr("The update did not install").to_string(), e.clone()),
+        Phase::Idle if app.settings.updates => (
+            tr("whereti is up to date").to_string(),
+            match app.updater.last_check() {
+                Some(t) => {
+                    let minutes = ((t + 11_644_473_600) / 60) as u32;
+                    let when = crate::app::relative_time(minutes, shell::tz_offset(), crate::app::now_minutes());
+                    trf!("Last checked: {when}", when)
+                }
+                None => tr("Not checked yet. whereti checks once a day.").to_string(),
+            },
+        ),
+        Phase::Idle => (
+            tr("Checking for updates is off").to_string(),
+            tr("Turn it on in General, or get new versions from whereti.com.").to_string(),
+        ),
+    };
+    row(ui, p, &title, &desc, |ui| match phase {
+        Phase::Offered(_) => {
+            if button(ui, p, tr("Install update"), true).clicked() {
+                app.updater.install(&ctx);
+            }
+        }
+        Phase::Failed(_) => {
+            if button(ui, p, tr("Try again"), false).clicked() {
+                app.updater.retry();
+            }
+        }
+        Phase::Downloading { .. } | Phase::Installing => {
+            ui.add(egui::Spinner::new().size(18.0).color(p.accent));
+        }
+        Phase::Idle => {}
     });
 }
 

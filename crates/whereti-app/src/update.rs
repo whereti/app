@@ -1,0 +1,571 @@
+//! Updates (PLAN.md §40), the way SilentSilo does them.
+//!
+//! - **At most one check a day, for real.** The time of a check is written to
+//!   disk *before* the request goes out. A restart, a crash, waking from sleep
+//!   or a failed request never leads to a second one; a check that fails waits
+//!   for the next day like any other. If the clock goes back, the wait starts
+//!   again from now. Only the search window checks, and it runs once.
+//! - **What it sends:** `GET https://releases.whereti.com/windows/{arch}/{version}`
+//!   and nothing else: no identifier, no cookies (switched off in WinHTTP).
+//! - **Installing needs a click.** The installer comes from whereti's GitHub
+//!   releases only, and runs only if its SHA-256 matches the manifest and it
+//!   carries a valid Authenticode signature from Software Hive S.R.L. So the
+//!   endpoint serving wrong data can break updating, never install code.
+//! - Settings can turn the check off; then nothing is ever sent.
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use eframe::egui;
+use parking_lot::Mutex;
+
+pub const ENDPOINT: &str = "https://releases.whereti.com";
+/// Installers are only ever downloaded from here.
+const DOWNLOADS: &str = "https://github.com/whereti/whereti/releases/download/";
+const PUBLISHER: &str = "Software Hive S.R.L.";
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+const DAY_SECS: u64 = 24 * 3600;
+/// How often the window looks at the day gate (a file read, nothing sent).
+const LOOK_EVERY: Duration = Duration::from_secs(10 * 60);
+const MAX_INSTALLER: u64 = 200 << 20;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Offer {
+    pub version: String,
+    pub notes: String,
+    pub url: String,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Phase {
+    Idle,
+    Offered(Offer),
+    Downloading { version: String, done: u64, total: u64 },
+    /// The installer is running (Windows asks for permission); whereti closes.
+    Installing,
+    Failed(String),
+}
+
+pub struct Updater {
+    phase: Arc<Mutex<Phase>>,
+    next_look: Instant,
+}
+
+fn state_file() -> PathBuf {
+    let base = std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
+    base.join("whereti").join("update.txt")
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+/// What `update.txt` holds: when the last check went out, and an update it
+/// found (so a restart does not need another check to show it again).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct Saved {
+    last_check: Option<u64>,
+    offer: Option<Offer>,
+}
+
+impl Saved {
+    fn load(path: &Path) -> Saved {
+        let mut s = Saved::default();
+        let Ok(text) = std::fs::read_to_string(path) else { return s };
+        let (mut version, mut url, mut sha256, mut notes) = (None, None, None, String::new());
+        for line in text.lines() {
+            match line.split_once('=') {
+                Some(("last_check", v)) => s.last_check = v.trim().parse().ok(),
+                Some(("offer_version", v)) => version = Some(v.trim().to_string()),
+                Some(("offer_url", v)) => url = Some(v.trim().to_string()),
+                Some(("offer_sha256", v)) => sha256 = Some(v.trim().to_string()),
+                Some(("offer_notes", v)) => notes = v.trim().replace("\\n", "\n"),
+                _ => {}
+            }
+        }
+        if let (Some(version), Some(url), Some(sha256)) = (version, url, sha256) {
+            s.offer = Some(Offer { version, notes, url, sha256 });
+        }
+        s
+    }
+
+    /// Written to a temporary file and renamed: a half-written file never
+    /// replaces a good one. Returns false if it could not be written.
+    fn save(&self, path: &Path) -> bool {
+        let mut text = String::new();
+        if let Some(t) = self.last_check {
+            text.push_str(&format!("last_check={t}\n"));
+        }
+        if let Some(o) = &self.offer {
+            text.push_str(&format!(
+                "offer_version={}\noffer_url={}\noffer_sha256={}\noffer_notes={}\n",
+                o.version,
+                o.url,
+                o.sha256,
+                o.notes.replace('\n', "\\n")
+            ));
+        }
+        let _ = std::fs::create_dir_all(path.parent().unwrap_or(Path::new(".")));
+        let tmp = path.with_extension("new");
+        let ok = std::fs::write(&tmp, text).is_ok() && std::fs::rename(&tmp, path).is_ok();
+        ok && Saved::load(path) == *self
+    }
+}
+
+/// Whether a check may go out now, given the last one. A last check in the
+/// future means the clock went back: not due, and the wait restarts.
+fn due(last: Option<u64>, now: u64) -> Result<bool, u64> {
+    match last {
+        None => Ok(true),
+        Some(t) if t > now => Err(now),
+        Some(t) => Ok(now - t >= DAY_SECS),
+    }
+}
+
+impl Updater {
+    pub fn new() -> Updater {
+        let saved = Saved::load(&state_file());
+        let phase = match saved.offer {
+            Some(o) if newer(&o.version, VERSION) => Phase::Offered(o),
+            _ => Phase::Idle,
+        };
+        // the first look waits a minute, so a check never slows the start
+        Updater { phase: Arc::new(Mutex::new(phase)), next_look: Instant::now() + Duration::from_secs(60) }
+    }
+
+    pub fn phase(&self) -> Phase {
+        self.phase.lock().clone()
+    }
+
+    /// The last check, as Unix seconds.
+    pub fn last_check(&self) -> Option<u64> {
+        Saved::load(&state_file()).last_check
+    }
+
+    /// Called often; does real work only when a check is due.
+    pub fn tick(&mut self, enabled: bool, ctx: &egui::Context) {
+        if !enabled || Instant::now() < self.next_look {
+            return;
+        }
+        self.next_look = Instant::now() + LOOK_EVERY;
+        if !matches!(*self.phase.lock(), Phase::Idle | Phase::Failed(_)) {
+            return;
+        }
+        let path = state_file();
+        let mut saved = Saved::load(&path);
+        let now = now_secs();
+        match due(saved.last_check, now) {
+            Ok(false) => return,
+            Err(reset) => {
+                saved.last_check = Some(reset);
+                saved.save(&path);
+                return;
+            }
+            Ok(true) => {}
+        }
+        // Claim the day first. If that cannot be written, no request goes
+        // out: one check a day must hold even when the disk is full.
+        saved.last_check = Some(now);
+        if !saved.save(&path) {
+            return;
+        }
+        let (phase, ctx) = (self.phase.clone(), ctx.clone());
+        let _ = std::thread::Builder::new().name("update-check".into()).spawn(move || {
+            if let Ok(Some(offer)) = check() {
+                let mut saved = Saved::load(&path);
+                saved.offer = Some(offer.clone());
+                saved.save(&path);
+                *phase.lock() = Phase::Offered(offer);
+                ctx.request_repaint();
+            }
+            // a failed check is silent and waits for tomorrow
+        });
+    }
+
+    /// Downloads, verifies and runs the installer for the offered version.
+    pub fn install(&self, ctx: &egui::Context) {
+        let Phase::Offered(offer) = self.phase() else { return };
+        *self.phase.lock() = Phase::Downloading { version: offer.version.clone(), done: 0, total: 0 };
+        let (phase, ctx) = (self.phase.clone(), ctx.clone());
+        let _ = std::thread::Builder::new().name("update-install".into()).spawn(move || {
+            let result = download_and_run(&offer, &mut |done, total| {
+                *phase.lock() = Phase::Downloading { version: offer.version.clone(), done, total };
+                ctx.request_repaint();
+            });
+            *phase.lock() = match result {
+                Ok(()) => Phase::Installing,
+                Err(e) => Phase::Failed(e),
+            };
+            ctx.request_repaint();
+        });
+    }
+
+    /// Back to the offer after a failure, so the button shows again.
+    pub fn retry(&self) {
+        let saved = Saved::load(&state_file());
+        *self.phase.lock() = match saved.offer {
+            Some(o) if newer(&o.version, VERSION) => Phase::Offered(o),
+            _ => Phase::Idle,
+        };
+    }
+}
+
+fn arch() -> &'static str {
+    if cfg!(target_arch = "aarch64") {
+        "aarch64"
+    } else {
+        "x86_64"
+    }
+}
+
+/// `a` is a newer version than `b` (x.y.z, a release beats its prereleases).
+pub fn newer(a: &str, b: &str) -> bool {
+    fn parse(v: &str) -> Option<([u64; 3], Option<String>)> {
+        let v = v.trim().trim_start_matches('v');
+        let (core, pre) = match v.split_once('-') {
+            Some((c, p)) => (c, Some(p.to_string())),
+            None => (v, None),
+        };
+        let mut n = core.split('.').map(|p| p.parse::<u64>().ok());
+        Some(([n.next()??, n.next()??, n.next()??], pre))
+    }
+    let (Some((ca, pa)), Some((cb, pb))) = (parse(a), parse(b)) else { return false };
+    if ca != cb {
+        return ca > cb;
+    }
+    match (pa, pb) {
+        (None, Some(_)) => true,
+        (Some(x), Some(y)) => x > y,
+        _ => false,
+    }
+}
+
+/// The one request: `None` when whereti is current.
+fn check() -> Result<Option<Offer>, String> {
+    let url = format!("{ENDPOINT}/windows/{}/{VERSION}", arch());
+    let (status, body) = http_get(&url, 64 * 1024, &mut |_, _| {})?;
+    match status {
+        204 => Ok(None),
+        200 => parse_offer(&body),
+        s => Err(format!("the update server answered {s}")),
+    }
+}
+
+fn parse_offer(body: &[u8]) -> Result<Option<Offer>, String> {
+    let v: serde_json::Value = serde_json::from_slice(body).map_err(|e| e.to_string())?;
+    let version = v["version"].as_str().unwrap_or("").to_string();
+    if !newer(&version, VERSION) {
+        return Ok(None);
+    }
+    let entry = &v["platforms"][format!("windows-{}", arch())];
+    let url = entry["url"].as_str().unwrap_or("").to_string();
+    let sha256 = entry["sha256"].as_str().unwrap_or("").to_ascii_lowercase();
+    if !url.starts_with(DOWNLOADS) || sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("the update manifest is not valid".into());
+    }
+    Ok(Some(Offer { version, notes: v["notes"].as_str().unwrap_or("").to_string(), url, sha256 }))
+}
+
+fn download_and_run(offer: &Offer, progress: &mut dyn FnMut(u64, u64)) -> Result<(), String> {
+    use crate::i18n::tr;
+    let (status, bytes) = http_get(&offer.url, MAX_INSTALLER, progress)?;
+    if status != 200 {
+        return Err(crate::trf!("The download failed (error {status}).", status));
+    }
+    if sha256_hex(&bytes)? != offer.sha256 {
+        return Err(tr("The download is damaged. Try again later.").into());
+    }
+    let dir = std::env::temp_dir().join("whereti-update");
+    let _ = std::fs::create_dir_all(&dir);
+    let file = dir.join(format!("whereti-setup-{}.exe", offer.version.replace(['\\', '/', ':'], "")));
+    std::fs::write(&file, &bytes).map_err(|e| e.to_string())?;
+    if let Err(e) = verify_publisher(&file) {
+        let _ = std::fs::remove_file(&file);
+        return Err(crate::trf!("The update is not signed by {publisher}: {e}", publisher = PUBLISHER, e));
+    }
+    run_installer(&file)
+}
+
+/// Starts `whereti-setup.exe /S /open`: it asks Windows for permission,
+/// replaces whereti (closing this window) and opens the new version.
+fn run_installer(file: &Path) -> Result<(), String> {
+    use windows_sys::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject, INFINITE};
+    use windows_sys::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
+    let file_w: Vec<u16> = file.as_os_str().encode_wide_nul();
+    let args: Vec<u16> = "/S /open".encode_utf16().chain([0]).collect();
+    let verb: Vec<u16> = "open".encode_utf16().chain([0]).collect();
+    // SAFETY: zeroed struct with its size set; strings outlive the call.
+    let mut info: SHELLEXECUTEINFOW = unsafe { std::mem::zeroed() };
+    info.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
+    info.fMask = SEE_MASK_NOCLOSEPROCESS;
+    info.lpVerb = verb.as_ptr();
+    info.lpFile = file_w.as_ptr();
+    info.lpParameters = args.as_ptr();
+    // SAFETY: valid struct.
+    if unsafe { ShellExecuteExW(&mut info) } == 0 || info.hProcess.is_null() {
+        return Err(crate::i18n::tr("The installer could not be started.").into());
+    }
+    let mut code = 0u32;
+    // SAFETY: process handle from ShellExecuteExW. On success the installer
+    // closes this app before it exits, so this returns only on failure.
+    unsafe {
+        WaitForSingleObject(info.hProcess, INFINITE);
+        GetExitCodeProcess(info.hProcess, &mut code);
+        windows_sys::Win32::Foundation::CloseHandle(info.hProcess);
+    }
+    if code == 0 {
+        Ok(())
+    } else {
+        Err(crate::i18n::tr("The update was cancelled or did not finish.").into())
+    }
+}
+
+trait EncodeWide {
+    fn encode_wide_nul(&self) -> Vec<u16>;
+}
+
+impl EncodeWide for std::ffi::OsStr {
+    fn encode_wide_nul(&self) -> Vec<u16> {
+        use std::os::windows::ffi::OsStrExt;
+        self.encode_wide().chain([0]).collect()
+    }
+}
+
+fn sha256_hex(data: &[u8]) -> Result<String, String> {
+    use windows_sys::Win32::Security::Cryptography::{BCryptHash, BCRYPT_SHA256_ALG_HANDLE};
+    let mut out = [0u8; 32];
+    // SAFETY: buffers and lengths match; the pseudo-handle needs no opening.
+    let status = unsafe {
+        BCryptHash(BCRYPT_SHA256_ALG_HANDLE, std::ptr::null(), 0, data.as_ptr(), data.len() as u32, out.as_mut_ptr(), 32)
+    };
+    if status != 0 {
+        return Err(format!("hashing failed ({status:#x})"));
+    }
+    Ok(out.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// A valid Authenticode signature whose signer is Software Hive S.R.L.
+/// Revocation lists are not fetched, so this sends nothing anywhere.
+fn verify_publisher(file: &Path) -> Result<(), String> {
+    use windows_sys::Win32::Security::Cryptography::{CertGetNameStringW, CERT_NAME_SIMPLE_DISPLAY_TYPE};
+    use windows_sys::Win32::Security::WinTrust::{
+        WTHelperGetProvSignerFromChain, WTHelperProvDataFromStateData, WinVerifyTrust, WINTRUST_ACTION_GENERIC_VERIFY_V2,
+        WINTRUST_DATA, WINTRUST_DATA_0, WINTRUST_FILE_INFO, WTD_CACHE_ONLY_URL_RETRIEVAL, WTD_CHOICE_FILE, WTD_REVOKE_NONE,
+        WTD_STATEACTION_CLOSE, WTD_STATEACTION_VERIFY, WTD_UI_NONE,
+    };
+    let path = file.as_os_str().encode_wide_nul();
+    // SAFETY: zeroed structs with their sizes set; the path outlives the calls;
+    // the state is closed before returning.
+    unsafe {
+        let mut fi: WINTRUST_FILE_INFO = std::mem::zeroed();
+        fi.cbStruct = std::mem::size_of::<WINTRUST_FILE_INFO>() as u32;
+        fi.pcwszFilePath = path.as_ptr();
+        let mut data: WINTRUST_DATA = std::mem::zeroed();
+        data.cbStruct = std::mem::size_of::<WINTRUST_DATA>() as u32;
+        data.dwUIChoice = WTD_UI_NONE;
+        data.fdwRevocationChecks = WTD_REVOKE_NONE;
+        data.dwUnionChoice = WTD_CHOICE_FILE;
+        data.Anonymous = WINTRUST_DATA_0 { pFile: &mut fi };
+        data.dwStateAction = WTD_STATEACTION_VERIFY;
+        data.dwProvFlags = WTD_CACHE_ONLY_URL_RETRIEVAL;
+        let mut action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+        let status = WinVerifyTrust(std::ptr::null_mut(), &mut action, &mut data as *mut _ as *mut _);
+        let mut signer = String::new();
+        if status == 0 {
+            let prov = WTHelperProvDataFromStateData(data.hWVTStateData);
+            let sgnr = if prov.is_null() { std::ptr::null_mut() } else { WTHelperGetProvSignerFromChain(prov, 0, 0, 0) };
+            if !sgnr.is_null() && (*sgnr).csCertChain > 0 && !(*sgnr).pasCertChain.is_null() {
+                let cert = (*(*sgnr).pasCertChain).pCert;
+                let mut buf = [0u16; 256];
+                let n = CertGetNameStringW(cert, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0, std::ptr::null(), buf.as_mut_ptr(), 256);
+                signer = String::from_utf16_lossy(&buf[..n.saturating_sub(1) as usize]);
+            }
+        }
+        data.dwStateAction = WTD_STATEACTION_CLOSE;
+        WinVerifyTrust(std::ptr::null_mut(), &mut action, &mut data as *mut _ as *mut _);
+        if status != 0 {
+            return Err(format!("no valid signature ({:#x})", status as u32));
+        }
+        if !signer.trim().eq_ignore_ascii_case(PUBLISHER) {
+            return Err(format!("signed by {signer}"));
+        }
+    }
+    Ok(())
+}
+
+/// HTTPS GET through WinHTTP (Windows' own TLS, proxy settings honoured,
+/// cookies off). Follows redirects; never more than `max` bytes.
+fn http_get(url: &str, max: u64, progress: &mut dyn FnMut(u64, u64)) -> Result<(u16, Vec<u8>), String> {
+    use windows_sys::Win32::Networking::WinHttp::*;
+    let Some(rest) = url.strip_prefix("https://") else { return Err("only https".into()) };
+    let (host, path) = rest.split_once('/').map_or((rest, "/".to_string()), |(h, p)| (h, format!("/{p}")));
+    let w = |s: &str| -> Vec<u16> { s.encode_utf16().chain([0]).collect() };
+    let (agent, host_w, path_w, get) = (w(&format!("whereti/{VERSION}")), w(host), w(&path), w("GET"));
+    struct H(*mut core::ffi::c_void);
+    impl Drop for H {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // SAFETY: a handle WinHTTP gave us, closed once.
+                unsafe { WinHttpCloseHandle(self.0) };
+            }
+        }
+    }
+    let err = |what: &str| format!("{what} failed ({})", std::io::Error::last_os_error());
+    // SAFETY: NUL-terminated strings that outlive the handles; every handle
+    // is closed by H; buffers match their lengths.
+    unsafe {
+        let session = H(WinHttpOpen(agent.as_ptr(), WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, std::ptr::null(), std::ptr::null(), 0));
+        if session.0.is_null() {
+            return Err(err("connecting"));
+        }
+        WinHttpSetTimeouts(session.0, 15_000, 15_000, 30_000, 60_000);
+        let connect = H(WinHttpConnect(session.0, host_w.as_ptr(), 443, 0));
+        if connect.0.is_null() {
+            return Err(err("connecting"));
+        }
+        let request = H(WinHttpOpenRequest(
+            connect.0,
+            get.as_ptr(),
+            path_w.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            WINHTTP_FLAG_SECURE,
+        ));
+        if request.0.is_null() {
+            return Err(err("the request"));
+        }
+        let no_cookies: u32 = WINHTTP_DISABLE_COOKIES;
+        WinHttpSetOption(request.0, WINHTTP_OPTION_DISABLE_FEATURE, &no_cookies as *const u32 as *const _, 4);
+        if WinHttpSendRequest(request.0, std::ptr::null(), 0, std::ptr::null(), 0, 0, 0) == 0
+            || WinHttpReceiveResponse(request.0, std::ptr::null_mut()) == 0
+        {
+            return Err(err("the request"));
+        }
+        let mut status = 0u32;
+        let mut len = 4u32;
+        WinHttpQueryHeaders(
+            request.0,
+            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+            std::ptr::null(),
+            &mut status as *mut u32 as *mut _,
+            &mut len,
+            std::ptr::null_mut(),
+        );
+        let mut total = 0u64;
+        let mut tlen = 8u32;
+        WinHttpQueryHeaders(
+            request.0,
+            WINHTTP_QUERY_CONTENT_LENGTH | WINHTTP_QUERY_FLAG_NUMBER64,
+            std::ptr::null(),
+            &mut total as *mut u64 as *mut _,
+            &mut tlen,
+            std::ptr::null_mut(),
+        );
+        let mut body = Vec::new();
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            let mut read = 0u32;
+            if WinHttpReadData(request.0, buf.as_mut_ptr() as *mut _, buf.len() as u32, &mut read) == 0 {
+                return Err(err("downloading"));
+            }
+            if read == 0 {
+                break;
+            }
+            body.extend_from_slice(&buf[..read as usize]);
+            if body.len() as u64 > max {
+                return Err("the answer is too large".into());
+            }
+            progress(body.len() as u64, total);
+        }
+        Ok((status as u16, body))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn one_check_a_day() {
+        let day = DAY_SECS;
+        assert_eq!(due(None, 1000), Ok(true));
+        assert_eq!(due(Some(1000), 1000 + day - 1), Ok(false));
+        assert_eq!(due(Some(1000), 1000 + day), Ok(true));
+        // the clock went back: wait a full day from now
+        assert_eq!(due(Some(5000), 1000), Err(1000));
+    }
+
+    #[test]
+    fn the_day_is_claimed_on_disk_before_asking() {
+        let path = std::env::temp_dir().join(format!("whereti-update-{}.txt", std::process::id()));
+        let s = Saved {
+            last_check: Some(123),
+            offer: Some(Offer {
+                version: "0.2.0".into(),
+                notes: "line 1\nline 2".into(),
+                url: format!("{DOWNLOADS}v0.2.0/whereti-setup-0.2.0.exe"),
+                sha256: "ab".repeat(32),
+            }),
+        };
+        assert!(s.save(&path));
+        assert_eq!(Saved::load(&path), s);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn versions() {
+        assert!(newer("0.2.0", "0.1.9"));
+        assert!(newer("v1.0.0", "0.9.9"));
+        assert!(newer("0.2.0", "0.2.0-rc.1"));
+        assert!(!newer("0.2.0-rc.1", "0.2.0"));
+        assert!(!newer("0.1.0", "0.1.0"));
+        assert!(!newer("garbage", "0.1.0"));
+    }
+
+    #[test]
+    fn only_github_installers_with_a_hash_are_accepted() {
+        let ok = format!(
+            r#"{{"version":"99.0.0","notes":"n","platforms":{{"windows-{}":{{"url":"{DOWNLOADS}v99.0.0/x.exe","sha256":"{}"}}}}}}"#,
+            arch(),
+            "AB".repeat(32)
+        );
+        let o = parse_offer(ok.as_bytes()).unwrap().unwrap();
+        assert_eq!(o.version, "99.0.0");
+        assert_eq!(o.sha256, "ab".repeat(32));
+        let elsewhere = ok.replace(DOWNLOADS, "https://evil.example/");
+        assert!(parse_offer(elsewhere.as_bytes()).is_err());
+        let old = ok.replace("99.0.0", "0.0.0");
+        assert_eq!(parse_offer(old.as_bytes()).unwrap(), None);
+    }
+
+    #[test]
+    fn hashes_like_sha256() {
+        assert_eq!(sha256_hex(b"abc").unwrap(), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    }
+
+    #[test]
+    fn a_file_signed_by_software_hive_passes() {
+        // SilentSilo is signed with the same certificate; skipped where it is not installed
+        let Some(local) = std::env::var_os("LOCALAPPDATA") else { return };
+        let exe = PathBuf::from(local).join(r"SilentSilo\silentsilo.exe");
+        if exe.exists() {
+            assert_eq!(verify_publisher(&exe), Ok(()));
+        }
+        // signed, but by someone else
+        let other = PathBuf::from(r"C:\Windows\explorer.exe");
+        if other.exists() {
+            assert!(verify_publisher(&other).is_err());
+        }
+    }
+
+    #[test]
+    fn unsigned_files_are_refused() {
+        let path = std::env::temp_dir().join(format!("whereti-unsigned-{}.exe", std::process::id()));
+        std::fs::write(&path, b"MZ not really a program").unwrap();
+        assert!(verify_publisher(&path).is_err());
+        let _ = std::fs::remove_file(&path);
+    }
+}

@@ -8,8 +8,9 @@ pub mod preview;
 pub mod dates;
 pub mod welcome;
 pub mod settings;
+pub mod updates;
 pub mod tray;
 pub mod setup;
 
 /// Every catalog.
-pub const ALL: &[&[Entry]] = &[common::ENTRIES, search::ENTRIES, preview::ENTRIES, dates::ENTRIES, welcome::ENTRIES, settings::ENTRIES, tray::ENTRIES, setup::ENTRIES];
+pub const ALL: &[&[Entry]] = &[common::ENTRIES, search::ENTRIES, preview::ENTRIES, dates::ENTRIES, welcome::ENTRIES, settings::ENTRIES, updates::ENTRIES, tray::ENTRIES, setup::ENTRIES];

@@ -29,6 +29,17 @@ pub const ENTRIES: &[Entry] = &[
         ro: "se conectează…",
     },
     Entry {
+        en: "Try again",
+        note: "Settings > About, button after a failed update.",
+        de: "Erneut versuchen",
+        es: "Intentar de nuevo",
+        fr: "Réessayer",
+        it: "Riprova",
+        pl: "Spróbuj ponownie",
+        pt_br: "Tentar novamente",
+        ro: "Încearcă din nou",
+    },
+    Entry {
         en: "Cancel",
         note: "Button label that stops recording a new keyboard shortcut (Settings > General, Shortcut row) or cancels in the installer; short.",
         de: "Abbrechen",

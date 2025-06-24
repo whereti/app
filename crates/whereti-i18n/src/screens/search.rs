@@ -370,6 +370,17 @@ pub const ENTRIES: &[Entry] = &[
         ro: "{n} fișier · {state}|{n} fișiere · {state}|{n} de fișiere · {state}",
     },
     Entry {
+        en: "whereti {version} is available · Install",
+        note: "Search window status bar, clickable link to install an update. {version} is like 0.2.0.",
+        de: "whereti {version} ist verfügbar · Installieren",
+        es: "whereti {version} está disponible · Instalar",
+        fr: "whereti {version} est disponible · Installer",
+        it: "whereti {version} è disponibile · Installa",
+        pl: "Dostępny jest whereti {version} · Zainstaluj",
+        pt_br: "whereti {version} está disponível · Instalar",
+        ro: "whereti {version} e disponibil · Instalează",
+    },
+    Entry {
         en: "{ms}  ·  Enter opens  ·  Ctrl+Enter shows in Explorer  ·  right-click for the menu  ·  drag into any app",
         note: "Footer hint line of the search window; {ms} is a time like \"3 ms\"; keep key names Enter and Ctrl+Enter; the longest of three variants.",
         de: "{ms}  ·  Enter öffnet  ·  Strg+Enter zeigt im Explorer  ·  Rechtsklick für das Menü  ·  in jede App ziehen",

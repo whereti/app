@@ -1,4 +1,4 @@
-# Builds the whereti installer: dist\whereti-setup-<version>.exe
+﻿# Builds the whereti installer: dist\whereti-setup-<version>.exe
 #
 #   .\scripts\package.ps1             development build: nothing is signed,
 #                                     no token is needed
@@ -96,3 +96,23 @@ $hash = (Get-FileHash $setup -Algorithm SHA256).Hash
 $size = [math]::Round((Get-Item $setup).Length / 1MB, 1)
 Write-Host "`n$setup  ($size MB)" -ForegroundColor Green
 Write-Host "SHA-256 $hash"
+
+if ($Release) {
+    # The manifest for releases.whereti.com (whereti.releases: npm run
+    # publish:manifest). Publish it only after the GitHub release exists.
+    $manifest = [ordered]@{
+        version   = $version
+        notes     = "See the release notes for v$version."
+        pub_date  = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+        platforms = [ordered]@{
+            "windows-x86_64" = [ordered]@{
+                url    = "https://github.com/whereti/whereti/releases/download/v$version/whereti-setup-$version.exe"
+                sha256 = $hash.ToLowerInvariant()
+                size   = (Get-Item $setup).Length
+            }
+        }
+    }
+    $json = $manifest | ConvertTo-Json -Depth 5
+    [IO.File]::WriteAllText((Join-Path $dist "latest.json"), $json, (New-Object Text.UTF8Encoding $false))
+    Write-Host "dist\latest.json written: publish it with whereti.releases after the GitHub release."
+}

@@ -127,6 +127,8 @@ pub struct WheretiApp {
     snippets: crate::snippets::Snippets,
     /// The CJK fonts are loaded (see `setup_fonts`).
     cjk_fonts: bool,
+    /// The once-a-day update check (update.rs).
+    pub(crate) updater: crate::update::Updater,
 }
 
 impl WheretiApp {
@@ -175,6 +177,7 @@ impl WheretiApp {
             preview,
             file_icons: FileIcons::new(),
             cjk_fonts: false,
+            updater: crate::update::Updater::new(),
             snippets: {
                 let wake_ctx = ctx.clone();
                 crate::snippets::Snippets::start(move || wake_ctx.request_repaint())
@@ -759,6 +762,13 @@ impl WheretiApp {
         // Left: a message, or the longest set of hints that still fits.
         let room = rect.width() - right_w - 14.0 - 24.0;
         let mut left: Option<(String, Color32)> = None;
+        let mut update_link = false;
+        if let crate::update::Phase::Offered(o) = self.updater.phase() {
+            if self.message.is_none() && self.page == Page::Search {
+                left = Some((trf!("whereti {version} is available · Install", version = o.version), p.accent));
+                update_link = true;
+            }
+        }
         if let Some((msg, at)) = &self.message {
             if at.elapsed() < Duration::from_secs(8) {
                 left = Some((msg.clone(), p.warn));
@@ -785,8 +795,18 @@ impl WheretiApp {
                 ..LayoutJob::simple_singleline(text, font.clone(), color)
             };
             let g = ui.fonts_mut(|f| f.layout_job(job));
-            painter.galley(Pos2::new(rect.left() + 14.0, y - g.size().y / 2.0), g, color);
+            let at = Pos2::new(rect.left() + 14.0, y - g.size().y / 2.0);
+            let hit = egui::Rect::from_min_size(at, g.size()).expand(4.0);
+            painter.galley(at, g, color);
+            if update_link {
+                let r = ui.interact(hit, ui.scope_id().with("update-link"), egui::Sense::click());
+                if r.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                    self.settings.section = crate::settings::Section::About;
+                    self.page = Page::Settings;
+                }
+            }
         }
+        let painter = ui.painter();
         let x = rect.right() - 14.0;
         painter.text(Pos2::new(x, y), Align2::RIGHT_CENTER, &state, font.clone(), p.text2);
         painter.circle_filled(Pos2::new(x - width(ui, &state) - 9.0, y), 3.5, dot);
@@ -811,6 +831,7 @@ impl eframe::App for WheretiApp {
             }
         }
         self.apply_updates();
+        self.updater.tick(self.settings.updates, ctx);
         if !self.cjk_fonts && (has_cjk(&self.query) || self.rows.iter().any(|r| has_cjk(&r.path))) {
             self.cjk_fonts = true;
             crate::setup_fonts(ctx, true);
