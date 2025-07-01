@@ -8,6 +8,7 @@
 //! entry is inflated beyond `MAX_ENTRY` (zip bombs).
 
 mod email;
+mod ocr;
 mod ole;
 mod rtf;
 #[cfg(test)]
@@ -70,6 +71,8 @@ pub enum Kind {
     WordBinary,
     /// PowerPoint 97-2003 (.ppt)
     PowerPointBinary,
+    /// A picture: its text is read with the OCR of Windows.
+    Image,
 }
 
 pub fn kind_of(ext: &str) -> Option<Kind> {
@@ -86,6 +89,7 @@ pub fn kind_of(ext: &str) -> Option<Kind> {
         "msg" => Kind::Outlook,
         "doc" | "dot" => Kind::WordBinary,
         "ppt" | "pps" | "pot" => Kind::PowerPointBinary,
+        e if IMAGE_EXTS.contains(&e) => Kind::Image,
         e if TEXT_EXTS.contains(&e) => Kind::Text,
         _ => return None,
     })
@@ -97,9 +101,12 @@ const DOC_EXTS: &[&str] = &[
     "pdf", "rtf", "html", "htm", "xhtml", "eml", "msg", "doc", "dot", "ppt", "pps", "pot",
 ];
 
+/// Pictures whose text is read by OCR (HEIC only where its codec is installed).
+const IMAGE_EXTS: &[&str] = &["jpg", "jpeg", "jpe", "jfif", "png", "bmp", "tif", "tiff", "gif", "webp", "heic", "heif"];
+
 /// Every extension `extract` reads, lower case, without the dot.
 pub fn extensions() -> Vec<&'static str> {
-    DOC_EXTS.iter().chain(TEXT_EXTS).copied().collect()
+    DOC_EXTS.iter().chain(TEXT_EXTS).chain(IMAGE_EXTS).copied().collect()
 }
 
 /// Plain-text formats: documents, data and ~80 kinds of source code.
@@ -121,7 +128,29 @@ pub fn extract(ext: &str, bytes: &[u8], max_chars: usize) -> Result<Extracted, E
         Kind::Pptx => pptx(bytes, &mut out)?,
         Kind::Spreadsheet => spreadsheet(ext, bytes, &mut out)?,
         Kind::OpenDocument => odf(bytes, &mut out)?,
-        Kind::Pdf => pdf(bytes, &mut out)?,
+        Kind::Pdf => {
+            let own = pdf(bytes, &mut out);
+            // A scan has (almost) no text of its own: read its pages with OCR.
+            // A PDF that pdf-extract cannot parse gets the same chance, since
+            // Windows' own PDF reader is more forgiving.
+            if matches!(own, Ok(()) | Err(ExtractError::Damaged(_))) {
+                let scanned = ocr::Ocr::new().and_then(|o| o.pdf_if_scanned(bytes, &out.text).ok().flatten());
+                if let Some((text, truncated)) = scanned {
+                    if !text.is_empty() {
+                        out = Out::new(max_chars);
+                        out.push(&text);
+                        out.truncated |= truncated;
+                        return Ok(out.finish());
+                    }
+                }
+            }
+            own?
+        }
+        Kind::Image => {
+            let o = ocr::Ocr::new().ok_or(ExtractError::Unsupported)?;
+            let text = o.picture(bytes).map_err(|e| ExtractError::Damaged(e.message().to_string()))?;
+            out.push(&text);
+        }
         Kind::Rtf => out.push(&rtf_to_text(&String::from_utf8_lossy(bytes))),
         Kind::Html => out.push(&html_to_text(&decode_text(bytes)?)),
         Kind::Email => email::eml(bytes, &mut out)?,

@@ -187,7 +187,11 @@ pub fn fingerprint(scan: &VolumeScan) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     scan.serial.hash(&mut h);
     for e in &scan.scan.entries {
-        (e.record, e.parent, e.size, e.modified, e.attributes).hash(&mut h);
+        // A folder's date changes with what is in it, which the entries
+        // below already show; leaving it out avoids rebuilding the index for
+        // a date Windows updates a moment after a file was written.
+        let modified = if e.is_dir { 0 } else { e.modified };
+        (e.record, e.parent, e.size, modified, e.attributes).hash(&mut h);
         scan.scan.name(e).hash(&mut h);
     }
     h.finish()
@@ -197,8 +201,8 @@ pub fn fingerprint(scan: &VolumeScan) -> u64 {
 mod tests {
     use super::*;
 
-    fn tree() -> std::path::PathBuf {
-        let root = std::env::temp_dir().join(format!("whereti-walk-{}", std::process::id()));
+    fn tree(name: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("whereti-walk-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("Photos").join("2025")).unwrap();
         std::fs::write(root.join("notes.txt"), "hello").unwrap();
@@ -208,7 +212,7 @@ mod tests {
 
     #[test]
     fn walks_a_folder_tree_like_an_mft_scan() {
-        let root = tree();
+        let root = tree("tree");
         let scan = walk_tree(root.to_str().unwrap()).unwrap();
         let by_name = |n: &str| scan.entries.iter().find(|e| scan.name(e) == n).copied().unwrap();
         assert_eq!(scan.name(&scan.entries[0]), ".");
@@ -228,8 +232,7 @@ mod tests {
     }
 
     #[test]
-    fn a_change_changes_the_fingerprint() {
-        let root = tree();
+    fn a_change_changes_the_fingerprint() {        let root = tree("change");
         let walk = |p: &std::path::Path| VolumeScan {
             letter: 'E',
             serial: 1,

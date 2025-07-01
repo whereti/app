@@ -315,7 +315,7 @@ fn search(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
         line(ui, p);
         // documents
         let c = status.as_ref().map(|s| s.content.clone());
-        let desc = tr("PDF, Word, Excel, PowerPoint, e-mails and text files, found by what is written in them.");
+        let desc = tr("PDF, Word, Excel, PowerPoint, e-mails, text files, and the text in scans and photos.");
         row(ui, p, tr("Inside documents"), desc, |ui| {
             if let Some(c) = &c {
                 let (dot, text) = match c.state.as_str() {

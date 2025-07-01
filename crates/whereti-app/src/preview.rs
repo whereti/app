@@ -242,8 +242,8 @@ impl Preview {
             Content::Text { text, .. } if text.trim().is_empty() => note(
                 ui,
                 p,
-                tr("The document has no text"),
-                tr("It is probably scanned (images only). Reading text from images (OCR) comes in a later version."),
+                tr("No text found"),
+                tr("whereti found no words in it, not even in its pictures."),
             ),
             Content::Text { text, truncated, mono } => {
                 let (text, truncated, mono) = (text.clone(), *truncated, *mono);

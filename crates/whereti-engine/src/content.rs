@@ -88,6 +88,8 @@ pub struct Content {
     exts: HashSet<&'static str>,
     /// Last hint from a user session: (when, busy, away).
     hint: Mutex<Option<(Instant, bool, bool)>>,
+    /// Where the content index lives (for the one-time OCR pass marker).
+    dir: PathBuf,
 }
 
 impl Content {
@@ -111,6 +113,7 @@ impl Content {
             known_keys: RwLock::new(HashSet::new()),
             exts: whereti_extract::extensions().into_iter().collect(),
             hint: Mutex::new(None),
+            dir: dir.to_path_buf(),
         })
     }
 
@@ -228,6 +231,17 @@ impl Content {
                 return;
             }
         };
+        // Once, when OCR arrives: documents that gave no text before (scanned
+        // PDFs) are read again. Forgetting them makes the next round redo them.
+        let ocr_marker = self.dir.join("ocr-1");
+        let ocr_pass = !ocr_marker.exists();
+        if ocr_pass {
+            let before = known.len();
+            known.retain(|_, i| !matches!(i.status, Status::Empty | Status::Failed));
+            if known.len() < before {
+                shared.log.log(format!("content: {} documents without text are read again with OCR", before - known.len()));
+            }
+        }
         self.update_counts(index, &known);
         let sandbox = Sandbox::beside_current_exe().map(|mut s| {
             s.timeout = Duration::from_secs(30);
@@ -243,9 +257,16 @@ impl Content {
             let dirty = self.dirty.swap(false, Ordering::Relaxed);
             if forced || dirty || last_round.elapsed() >= SAFETY_ROUND {
                 last_round = Instant::now();
-                if let Err(e) = self.round(index, &shared, &mut known, sandbox.as_ref()) {
-                    shared.log.log(format!("content: {e}"));
-                    self.set_state(&format!("error: {e}"));
+                match self.round(index, &shared, &mut known, sandbox.as_ref()) {
+                    Ok(()) => {
+                        if ocr_pass && self.status.lock().queued == 0 && !ocr_marker.exists() {
+                            let _ = std::fs::write(&ocr_marker, "documents without text were read again with OCR\n");
+                        }
+                    }
+                    Err(e) => {
+                        shared.log.log(format!("content: {e}"));
+                        self.set_state(&format!("error: {e}"));
+                    }
                 }
                 *self.known_keys.write() = known.keys().copied().collect();
             }
@@ -514,7 +535,11 @@ fn files_in(idx: &NameIndex, folders: &[String]) -> HashMap<u64, Candidate> {
         };
         entries.extend(idx.matching(&in_folders));
     }
-    let entries: Vec<u32> = entries.into_iter().filter(|&e| idx.flags(e) & SKIP == 0).collect();
+    let entries: Vec<u32> = entries
+        .into_iter()
+        .filter(|&e| idx.flags(e) & SKIP == 0)
+        .filter(|&e| !is_picture(&idx.full_path(e)) || (MIN_PICTURE..=MAX_PICTURE).contains(&idx.size(e)))
+        .collect();
     let records = idx.records_of(&entries);
     let mut out = HashMap::with_capacity(entries.len());
     for (e, r) in entries.into_iter().zip(records) {
@@ -523,6 +548,16 @@ fn files_in(idx: &NameIndex, folders: &[String]) -> HashMap<u64, Candidate> {
         out.entry(k).or_insert_with(|| Candidate { key: k, path: idx.full_path(e), size: idx.size(e), modified: idx.modified(e) });
     }
     out
+}
+
+/// Pictures smaller than this are icons and thumbnails; larger ones are
+/// raw camera files or posters. Neither is worth the OCR.
+const MIN_PICTURE: u64 = 20 << 10;
+const MAX_PICTURE: u64 = 30 << 20;
+
+fn is_picture(path: &str) -> bool {
+    let ext = path.rsplit_once('.').map(|(_, e)| e).unwrap_or("");
+    whereti_extract::kind_of(ext) == Some(Kind::Image)
 }
 
 /// Reads one file. `None` when it could not be opened right now (gone,
