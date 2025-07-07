@@ -15,7 +15,7 @@ fn texts_in_code() -> Vec<(String, String)> {
                 continue;
             }
             let src = std::fs::read_to_string(&path).unwrap();
-            for start in ["tr(", "trf!(", "trn!("] {
+            for start in ["tr(", "trf!(", "trn!(", "tr_both("] {
                 for (i, _) in src.match_indices(start) {
                     let before = src[..i].chars().last().unwrap_or(' ');
                     if before.is_alphanumeric() || before == '_' || before == '.' {

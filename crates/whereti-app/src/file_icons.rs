@@ -61,6 +61,57 @@ impl FileIcons {
         tex
     }
 
+    /// The icon of an app, a Control Panel item, or (for `ms-settings:`
+    /// pages) the Settings app.
+    pub fn get_shell(&mut self, ctx: &egui::Context, target: &str) -> Option<TextureHandle> {
+        const SETTINGS_APP: &str =
+            r"shell:AppsFolder\windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel";
+        let target = if target.starts_with("ms-settings:") { SETTINGS_APP } else { target };
+        let key = format!("shell:{}", target.to_lowercase());
+        if let Some(t) = self.cache.get(&key) {
+            return t.clone();
+        }
+        if self.fetched_this_frame >= PER_FRAME {
+            ctx.request_repaint();
+            return None;
+        }
+        self.fetched_this_frame += 1;
+        let tex = self.fetch_shell(target).map(|(rgba, size)| {
+            let image = ColorImage::from_rgba_unmultiplied([size, size], &rgba);
+            ctx.load_texture(format!("icon:{key}"), image, TextureOptions::LINEAR)
+        });
+        self.cache.insert(key, tex.clone());
+        tex
+    }
+
+    fn fetch_shell(&self, target: &str) -> Option<(Vec<u8>, usize)> {
+        use windows::Win32::System::Com::CoTaskMemFree;
+        use windows::Win32::UI::Shell::{SHParseDisplayName, SHGFI_PIDL};
+        let list = self.list.as_ref()?;
+        let mut pidl = std::ptr::null_mut();
+        // SAFETY: the PIDL Windows allocates is freed below; the info struct
+        // has the right size; the icon from GetIcon is destroyed.
+        unsafe {
+            SHParseDisplayName(&HSTRING::from(target), None, &mut pidl, 0, None).ok()?;
+            let mut info = SHFILEINFOW::default();
+            let ok = SHGetFileInfoW(
+                windows::core::PCWSTR(pidl as *const u16),
+                FILE_FLAGS_AND_ATTRIBUTES(0),
+                Some(&mut info),
+                size_of::<SHFILEINFOW>() as u32,
+                SHGFI_PIDL | SHGFI_SYSICONINDEX,
+            );
+            CoTaskMemFree(Some(pidl as *const _));
+            if ok == 0 {
+                return None;
+            }
+            let icon = list.GetIcon(info.iIcon, ILD_TRANSPARENT.0).ok()?;
+            let out = icon_rgba(icon);
+            let _ = DestroyIcon(icon);
+            out
+        }
+    }
+
     fn fetch(&self, path: &str, is_dir: bool) -> Option<(Vec<u8>, usize)> {
         let list = self.list.as_ref()?;
         let own_icon = !is_dir && has_own_icon(path);

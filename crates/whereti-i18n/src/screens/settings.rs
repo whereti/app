@@ -51,17 +51,6 @@ pub const ENTRIES: &[Entry] = &[
         ro: "Căutare",
     },
     Entry {
-        en: "About",
-        note: "Settings left menu item for the section about the app, its license and privacy; short.",
-        de: "Info",
-        es: "Acerca de",
-        fr: "À propos",
-        it: "Informazioni",
-        pl: "Informacje",
-        pt_br: "Sobre",
-        ro: "Despre",
-    },
-    Entry {
         en: "How whereti looks and starts.",
         note: "Description under the title of Settings > General.",
         de: "Wie whereti aussieht und startet.",

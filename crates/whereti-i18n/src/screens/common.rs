@@ -29,6 +29,17 @@ pub const ENTRIES: &[Entry] = &[
         ro: "se conectează…",
     },
     Entry {
+        en: "About",
+        note: "Name of the Windows 11 Settings page opened by ms-settings:about. Use the exact name Windows 11 shows in your language.",
+        de: "Info",
+        es: "Información",
+        fr: "Informations système",
+        it: "Informazioni su",
+        pl: "Informacje",
+        pt_br: "Sobre",
+        ro: "Despre",
+    },
+    Entry {
         en: "Try again",
         note: "Settings > About, button after a failed update.",
         de: "Erneut versuchen",

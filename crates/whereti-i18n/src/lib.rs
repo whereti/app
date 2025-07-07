@@ -86,6 +86,12 @@ pub fn tr(en: &'static str) -> &'static str {
     tr_in(current(), en)
 }
 
+/// The text in English and in the current language, for matching what a
+/// user types in either (Windows setting names, for example).
+pub fn tr_both(en: &'static str) -> (&'static str, &'static str) {
+    (en, tr(en))
+}
+
 pub fn tr_in(lang: Lang, en: &'static str) -> &'static str {
     match entry(en) {
         Some(e) => e.get(lang),

@@ -129,6 +129,13 @@ pub struct WheretiApp {
     cjk_fonts: bool,
     /// The once-a-day update check (update.rs).
     pub(crate) updater: crate::update::Updater,
+    /// Apps, Settings pages and Control Panel items (launch.rs).
+    launch: crate::launch::Launch,
+    last_launch_refresh: Instant,
+    /// Shown above the files: `rows[..launch_items.len()]` are these.
+    launch_items: Vec<crate::launch::Item>,
+    /// Matches for the search in flight, shown when its results arrive.
+    pending_launch: Vec<crate::launch::Item>,
 }
 
 impl WheretiApp {
@@ -178,6 +185,10 @@ impl WheretiApp {
             file_icons: FileIcons::new(),
             cjk_fonts: false,
             updater: crate::update::Updater::new(),
+            launch: crate::launch::Launch::new(ctx),
+            last_launch_refresh: Instant::now(),
+            launch_items: Vec::new(),
+            pending_launch: Vec::new(),
             snippets: {
                 let wake_ctx = ctx.clone();
                 crate::snippets::Snippets::start(move || wake_ctx.request_repaint())
@@ -233,6 +244,7 @@ impl WheretiApp {
         self.generation += 1;
         let (query, sort, recent) = self.effective_query();
         self.recent_mode = recent;
+        self.pending_launch = if recent { Vec::new() } else { self.launch.search(&self.query) };
         let content = !recent && !highlight_needles(&self.query).is_empty();
         self.content_pending = content;
         self.searcher.search(Job { generation: self.generation, query, sort, limit: RESULT_LIMIT, content, recent });
@@ -249,6 +261,11 @@ impl WheretiApp {
         self.visible = true;
         self.focus_search = true;
         self.page = Page::Search;
+        // apps installed meanwhile
+        if self.last_launch_refresh.elapsed() > Duration::from_secs(10 * 60) {
+            self.last_launch_refresh = Instant::now();
+            self.launch.refresh();
+        }
         self.run_search(); // fresh results every time the window appears
     }
 
@@ -270,7 +287,14 @@ impl WheretiApp {
                         continue; // an older search; a newer one is on its way
                     }
                     self.offline = None;
-                    self.rows = reply.rows;
+                    let launch = std::mem::take(&mut self.pending_launch);
+                    let mut rows: Vec<Row> = launch
+                        .iter()
+                        .map(|it| Row { path: it.target.clone(), is_dir: false, size: 0, modified: 0, flags: 0 })
+                        .collect();
+                    rows.extend(reply.rows);
+                    self.launch_items = launch;
+                    self.rows = rows;
                     self.total = reply.total;
                     self.content_start = None;
                     self.round_trip = round_trip;
@@ -316,10 +340,21 @@ impl WheretiApp {
         }
     }
 
+    /// Row `i` is an app, a Settings page or a Control Panel item.
+    fn is_launch(&self, i: usize) -> bool {
+        i < self.launch_items.len()
+    }
+
     fn open_selected(&mut self, ctx: &egui::Context, reveal: bool) {
         let Some(row) = self.rows.get(self.selected) else { return };
         let path = row.path.clone();
-        let result = if reveal { shell::reveal(&path) } else { shell::open(&path) };
+        let result = if self.is_launch(self.selected) {
+            crate::launch::open(&path)
+        } else if reveal {
+            shell::reveal(&path)
+        } else {
+            shell::open(&path)
+        };
         match result {
             Ok(()) => self.hide(ctx),
             Err(e) => self.flash(e),
@@ -388,7 +423,7 @@ impl WheretiApp {
         if self.selected != before {
             self.scroll_to_selected = true;
         }
-        if menu {
+        if menu && !self.is_launch(self.selected) {
             if let (Some(hwnd), Some(row)) = (self.hwnd, self.rows.get(self.selected)) {
                 if let Err(e) = crate::win::context_menu(hwnd, &row.path.clone()) {
                     self.flash(e);
@@ -400,7 +435,7 @@ impl WheretiApp {
         } else if enter {
             self.open_selected(ctx, false);
         }
-        if copy {
+        if copy && !self.is_launch(self.selected) {
             if let Some(row) = self.rows.get(self.selected) {
                 ctx.copy_text(row.path.clone());
                 self.flash(tr("Path copied"));
@@ -589,8 +624,11 @@ impl WheretiApp {
             return;
         }
         ui.add_space(10.0);
+        let launch_n = self.launch_items.len();
         let header = if self.recent_mode {
             tr("RECENT").to_string()
+        } else if launch_n > 0 {
+            tr("APPS AND SETTINGS").to_string()
         } else if self.content_start == Some(0) {
             tr("NO NAME MATCHES").to_string()
         } else {
@@ -611,12 +649,31 @@ impl WheretiApp {
         // The list: name results, the section header, content results (taller,
         // with a snippet). Heights differ, so the list is virtualised here:
         // only the items in view are laid out and painted.
+        // Items: apps and settings, then the files' header, the files, then
+        // "found in contents" and those files.
         let content_start = self.content_start;
-        let items = self.rows.len() + content_start.is_some() as usize;
-        let height_of = |item: usize| match content_start {
-            Some(s) if item == s => ROW_HEIGHT,
-            Some(s) if item > s => CONTENT_ROW_HEIGHT,
-            _ => ROW_HEIGHT,
+        let section = self.content_section_label();
+        let mut labels: Vec<String> = Vec::new();
+        let mut list: Vec<Item> = Vec::with_capacity(self.rows.len() + 2);
+        let mut item_of_row = Vec::with_capacity(self.rows.len());
+        for i in 0..self.rows.len() {
+            if launch_n > 0 && i == launch_n && content_start != Some(i) {
+                let files = if self.total == 0 { tr("FILES").to_string() } else { trn!("{n} RESULT|{n} RESULTS", self.total) };
+                labels.push(files);
+                list.push(Item::Section(labels.len() - 1));
+            }
+            if content_start == Some(i) {
+                labels.push(section.clone());
+                list.push(Item::Section(labels.len() - 1));
+            }
+            item_of_row.push(list.len());
+            list.push(Item::Row(i));
+        }
+        let items = list.len();
+        let height_of = |item: usize| match list[item] {
+            Item::Section(_) => ROW_HEIGHT,
+            Item::Row(i) if content_start.is_some_and(|s| i >= s) => CONTENT_ROW_HEIGHT,
+            Item::Row(_) => ROW_HEIGHT,
         };
         let mut tops = Vec::with_capacity(items + 1);
         let mut y = 0.0;
@@ -626,7 +683,7 @@ impl WheretiApp {
         }
         tops.push(y);
         let total = y;
-        let item_of = |row: usize| row + content_start.is_some_and(|s| row >= s) as usize;
+        let item_of = |row: usize| item_of_row.get(row).copied().unwrap_or(0);
 
         let mut area = egui::ScrollArea::vertical().auto_shrink([false, false]);
         // Keep the selected row visible after keyboard moves.
@@ -646,10 +703,10 @@ impl WheretiApp {
         let mut clicked: Option<(usize, bool)> = None;
         let mut dragged: Option<usize> = None;
         let mut menu_for: Option<usize> = None;
-        let section = self.content_section_label();
         let needles = highlight_needles(&self.query);
         self.snippets.begin_frame(&needles);
         let rows = &self.rows;
+        let launch_items = &self.launch_items;
         let file_icons = &mut self.file_icons;
         let snippets = &mut self.snippets;
         let selected = self.selected;
@@ -667,16 +724,26 @@ impl WheretiApp {
                     Pos2::new(whole.left(), whole.top() + top),
                     Vec2::new(whole.width(), height_of(item)),
                 );
-                let i = match content_start {
-                    Some(s) if item == s => {
-                        paint_section(ui, p, rect, &section);
+                let i = match list[item] {
+                    Item::Section(k) => {
+                        paint_section(ui, p, rect, &labels[k]);
                         continue;
                     }
-                    Some(s) if item > s => item - 1,
-                    _ => item,
+                    Item::Row(i) => i,
                 };
-                let resp = ui.interact(rect, list_id.with(i), Sense::click_and_drag());
                 let row = &rows[i];
+                if let Some(it) = launch_items.get(i) {
+                    let resp = ui.interact(rect, list_id.with(i), Sense::click());
+                    let icon = file_icons.get_shell(ui.ctx(), &it.target);
+                    paint_launch_row(ui, p, rect, it, icon.as_ref(), i == selected, resp.hovered(), &needles);
+                    if resp.double_clicked() {
+                        clicked = Some((i, true));
+                    } else if resp.clicked() {
+                        clicked = Some((i, false));
+                    }
+                    continue;
+                }
+                let resp = ui.interact(rect, list_id.with(i), Sense::click_and_drag());
                 let icon = file_icons.get(ui.ctx(), &row.path, row.is_dir);
                 if content_start.is_some_and(|s| i >= s) {
                     let line = snippets.get(&row.path);
@@ -900,7 +967,8 @@ impl eframe::App for WheretiApp {
         let show_preview =
             self.page == Page::Search && self.preview.open && self.offline.is_none() && !self.rows.is_empty();
         if show_preview {
-            self.preview.select(self.rows.get(self.selected));
+            let file = if self.is_launch(self.selected) { None } else { self.rows.get(self.selected) };
+        self.preview.select(file);
             let needles = highlight_needles(&self.query);
             let width = ctx.content_rect().width();
             egui::Panel::right("preview")
@@ -913,7 +981,7 @@ impl eframe::App for WheretiApp {
                     // our own fine divider instead of egui's heavier one
                     let r = ui.max_rect();
                     ui.painter().vline(r.left() - 16.0, r.y_range().expand(12.0), Stroke::new(1.0, p.line));
-                    let row = self.rows.get(self.selected);
+                    let row = if self.is_launch(self.selected) { None } else { self.rows.get(self.selected) };
                     self.preview.show(ui, &p, row, &mut self.file_icons, &needles, self.tz)
                 });
         }
@@ -1176,6 +1244,59 @@ fn empty_state(
 }
 
 // ---------------------------------------------------------------- rows
+
+/// An item of the results list.
+#[derive(Clone, Copy)]
+enum Item {
+    /// A header, by its index in the labels.
+    Section(usize),
+    Row(usize),
+}
+
+/// An app, a Settings page or a Control Panel item: its icon, its name, and
+/// what it is.
+#[allow(clippy::too_many_arguments)]
+fn paint_launch_row(
+    ui: &egui::Ui,
+    p: &Palette,
+    rect: Rect,
+    it: &crate::launch::Item,
+    icon: Option<&egui::TextureHandle>,
+    selected: bool,
+    hovered: bool,
+    needles: &[String],
+) {
+    use crate::launch::Kind;
+    let painter = ui.painter_at(rect);
+    let inner = rect.shrink2(Vec2::new(2.0, 2.0));
+    if selected {
+        painter.rect_filled(inner, 10.0, p.accent_soft);
+    } else if hovered {
+        painter.rect_filled(inner, 10.0, p.hover);
+    }
+    let tile = Rect::from_center_size(Pos2::new(inner.left() + 26.0, inner.center().y), Vec2::splat(32.0));
+    match icon {
+        Some(t) => {
+            let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
+            painter.image(t.id(), tile, uv, Color32::WHITE);
+        }
+        None => {
+            painter.rect_filled(tile.shrink(3.0), 7.0, p.accent_soft);
+            crate::icons::paint(&painter, tile.shrink(8.0), crate::icons::Icon::Settings, p.accent);
+        }
+    }
+    let text_left = tile.right() + 14.0;
+    let text_w = (inner.right() - 160.0 - text_left).max(80.0);
+    let name_job = highlighted(&it.name, needles, FontId::new(14.5, medium()), p.text, p.accent, text_w);
+    let name_g = ui.fonts_mut(|f| f.layout_job(name_job));
+    painter.galley(Pos2::new(text_left, inner.center().y - name_g.size().y / 2.0), name_g, p.text);
+    let kind = match it.kind {
+        Kind::App => tr("App"),
+        Kind::Setting => tr("Windows settings"),
+        Kind::ControlPanel => tr("Control Panel"),
+    };
+    painter.text(Pos2::new(inner.right() - 14.0, inner.center().y), Align2::RIGHT_CENTER, kind, FontId::proportional(12.0), p.text3);
+}
 
 /// One result: Explorer's icon, name over its folder, date and size.
 #[allow(clippy::too_many_arguments)]
