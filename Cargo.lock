@@ -4878,7 +4878,9 @@ version = "0.0.1"
 dependencies = [
  "eframe",
  "global-hotkey",
+ "parking_lot 0.13.0",
  "raw-window-handle",
+ "serde_json",
  "tray-icon",
  "whereti-extract",
  "whereti-i18n",
@@ -4953,6 +4955,7 @@ dependencies = [
  "mail-parser",
  "pdf-extract",
  "quick-xml 0.42.0",
+ "windows",
  "windows-sys 0.61.2",
  "zip",
 ]
