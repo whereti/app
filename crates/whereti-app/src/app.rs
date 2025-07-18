@@ -578,6 +578,7 @@ impl WheretiApp {
             );
             return;
         }
+        self.update_banner(ui, ctx, p);
         if self.rows.is_empty() && self.content_pending {
             ui.add_space(30.0);
             ui.vertical_centered(|ui| {
@@ -795,6 +796,109 @@ impl WheretiApp {
         }
     }
 
+    /// A new version, shown big above the results until it is installed or
+    /// put off for a few days.
+    fn update_banner(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, p: &Palette) {
+        use crate::update::Phase;
+        if !self.updater.banner() {
+            return;
+        }
+        let phase = self.updater.phase();
+        let (title, text): (String, String) = match &phase {
+            Phase::Offered(o) => (
+                trf!("whereti {version} is ready", version = o.version),
+                o.notes.lines().next().filter(|l| !l.trim().is_empty()).map(str::to_string).unwrap_or_else(|| {
+                    tr("New features and fixes. It takes a minute, and your settings stay as they are.").to_string()
+                }),
+            ),
+            Phase::Downloading { version, .. } => (
+                trf!("Downloading whereti {version}…", version),
+                tr("You can keep searching meanwhile.").to_string(),
+            ),
+            Phase::Installing => (
+                tr("Installing the update").to_string(),
+                tr("Windows asks for permission, then whereti opens again.").to_string(),
+            ),
+            Phase::Failed(e) => (tr("The update did not install").to_string(), e.clone()),
+            Phase::Idle => return,
+        };
+        ui.add_space(12.0);
+        Frame::new()
+            .fill(p.accent_soft)
+            .stroke(Stroke::new(1.0, p.accent.gamma_multiply(0.45)))
+            .corner_radius(14.0)
+            .inner_margin(Margin { left: 16, right: 14, top: 14, bottom: 14 })
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    // the badge
+                    let (badge, _) = ui.allocate_exact_size(Vec2::splat(40.0), Sense::hover());
+                    ui.painter().circle_filled(badge.center(), 20.0, p.accent);
+                    crate::icons::paint(ui.painter(), badge.shrink(10.0), Icon::Sparkle, Color32::WHITE);
+                    ui.add_space(12.0);
+                    let buttons_w = 260.0;
+                    let text_w = (ui.available_width() - buttons_w).max(160.0);
+                    ui.vertical(|ui| {
+                        ui.set_width(text_w);
+                        ui.label(egui::RichText::new(&title).size(15.5).family(semibold()).color(p.text));
+                        ui.add_space(2.0);
+                        ui.add(egui::Label::new(egui::RichText::new(&text).size(12.5).color(p.text2)).wrap());
+                        if let Phase::Downloading { done, total, .. } = &phase {
+                            ui.add_space(8.0);
+                            let f = if *total > 0 { *done as f32 / *total as f32 } else { 0.0 };
+                            ui.add(egui::ProgressBar::new(f).desired_height(6.0).fill(p.accent));
+                        }
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                        let primary = |ui: &mut egui::Ui, label: &str| {
+                            ui.add(
+                                egui::Button::new(egui::RichText::new(label).size(14.0).family(semibold()).color(p.on_accent))
+                                    .fill(p.accent)
+                                    .corner_radius(10.0)
+                                    .min_size(Vec2::new(0.0, 36.0)),
+                            )
+                            .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        };
+                        let quiet = |ui: &mut egui::Ui, label: &str| {
+                            ui.add(
+                                egui::Button::new(egui::RichText::new(label).size(13.5).color(p.text2))
+                                    .fill(Color32::TRANSPARENT)
+                                    .stroke(Stroke::NONE)
+                                    .min_size(Vec2::new(0.0, 36.0)),
+                            )
+                            .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        };
+                        match &phase {
+                            Phase::Offered(_) => {
+                                if primary(ui, tr("Install update")).clicked() {
+                                    self.updater.install(ctx);
+                                }
+                                if quiet(ui, tr("Later")).clicked() {
+                                    self.updater.later();
+                                }
+                            }
+                            Phase::Failed(_) => {
+                                if primary(ui, tr("Try again")).clicked() {
+                                    self.updater.retry();
+                                    self.updater.install(ctx);
+                                }
+                                if quiet(ui, tr("Later")).clicked() {
+                                    self.updater.later();
+                                }
+                            }
+                            Phase::Downloading { done, total, .. } if *total > 0 => {
+                                ui.label(egui::RichText::new(format!("{} %", done * 100 / total)).size(13.0).color(p.text2));
+                            }
+                            _ => {
+                                ui.add(egui::Spinner::new().size(18.0).color(p.accent));
+                            }
+                        }
+                    });
+                });
+            });
+        ui.add_space(4.0);
+    }
+
     /// "GĂSIT ÎN CONȚINUT · 12" (+ indexing progress while it runs).
     fn content_section_label(&self) -> String {
         let shown = self.content_start.map_or(0, |s| self.rows.len() - s) as u64;
@@ -831,7 +935,7 @@ impl WheretiApp {
         let mut left: Option<(String, Color32)> = None;
         let mut update_link = false;
         if let crate::update::Phase::Offered(o) = self.updater.phase() {
-            if self.message.is_none() && self.page == Page::Search {
+            if self.message.is_none() && self.page == Page::Search && !self.updater.banner() {
                 left = Some((trf!("whereti {version} is available · Install", version = o.version), p.accent));
                 update_link = true;
             }

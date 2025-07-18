@@ -29,6 +29,9 @@ const DAY_SECS: u64 = 24 * 3600;
 /// How often the window looks at the day gate (a file read, nothing sent).
 const LOOK_EVERY: Duration = Duration::from_secs(10 * 60);
 const MAX_INSTALLER: u64 = 200 << 20;
+/// "Later" on the update banner hides it this long (Settings, About still
+/// shows the update).
+const LATER_SECS: u64 = 3 * DAY_SECS;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Offer {
@@ -51,6 +54,9 @@ pub enum Phase {
 pub struct Updater {
     phase: Arc<Mutex<Phase>>,
     next_look: Instant,
+    /// "Later" on the banner: for which version, and when (kept in memory,
+    /// written to update.txt when chosen).
+    later: Option<(String, u64)>,
 }
 
 fn state_file() -> PathBuf {
@@ -68,6 +74,8 @@ fn now_secs() -> u64 {
 struct Saved {
     last_check: Option<u64>,
     offer: Option<Offer>,
+    /// The banner was put off: for which version, and when.
+    later: Option<(String, u64)>,
 }
 
 impl Saved {
@@ -82,6 +90,9 @@ impl Saved {
                 Some(("offer_url", v)) => url = Some(v.trim().to_string()),
                 Some(("offer_sha256", v)) => sha256 = Some(v.trim().to_string()),
                 Some(("offer_notes", v)) => notes = v.trim().replace("\\n", "\n"),
+                Some(("later", v)) => {
+                    s.later = v.trim().split_once('@').and_then(|(ver, t)| Some((ver.to_string(), t.parse().ok()?)))
+                }
                 _ => {}
             }
         }
@@ -107,6 +118,9 @@ impl Saved {
                 o.notes.replace('\n', "\\n")
             ));
         }
+        if let Some((v, t)) = &self.later {
+            text.push_str(&format!("later={v}@{t}\n"));
+        }
         let _ = std::fs::create_dir_all(path.parent().unwrap_or(Path::new(".")));
         let tmp = path.with_extension("new");
         let ok = std::fs::write(&tmp, text).is_ok() && std::fs::rename(&tmp, path).is_ok();
@@ -127,16 +141,44 @@ fn due(last: Option<u64>, now: u64) -> Result<bool, u64> {
 impl Updater {
     pub fn new() -> Updater {
         let saved = Saved::load(&state_file());
-        let phase = match saved.offer {
-            Some(o) if newer(&o.version, VERSION) => Phase::Offered(o),
+        let phase = match &saved.offer {
+            Some(o) if newer(&o.version, VERSION) => Phase::Offered(o.clone()),
             _ => Phase::Idle,
         };
         // the first look waits a minute, so a check never slows the start
-        Updater { phase: Arc::new(Mutex::new(phase)), next_look: Instant::now() + Duration::from_secs(60) }
+        Updater { phase: Arc::new(Mutex::new(phase)), next_look: Instant::now() + Duration::from_secs(60), later: saved.later }
     }
 
     pub fn phase(&self) -> Phase {
         self.phase.lock().clone()
+    }
+
+    /// Whether the big banner shows: always while downloading, installing or
+    /// after a failure; for an offer, unless "Later" was chosen for this
+    /// version less than three days ago.
+    pub fn banner(&self) -> bool {
+        match self.phase() {
+            Phase::Idle => false,
+            Phase::Offered(o) => match &self.later {
+                Some((v, t)) if *v == o.version => now_secs().saturating_sub(*t) >= LATER_SECS || *t > now_secs(),
+                _ => true,
+            },
+            _ => true,
+        }
+    }
+
+    /// "Later": the banner goes away for three days, for this version only.
+    pub fn later(&mut self) {
+        if !matches!(self.phase(), Phase::Offered(_)) {
+            self.retry(); // after a failure: back to the offer
+        }
+        if let Phase::Offered(o) = self.phase() {
+            self.later = Some((o.version, now_secs()));
+            let path = state_file();
+            let mut saved = Saved::load(&path);
+            saved.later = self.later.clone();
+            saved.save(&path);
+        }
     }
 
     /// The last check, as Unix seconds.
@@ -502,6 +544,7 @@ mod tests {
     fn the_day_is_claimed_on_disk_before_asking() {
         let path = std::env::temp_dir().join(format!("whereti-update-{}.txt", std::process::id()));
         let s = Saved {
+            later: Some(("0.2.0".into(), 456)),
             last_check: Some(123),
             offer: Some(Offer {
                 version: "0.2.0".into(),
