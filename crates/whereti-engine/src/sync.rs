@@ -232,12 +232,16 @@ pub struct JournalMsg {
 /// Reader thread: sleeps in the kernel until the journal has new records and
 /// forwards them. Uses its own handle, so a blocked read never holds up the
 /// record reads on the caller's handle.
+/// `stop`: set before the reader is cancelled (the drive is being removed
+/// safely); it then ends quietly instead of reporting an error.
 pub fn follow_journal<M: From<JournalMsg> + Send + 'static>(
     letter: char,
     journal_id: u64,
     mut pos: i64,
     tx: mpsc::Sender<M>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
+    use std::sync::atomic::Ordering;
     let vol = match Volume::open(letter, false) {
         Ok(vol) => vol,
         Err(e) => {
@@ -248,7 +252,11 @@ pub fn follow_journal<M: From<JournalMsg> + Send + 'static>(
     let mut buf = Vec::new();
     let mut empty_reads = 0u32;
     loop {
-        match journal::read_journal(&vol, journal_id, pos, true, &mut buf) {
+        let read = journal::read_journal(&vol, journal_id, pos, true, &mut buf);
+        if stop.load(Ordering::SeqCst) {
+            return; // closes this thread's handle on the drive
+        }
+        match read {
             Ok((changes, next)) => {
                 if changes.is_empty() {
                     // A blocking read should not return empty; never spin if it does.

@@ -11,7 +11,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -27,6 +27,7 @@ use crate::content::{self, Content};
 use crate::log::Logger;
 use crate::sync::{self, Batch, JournalMsg, JournalRead, Prefetched};
 use crate::system::{self, Background};
+use crate::removal::Removal;
 use crate::walk::{self, Drive, WALKED};
 
 /// Re-read files still open for writing this often.
@@ -81,6 +82,11 @@ pub enum Msg {
     Journal(JournalMsg),
     /// New exclusion paths: rebuild the index with them.
     Reconfigure(Vec<String>),
+    /// Windows asks to remove this drive: close every handle on it, then
+    /// answer on the channel (removal.rs).
+    Release(char, Option<mpsc::Sender<()>>),
+    /// The removal was cancelled: open the drive again.
+    Reacquire(char),
     Stop,
 }
 
@@ -295,8 +301,13 @@ struct Worker {
     /// (or an NTFS drive that could not be opened).
     vols: Vec<Option<Volume>>,
     open: Vec<HashSet<u64>>,
-    /// Drives with a journal reader thread running.
-    followed: HashSet<char>,
+    /// Journal reader threads, by drive: the thread and its stop flag.
+    followers: std::collections::HashMap<char, (JoinHandle<()>, Arc<AtomicBool>)>,
+    /// Safe removal: the hidden window, and each drive's registration.
+    removal: Option<Removal>,
+    notify: HashMap<char, usize>,
+    /// Drives let go for a removal; not opened again until it is done or cancelled.
+    released: HashSet<char>,
     /// Walked drives: when, how long it took, and what was found.
     walks: HashMap<char, (Instant, Duration, u64)>,
     last_drive_check: Instant,
@@ -320,7 +331,10 @@ impl Worker {
             tx,
             vols: Vec::new(),
             open: Vec::new(),
-            followed: HashSet::new(),
+            followers: HashMap::new(),
+            removal: None,
+            notify: HashMap::new(),
+            released: HashSet::new(),
             walks: HashMap::new(),
             last_drive_check: now,
             journal_max: Vec::new(),
@@ -339,6 +353,10 @@ impl Worker {
     }
 
     fn run(mut self, rx: mpsc::Receiver<Msg>) {
+        self.removal = Removal::start(self.tx.clone());
+        if self.removal.is_none() {
+            self.log("safe removal of external drives is not available (no notification window)");
+        }
         if let Err(e) = self.startup() {
             self.log(format!("error: {e}"));
             self.shared.set_state(format!("error: {e}"));
@@ -355,6 +373,8 @@ impl Worker {
                         self.log(format!("error: {e}"));
                     }
                 }
+                Ok(Msg::Release(letter, reply)) => self.release(letter, reply),
+                Ok(Msg::Reacquire(letter)) => self.reacquire(letter),
                 Ok(Msg::Journal(first)) => {
                     let mut msgs = vec![first];
                     let deadline = Instant::now() + BATCH_WINDOW;
@@ -368,6 +388,11 @@ impl Worker {
                             }
                             Ok(Msg::Stop) => {
                                 stopping = true;
+                                break;
+                            }
+                            Ok(Msg::Release(letter, reply)) => self.release(letter, reply),
+                            Ok(Msg::Reacquire(letter)) => {
+                                let _ = self.tx.send(Msg::Reacquire(letter));
                                 break;
                             }
                             Err(_) => break,
@@ -528,7 +553,7 @@ impl Worker {
                 continue;
             }
             if let Some(err) = mine.iter().find_map(|m| m.error.as_ref()) {
-                self.followed.remove(&letter);
+                self.followers.remove(&letter);
                 if walk::drives().iter().any(|d| d.letter == letter) {
                     self.log(format!("{err} → full rescan"));
                 } else {
@@ -657,6 +682,8 @@ impl Worker {
         let mut gone = Vec::new();
         for &l in letters {
             match present.iter().find(|d| d.letter == l) {
+                // being removed safely: not opened again meanwhile
+                Some(_) if self.released.contains(&l) => {}
                 Some(d) => fresh.push(self.scan(d)?),
                 None => gone.push(l),
             }
@@ -669,6 +696,7 @@ impl Worker {
         *self.shared.index.write() = Some(rebuilt);
         for l in &gone {
             self.walks.remove(l);
+            self.released.remove(l);
         }
         let open_before = self.open_by_letter();
         self.reopen();
@@ -753,13 +781,19 @@ impl Worker {
         let infos: Vec<_> = self.shared.index.read().as_ref().expect("index").volumes().to_vec();
         for (v, info) in infos.into_iter().enumerate() {
             let letter = info.letter();
-            if self.vols[v].is_none() || info.journal_id == WALKED || !self.followed.insert(letter) {
+            let running = self.followers.get(&letter).is_some_and(|(h, _)| !h.is_finished());
+            if self.vols[v].is_none() || info.journal_id == WALKED || running || self.released.contains(&letter) {
                 continue;
             }
             let tx = self.tx.clone();
-            let _ = std::thread::Builder::new()
+            let stop = Arc::new(AtomicBool::new(false));
+            let flag = stop.clone();
+            if let Ok(h) = std::thread::Builder::new()
                 .name(format!("journal-{letter}"))
-                .spawn(move || sync::follow_journal::<Msg>(letter, info.journal_id, info.next_usn, tx));
+                .spawn(move || sync::follow_journal::<Msg>(letter, info.journal_id, info.next_usn, tx, flag))
+            {
+                self.followers.insert(letter, (h, stop));
+            }
         }
     }
 
@@ -767,10 +801,26 @@ impl Worker {
     /// the per-volume lists to match.
     fn reopen(&mut self) {
         let infos: Vec<_> = self.shared.index.read().as_ref().expect("index").volumes().to_vec();
+        for (_, n) in self.notify.drain() {
+            Removal::unwatch(n);
+        }
         self.vols = infos
             .iter()
-            .map(|i| if i.journal_id == WALKED { None } else { Volume::open(i.letter(), false).ok() })
+            .map(|i| {
+                if i.journal_id == WALKED || self.released.contains(&i.letter()) {
+                    None
+                } else {
+                    Volume::open(i.letter(), false).ok()
+                }
+            })
             .collect();
+        if let Some(r) = &self.removal {
+            for vol in self.vols.iter().flatten() {
+                if let Some(n) = r.watch(vol.letter, vol.raw_handle()) {
+                    self.notify.insert(vol.letter, n);
+                }
+            }
+        }
         self.open = vec![HashSet::new(); infos.len()];
         self.journal_max = self
             .vols
@@ -778,6 +828,55 @@ impl Worker {
             .map(|v| v.as_ref().and_then(|v| v.query_usn_journal().ok()).map_or(0, |j| j.maximum_size))
             .collect();
         self.saved_usn = infos.iter().map(|v| v.next_usn).collect();
+    }
+
+    /// Windows wants to remove `letter`: close the MFT handle and stop the
+    /// journal reader, then answer so the removal can go on.
+    fn release(&mut self, letter: char, reply: Option<mpsc::Sender<()>>) {
+        use std::os::windows::io::AsRawHandle;
+        if self.released.insert(letter) {
+            if let Some(n) = self.notify.remove(&letter) {
+                Removal::unwatch(n);
+            }
+            for v in 0..self.vols.len() {
+                if self.letter(v) == letter {
+                    self.vols[v] = None;
+                    self.open[v].clear();
+                }
+            }
+            if let Some((h, stop)) = self.followers.remove(&letter) {
+                stop.store(true, Ordering::SeqCst);
+                // the reader sleeps in the kernel waiting for the journal: wake it
+                let deadline = Instant::now() + Duration::from_secs(3);
+                while !h.is_finished() && Instant::now() < deadline {
+                    // SAFETY: the thread's own handle, alive while `h` is.
+                    unsafe { windows_sys::Win32::System::IO::CancelSynchronousIo(h.as_raw_handle() as _) };
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                if h.is_finished() {
+                    let _ = h.join();
+                }
+            }
+            self.log(format!("{letter}: let go for safe removal"));
+        }
+        if let Some(r) = reply {
+            let _ = r.send(());
+        }
+    }
+
+    /// The removal of `letter` was cancelled: follow it again.
+    fn reacquire(&mut self, letter: char) {
+        if self.released.remove(&letter) {
+            let open_before = self.open_by_letter();
+            self.reopen();
+            for v in 0..self.vols.len() {
+                if let Some(o) = open_before.get(&self.letter(v)) {
+                    self.open[v] = o.clone();
+                }
+            }
+            self.follow_all();
+            self.log(format!("{letter}: removal cancelled, followed again"));
+        }
     }
 
     fn open_by_letter(&self) -> HashMap<char, HashSet<u64>> {
@@ -809,6 +908,7 @@ impl Worker {
         for &(l, serial, walked) in &indexed {
             match present.iter().find(|d| d.letter == l) {
                 None => changed.push(l),
+                Some(_) if self.released.contains(&l) => {}
                 // another stick under the same letter
                 Some(d) if walked && d.serial != serial => changed.push(l),
                 Some(_) => {}

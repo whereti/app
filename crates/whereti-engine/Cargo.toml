@@ -14,4 +14,4 @@ whereti-extract = { version = "0.0.1", path = "../whereti-extract" }
 whereti-ipc = { version = "0.0.1", path = "../whereti-ipc" }
 whereti-ntfs = { version = "0.0.1", path = "../whereti-ntfs" }
 whereti-query = { version = "0.0.1", path = "../whereti-query" }
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Threading", "Win32_System_ProcessStatus", "Win32_System_Time", "Win32_System_SystemInformation", "Win32_System_Power"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Threading", "Win32_System_ProcessStatus", "Win32_System_Time", "Win32_System_SystemInformation", "Win32_System_Power", "Win32_System_IO", "Win32_System_LibraryLoader", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi"] }

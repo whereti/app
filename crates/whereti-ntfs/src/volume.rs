@@ -86,6 +86,11 @@ impl Volume {
         Ok(vol)
     }
 
+    /// The open volume handle (to register for removal notifications).
+    pub fn raw_handle(&self) -> isize {
+        self.file.as_raw_handle() as isize
+    }
+
     pub fn query_usn_journal(&self) -> io::Result<UsnJournalData> {
         let mut data = UsnJournalData::default();
         // SAFETY: plain repr(C) struct.

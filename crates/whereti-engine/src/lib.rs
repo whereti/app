@@ -7,6 +7,7 @@
 pub mod content;
 pub mod engine;
 pub mod log;
+pub mod removal;
 pub mod sync;
 pub mod system;
 pub mod walk;
