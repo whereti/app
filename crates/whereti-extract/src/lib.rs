@@ -104,6 +104,11 @@ const DOC_EXTS: &[&str] = &[
 /// Pictures whose text is read by OCR (HEIC only where its codec is installed).
 const IMAGE_EXTS: &[&str] = &["jpg", "jpeg", "jpe", "jfif", "png", "bmp", "tif", "tiff", "gif", "webp", "heic", "heif"];
 
+/// Windows has an OCR language installed (servers often have none).
+pub fn ocr_available() -> bool {
+    ocr::Ocr::new().is_some()
+}
+
 /// Every extension `extract` reads, lower case, without the dot.
 pub fn extensions() -> Vec<&'static str> {
     DOC_EXTS.iter().chain(TEXT_EXTS).chain(IMAGE_EXTS).copied().collect()

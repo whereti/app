@@ -1,7 +1,17 @@
 //! OCR on real files: a picture and a two-page scanned PDF (an image per
 //! page, no text of its own), both made from the same invoice.
 
-use whereti_extract::{extract, kind_of, Kind};
+use whereti_extract::{extract, kind_of, ocr_available, Kind};
+
+/// Windows Server (CI) may have no OCR language: those tests then say so and pass.
+macro_rules! needs_ocr {
+    () => {
+        if !ocr_available() {
+            eprintln!("no OCR language on this Windows: skipped");
+            return;
+        }
+    };
+}
 
 fn fixture(name: &str) -> Vec<u8> {
     std::fs::read(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("fixtures").join(name)).unwrap()
@@ -16,6 +26,7 @@ fn has_invoice(text: &str) {
 
 #[test]
 fn pictures_are_read() {
+    needs_ocr!();
     assert_eq!(kind_of("JPG"), Some(Kind::Image));
     for name in ["invoice.png", "invoice.jpg"] {
         let ext = name.rsplit('.').next().unwrap();
@@ -26,6 +37,7 @@ fn pictures_are_read() {
 
 #[test]
 fn scanned_pdfs_are_read_page_by_page() {
+    needs_ocr!();
     let got = extract("pdf", &fixture("scanned.pdf"), 100_000).unwrap();
     has_invoice(&got.text);
     // both pages
@@ -35,6 +47,7 @@ fn scanned_pdfs_are_read_page_by_page() {
 
 #[test]
 fn a_picture_without_text_gives_nothing() {
+    needs_ocr!();
     // a plain grey picture: the OCR finds nothing, and nothing is kept
     let mut bmp = vec![0u8; 54 + 200 * 200 * 3];
     bmp[0..2].copy_from_slice(b"BM");
@@ -55,5 +68,6 @@ fn a_picture_without_text_gives_nothing() {
 
 #[test]
 fn not_a_picture_is_an_error_not_a_crash() {
+    needs_ocr!();
     assert!(extract("jpg", b"definitely not a jpeg", 100_000).is_err());
 }
