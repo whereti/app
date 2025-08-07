@@ -41,7 +41,14 @@ if ($Release) {
     $tag = & { $ErrorActionPreference = "Continue"; git describe --exact-match --tags HEAD 2>$null }
     if (-not $tag) { throw "HEAD is not tagged. Tag the release (e.g. git tag v$version) and build from the tag." }
     if ($tag -ne "v$version") { throw "The tag $tag does not match the version $version in Cargo.toml." }
-    # Found now, not after ten minutes of compiling.
+    # The supporter keys: a release must carry the production public key and
+    # real checkout links, never the development ones (license.rs, links.rs).
+    $license = Get-Content (Join-Path $repoRoot "crates\whereti-app\src\license.rs") -Raw
+    $public = [regex]::Match($license, 'pub const PUBLIC_KEY_HEX: &str = "([0-9a-f]{64})"').Groups[1].Value
+    $dev = [regex]::Match($license, 'pub const DEV_PUBLIC_KEY_HEX: &str = "([0-9a-f]{64})"').Groups[1].Value
+    if (-not $public -or $public -eq $dev) { throw "license.rs still has the development public key. Run whereti.licenses/scripts/new-key.mjs and paste the production key." }
+    $links = Get-Content (Join-Path $repoRoot "crates\whereti-app\src\links.rs") -Raw
+    if ($links -match 'BUY_(PERSONAL|BUSINESS): &str = "https://whereti\.com/supporter/#') { throw "links.rs still has placeholder checkout links. Paste the Lemon Squeezy links." }    # Found now, not after ten minutes of compiling.
     $thumbprint = if ($env:WHERETI_SIGN_THUMBPRINT) { $env:WHERETI_SIGN_THUMBPRINT } else { "5DF397C236D87DA3DB0137E9CBFDF29319241E4A" }
     if (-not (Get-ChildItem Cert:\CurrentUser\My | Where-Object { $_.Thumbprint -eq $thumbprint })) {
         throw "The Authenticode certificate $thumbprint is not known to this machine. Plug the token in once with proCertum CardManager closed so Windows registers it."

@@ -271,17 +271,6 @@ pub const ENTRIES: &[Entry] = &[
         ro: "Se elimină aplicația, serviciul de căutare și indexul. Fișierele tale nu sunt atinse.",
     },
     Entry {
-        en: "Remove",
-        note: "Installer button that confirms uninstallation; short.",
-        de: "Entfernen",
-        es: "Quitar",
-        fr: "Supprimer",
-        it: "Rimuovi",
-        pl: "Usuń",
-        pt_br: "Remover",
-        ro: "Elimină",
-    },
-    Entry {
         en: "whereti was removed",
         note: "Installer title shown after the app was uninstalled.",
         de: "whereti wurde entfernt",

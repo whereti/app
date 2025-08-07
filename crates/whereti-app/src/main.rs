@@ -10,6 +10,7 @@ mod file_icons;
 mod i18n;
 mod icons;
 mod launch;
+mod license;
 mod links;
 mod preview;
 mod recent;

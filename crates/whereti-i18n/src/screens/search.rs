@@ -183,6 +183,17 @@ pub const ENTRIES: &[Entry] = &[
         ro: "Golește (Esc)",
     },
     Entry {
+        en: "Supporter: {name}",
+        note: "Search window, right of the filter tabs, once a supporter license is active. {name} is the buyer's name.",
+        de: "Unterstützer: {name}",
+        es: "Colaborador: {name}",
+        fr: "Soutien : {name}",
+        it: "Sostenitore: {name}",
+        pl: "Wspierający: {name}",
+        pt_br: "Apoiador: {name}",
+        ro: "Susținător: {name}",
+    },
+    Entry {
         en: "Start it from an Administrator terminal: whereti-service start   ({msg})",
         note: "Hint under the error title in the search window; keep the command \"whereti-service start\"; {msg} is a technical error message.",
         de: "Starten Sie ihn in einem Administrator-Terminal: whereti-service start   ({msg})",

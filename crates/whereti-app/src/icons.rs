@@ -23,6 +23,7 @@ pub enum Icon {
     Lock,
     Plug,
     Sparkle,
+    Heart,
 }
 
 /// Draws `icon` centred in `rect` (the rect's smaller side is the icon size).
@@ -54,6 +55,17 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
     };
     use std::f32::consts::{FRAC_PI_2, PI, TAU};
     match icon {
+        Icon::Heart => {
+            // filled: two round lobes and a point, readable even at 14 px
+            let r = 4.6 * k;
+            painter.circle_filled(p(8.0, 9.2), r, color);
+            painter.circle_filled(p(16.0, 9.2), r, color);
+            painter.add(eframe::egui::Shape::convex_polygon(
+                vec![p(3.55, 10.6), p(20.45, 10.6), p(12.0, 20.0)],
+                color,
+                Stroke::NONE,
+            ));
+        }
         Icon::Search => {
             painter.circle_stroke(p(10.5, 10.5), 6.5 * k, s);
             line(&[(15.4, 15.4), (20.0, 20.0)]);

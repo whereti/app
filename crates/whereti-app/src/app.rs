@@ -560,6 +560,18 @@ impl WheretiApp {
                     self.focus_search = true;
                 }
             }
+            // on the right: an invitation to support whereti, or a thank-you
+            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                ui.add_space(6.0);
+                let (text, color) = match &self.settings.license {
+                    Some(l) => (trf!("Supporter: {name}", name = l.name), p.text3),
+                    None => (tr("Support whereti").to_string(), p.accent),
+                };
+                if support_link(ui, p, &text, color).clicked() {
+                    self.settings.section = crate::settings::Section::Support;
+                    self.page = Page::Settings;
+                }
+            });
         });
         let r = row.response.rect;
         ui.painter().hline(ui.max_rect().x_range(), r.bottom(), Stroke::new(1.0, p.line));
@@ -1348,6 +1360,21 @@ fn empty_state(
 }
 
 // ---------------------------------------------------------------- rows
+
+/// A heart and a short text, clickable.
+fn support_link(ui: &mut egui::Ui, p: &Palette, text: &str, color: Color32) -> egui::Response {
+    let font = FontId::new(13.0, medium());
+    let g = ui.painter().layout_no_wrap(text.to_string(), font, color);
+    let size = Vec2::new(g.size().x + 22.0, g.size().y.max(18.0) + 8.0);
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    if resp.hovered() {
+        ui.painter().rect_filled(rect.expand(2.0), 8.0, p.hover);
+    }
+    let heart = Rect::from_center_size(Pos2::new(rect.left() + 8.0, rect.center().y), Vec2::splat(15.0));
+    crate::icons::paint(ui.painter(), heart, Icon::Heart, color);
+    ui.painter().galley(Pos2::new(rect.left() + 22.0, rect.center().y - g.size().y / 2.0), g, color);
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
 
 /// An item of the results list.
 #[derive(Clone, Copy)]
