@@ -247,6 +247,17 @@ impl Engine {
                 let query = whereti_query::parse(&r.query, &system::date_ctx());
                 Response::Content(self.content.search(idx, &query, r.limit.min(MAX_LIMIT) as usize, caller))
             }
+            Request::ScanUnindexed(r) => {
+                let query = whereti_query::parse(&r.query, &system::date_ctx());
+                // the name index is held only while the list is made
+                let plan = {
+                    let guard = self.shared.index.read();
+                    let Some(idx) = guard.as_ref() else { return Response::Scan(Default::default()) };
+                    self.content.scan_plan(idx, &query)
+                };
+                let budget = Duration::from_millis(r.budget_ms.clamp(200, 5000) as u64);
+                Response::Scan(self.content.scan_run(&plan, r.skip, budget, r.limit.clamp(1, 500) as usize, caller))
+            }
             Request::Hint { busy, away } => {
                 self.content.hint(busy, away);
                 Response::Ok

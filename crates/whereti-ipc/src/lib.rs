@@ -28,7 +28,7 @@ use windows_sys::Win32::System::Pipes::{
 };
 
 pub const PIPE_NAME: &str = r"\\.\pipe\whereti";
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 const MAX_MESSAGE: usize = 64 << 20;
 
 /// The account that created the pipe (OW), SYSTEM and Administrators: full
@@ -73,6 +73,10 @@ pub enum Request {
     /// full-screen game or video, or a presentation; `away` = screen locked
     /// or screen saver. Background work pauses or speeds up accordingly.
     Hint { busy: bool, away: bool },
+    /// Look inside the documents the content index has not read yet (while
+    /// it is still working), one step of about `budget_ms` at a time; call
+    /// again with `skip = next` until `done`.
+    ScanUnindexed(ScanRequest),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -116,6 +120,26 @@ pub struct ContentReply {
     pub micros: u64,
     /// Said under the results, e.g. "indexing: 1,234 of 5,000 documents".
     pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ScanRequest {
+    pub query: String,
+    /// Documents already looked at in earlier steps.
+    pub skip: u64,
+    pub budget_ms: u32,
+    pub limit: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ScanReply {
+    /// Documents of this step whose text has every word.
+    pub rows: Vec<Row>,
+    /// Where the next step starts.
+    pub next: u64,
+    /// Documents not indexed yet, in all.
+    pub total: u64,
+    pub done: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -164,6 +188,7 @@ pub enum Response {
     Config(ConfigReply),
     Ok,
     Error(String),
+    Scan(ScanReply),
 }
 
 pub fn write_message<T: Serialize>(w: &mut impl Write, msg: &T) -> io::Result<()> {

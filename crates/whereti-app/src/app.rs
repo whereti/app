@@ -136,6 +136,8 @@ pub struct WheretiApp {
     launch_items: Vec<crate::launch::Item>,
     /// Matches for the search in flight, shown when its results arrive.
     pending_launch: Vec<crate::launch::Item>,
+    /// "Search the documents not indexed yet", for the current search.
+    scan: Option<Scan>,
 }
 
 impl WheretiApp {
@@ -189,6 +191,7 @@ impl WheretiApp {
             last_launch_refresh: Instant::now(),
             launch_items: Vec::new(),
             pending_launch: Vec::new(),
+            scan: None,
             snippets: {
                 let wake_ctx = ctx.clone();
                 crate::snippets::Snippets::start(move || wake_ctx.request_repaint())
@@ -245,6 +248,7 @@ impl WheretiApp {
         let (query, sort, recent) = self.effective_query();
         self.recent_mode = recent;
         self.pending_launch = if recent { Vec::new() } else { self.launch.search(&self.query) };
+        self.scan = None; // a new search: offer it again, from the start
         let content = !recent && !highlight_needles(&self.query).is_empty();
         self.content_pending = content;
         self.searcher.search(Job { generation: self.generation, query, sort, limit: RESULT_LIMIT, content, recent });
@@ -312,6 +316,29 @@ impl WheretiApp {
                     let extra: Vec<Row> = reply.rows.into_iter().filter(|r| !named.contains(&r.path)).collect();
                     if !extra.is_empty() {
                         self.content_start = Some(self.rows.len());
+                        self.rows.extend(extra);
+                    }
+                }
+                Update::Scan { generation, reply } => {
+                    let Some(scan) = self.scan.as_mut().filter(|s| s.generation == generation && s.running) else { continue };
+                    scan.looked = reply.next;
+                    scan.total = reply.total;
+                    scan.found += reply.rows.len() as u64;
+                    if reply.done {
+                        scan.running = false;
+                    } else {
+                        self.searcher.scan(crate::searcher::ScanJob {
+                            generation,
+                            query: scan.query.clone(),
+                            skip: reply.next,
+                        });
+                    }
+                    let known: std::collections::HashSet<String> = self.rows.iter().map(|r| r.path.clone()).collect();
+                    let extra: Vec<Row> = reply.rows.into_iter().filter(|r| !known.contains(&r.path)).collect();
+                    if !extra.is_empty() {
+                        if self.content_start.is_none() {
+                            self.content_start = Some(self.rows.len());
+                        }
                         self.rows.extend(extra);
                     }
                 }
@@ -591,6 +618,7 @@ impl WheretiApp {
             return;
         }
         self.update_banner(ui, ctx, p);
+        self.scan_strip(ui, p);
         if self.rows.is_empty() && self.content_pending {
             ui.add_space(30.0);
             ui.vertical_centered(|ui| {
@@ -805,6 +833,85 @@ impl WheretiApp {
             if let Err(e) = crate::win::context_menu(hwnd, &path) {
                 self.flash(e);
             }
+        }
+    }
+
+    /// While document contents are still being indexed: an offer to look in
+    /// the ones not read yet, then its progress, then what it found.
+    fn scan_strip(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        let words = !highlight_needles(&self.query).is_empty();
+        let indexing = self.status.as_ref().map(|s| &s.content).filter(|c| content_active(c) && c.queued > 0);
+        if self.recent_mode || !words || (indexing.is_none() && self.scan.is_none()) {
+            return;
+        }
+        let (text, action): (String, Option<&str>) = match &self.scan {
+            None => {
+                let c = indexing.expect("indexing");
+                let all = c.done + c.queued;
+                let pct = (c.done * 100).checked_div(all).unwrap_or(0);
+                (
+                    trf!("Document contents are {pct}% indexed, so some may not be found yet.", pct),
+                    Some(tr("Search them too")),
+                )
+            }
+            Some(s) if s.running => (
+                if s.total == 0 {
+                    tr("Looking in the documents not indexed yet…").to_string()
+                } else {
+                    trf!("Looking in {looked} of {total} documents not indexed yet…", looked = shell::count(s.looked), total = shell::count(s.total))
+                },
+                Some(tr("Stop")),
+            ),
+            Some(s) => (
+                crate::trn!(
+                    "Looked in {n} document not indexed yet: {found} more found.|Looked in {n} documents not indexed yet: {found} more found.",
+                    s.looked,
+                    found = shell::count(s.found)
+                ),
+                None,
+            ),
+        };
+        ui.add_space(10.0);
+        let mut clicked = false;
+        Frame::new()
+            .fill(p.surface)
+            .stroke(Stroke::new(1.0, p.border))
+            .corner_radius(10.0)
+            .inner_margin(Margin { left: 14, right: 8, top: 6, bottom: 6 })
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    if self.scan.as_ref().is_some_and(|s| s.running) {
+                        ui.add(egui::Spinner::new().size(14.0).color(p.accent));
+                        ui.add_space(4.0);
+                    } else {
+                        let (r, _) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::hover());
+                        crate::icons::paint(ui.painter(), r, Icon::Document, p.text3);
+                        ui.add_space(4.0);
+                    }
+                    ui.label(egui::RichText::new(&text).size(12.5).color(p.text2));
+                    if let Some(a) = action {
+                        ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                            let b = egui::Button::new(egui::RichText::new(a).size(12.5).family(semibold()).color(p.accent))
+                                .fill(Color32::TRANSPARENT)
+                                .stroke(Stroke::new(1.0, p.accent.gamma_multiply(0.5)))
+                                .corner_radius(8.0);
+                            if ui.add(b).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                                clicked = true;
+                            }
+                        });
+                    }
+                });
+            });
+        if clicked {
+            match &mut self.scan {
+                None => {
+                    self.scan = Some(Scan { generation: self.generation, query: self.query.clone(), looked: 0, total: 0, found: 0, running: true });
+                    self.searcher.scan(crate::searcher::ScanJob { generation: self.generation, query: self.query.clone(), skip: 0 });
+                }
+                Some(s) => s.running = false, // Stop: the next step is simply not asked for
+            }
+            self.focus_search = true;
         }
     }
 
@@ -1374,6 +1481,16 @@ fn support_link(ui: &mut egui::Ui, p: &Palette, text: &str, color: Color32) -> e
     crate::icons::paint(ui.painter(), heart, Icon::Heart, color);
     ui.painter().galley(Pos2::new(rect.left() + 22.0, rect.center().y - g.size().y / 2.0), g, color);
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// "Search the documents not indexed yet" for one search.
+struct Scan {
+    generation: u64,
+    query: String,
+    looked: u64,
+    total: u64,
+    found: u64,
+    running: bool,
 }
 
 /// An item of the results list.

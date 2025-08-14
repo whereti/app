@@ -38,7 +38,7 @@ use whereti_core::index::{FLAG_CLOUD, FLAG_HIDDEN, FLAG_NOISE, FLAG_SYSTEM};
 use whereti_core::NameIndex;
 use whereti_extract::worker::{read_shared, Sandbox, SandboxError};
 use whereti_extract::{ExtractError, Kind};
-use whereti_ipc::{Caller, ContentReply, ContentStatus, Row};
+use whereti_ipc::{Caller, ContentReply, ContentStatus, Row, ScanReply};
 use whereti_query::{fold, Clause, Query, Term};
 
 use crate::engine::Shared;
@@ -473,6 +473,80 @@ impl Content {
     }
 }
 
+/// What a "search the documents not indexed yet" goes through.
+#[derive(Default)]
+pub struct ScanPlan {
+    needles: Vec<String>,
+    candidates: Vec<Candidate>,
+}
+
+impl Content {
+    /// The documents the content index has not read yet that match the
+    /// query's other conditions, newest first. Needs the name index (held
+    /// briefly by the caller); reads nothing.
+    pub fn scan_plan(&self, idx: &NameIndex, query: &Query) -> ScanPlan {
+        let (words, filters) = split_query(query);
+        let needles: Vec<String> =
+            words.split_whitespace().map(|w| fold(w.trim_matches('"'))).filter(|w| !w.is_empty()).collect();
+        if needles.is_empty() {
+            return ScanPlan::default();
+        }
+        let known = self.known_keys.read();
+        let mut candidates: Vec<Candidate> =
+            files_in(idx, &self.folders()).into_values().filter(|c| !known.contains(&c.key)).collect();
+        drop(known);
+        if !filters.clauses.is_empty() {
+            let entries: Vec<u32> = candidates
+                .iter()
+                .filter_map(|c| {
+                    let (letter, record) = split_key(c.key);
+                    idx.volume_index(letter).and_then(|v| idx.live_entry_of(v, record))
+                })
+                .collect();
+            let keep: HashSet<String> = idx.filter(&filters, &entries).into_iter().map(|e| idx.full_path(e)).collect();
+            candidates.retain(|c| keep.contains(&c.path));
+        }
+        candidates.sort_by(|a, b| b.modified.cmp(&a.modified).then(a.key.cmp(&b.key)));
+        ScanPlan { needles, candidates }
+    }
+
+    /// One step: reads documents from `skip` on, for about `budget`, and
+    /// returns those whose text has every word. Only files the caller may
+    /// read are opened at all (checked a few at a time, before reading).
+    pub fn scan_run(&self, plan: &ScanPlan, skip: u64, budget: Duration, limit: usize, caller: &dyn Caller) -> ScanReply {
+        let t = Instant::now();
+        let n = plan.candidates.len();
+        let mut i = (skip as usize).min(n);
+        let mut rows = Vec::new();
+        let sandbox = Sandbox::beside_current_exe().map(|mut s| {
+            s.timeout = Duration::from_secs(15);
+            s.max_file = MAX_DOCUMENT;
+            s
+        });
+        // every step reads at least one document, so the caller always gets on
+        'steps: while i < n && rows.len() < limit && (i == skip as usize || t.elapsed() < budget) {
+            let chunk = &plan.candidates[i..(i + 16).min(n)];
+            let paths: Vec<String> = chunk.iter().map(|c| c.path.clone()).collect();
+            let allowed = caller.can_read(&paths);
+            for (c, ok) in chunk.iter().zip(allowed) {
+                i += 1;
+                if ok {
+                    if let Some((_, text)) = extract(c, sandbox.as_ref()) {
+                        let folded = fold(&text);
+                        if plan.needles.iter().all(|w| folded.contains(w.as_str())) {
+                            rows.push(Row { path: c.path.clone(), is_dir: false, size: c.size, modified: c.modified, flags: 0 });
+                        }
+                    }
+                }
+                if (t.elapsed() >= budget && i > skip as usize) || rows.len() >= limit {
+                    break 'steps;
+                }
+            }
+        }
+        ScanReply { rows, next: i as u64, total: n as u64, done: i >= n }
+    }
+}
+
 /// Separates the words to look for in file contents from the conditions
 /// that filter the files. With `content:` terms, plain words stay name
 /// conditions (`raport content:total` = name has „raport”, text has „total”).
@@ -701,5 +775,49 @@ mod tests {
         );
         assert!(validate_folders(&[r"\\server\share".into()]).is_err());
         assert!(validate_folders(&["Documents".into()]).is_err());
+    }
+
+    /// Allowed everything except paths containing "secret".
+    struct NotSecrets;
+    impl Caller for NotSecrets {
+        fn can_read(&self, paths: &[String]) -> Vec<bool> {
+            paths.iter().map(|p| !p.contains("secret")).collect()
+        }
+    }
+
+    #[test]
+    fn documents_not_indexed_yet_are_searched_step_by_step() {
+        let dir = std::env::temp_dir().join(format!("whereti-scan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = |name: &str, text: &str, modified: u32| {
+            let path = dir.join(name);
+            std::fs::write(&path, text).unwrap();
+            Candidate { key: modified as u64, path: path.to_string_lossy().into_owned(), size: text.len() as u64, modified }
+        };
+        let plan = ScanPlan {
+            needles: vec![fold("chirie"), fold("Iulie")],
+            candidates: vec![
+                file("a.txt", "Chiria pe iulie: 1200 lei", 30),
+                file("b.txt", "nimic aici", 20),
+                file("secret.txt", "chiria pe iulie, secret", 10),
+                file("c.md", "Contract: chirie, plata în IULIE", 5),
+            ],
+        };
+        let content = Content::open(&dir.join("index"), &|_| {});
+        // a tiny budget still reads at least one document per step
+        let first = content.scan_run(&plan, 0, Duration::ZERO, 100, &NotSecrets);
+        assert_eq!(first.next, 1);
+        let all = content.scan_run(&plan, 0, Duration::from_secs(10), 100, &NotSecrets);
+        let found: Vec<&str> = all.rows.iter().map(|r| r.path.rsplit('\\').next().unwrap()).collect();
+        // "chiria" does not contain "chirie": only c.md has both words; the secret is never read
+        assert_eq!(found, ["c.md"]);
+        assert!(all.done);
+        assert_eq!((all.next, all.total), (4, 4));
+        // resuming past the end gives nothing more
+        let after = content.scan_run(&plan, 4, Duration::from_secs(1), 100, &NotSecrets);
+        assert!(after.done && after.rows.is_empty());
+        drop(content);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -5,7 +5,9 @@
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
-use whereti_ipc::{Client, ConfigReply, ContentReply, Request, Response, SearchReply, SearchRequest, Sort, StatusReply};
+use whereti_ipc::{
+    Client, ConfigReply, ContentReply, Request, Response, ScanReply, ScanRequest, SearchReply, SearchRequest, Sort, StatusReply,
+};
 
 /// Content search waits this long after the name results, so it runs only
 /// once typing pauses.
@@ -25,6 +27,8 @@ pub struct Job {
 pub enum Update {
     Results { generation: u64, reply: SearchReply, round_trip: Duration },
     Content { generation: u64, reply: ContentReply },
+    /// One step of looking in the documents not indexed yet.
+    Scan { generation: u64, reply: ScanReply },
     Status(StatusReply),
     Config(ConfigReply),
     /// A change was accepted; a short message for the user.
@@ -33,8 +37,16 @@ pub enum Update {
     Offline(String),
 }
 
+/// One step of "search the documents not indexed yet".
+pub struct ScanJob {
+    pub generation: u64,
+    pub query: String,
+    pub skip: u64,
+}
+
 enum Msg {
     Search(Job),
+    Scan(ScanJob),
     Status,
     Config,
     SetExclusions(Vec<String>),
@@ -61,6 +73,10 @@ impl Searcher {
         let _ = self.tx.send(Msg::Search(job));
     }
 
+    pub fn scan(&self, job: ScanJob) {
+        let _ = self.tx.send(Msg::Scan(job));
+    }
+
     pub fn ask_status(&self) {
         let _ = self.tx.send(Msg::Status);
     }
@@ -82,6 +98,7 @@ impl Searcher {
 #[derive(Default)]
 struct Pending {
     search: Option<Job>,
+    scan: Option<ScanJob>,
     status: bool,
     config: bool,
     exclusions: Option<Vec<String>>,
@@ -95,6 +112,7 @@ fn worker(jobs: Receiver<Msg>, out: Sender<Update>, wake: impl Fn()) {
         let mut p = Pending::default();
         let mut take = |m: Msg| match m {
             Msg::Search(j) => p.search = Some(j),
+            Msg::Scan(j) => p.scan = Some(j),
             Msg::Status => p.status = true,
             Msg::Config => p.config = true,
             Msg::SetExclusions(e) => {
@@ -165,6 +183,12 @@ fn worker(jobs: Receiver<Msg>, out: Sender<Update>, wake: impl Fn()) {
                             }
                         }
                     }
+                }
+            }
+            if let Some(job) = p.scan {
+                let req = Request::ScanUnindexed(ScanRequest { query: job.query, skip: job.skip, budget_ms: 1500, limit: 100 });
+                if let Response::Scan(reply) = c.call(&req)? {
+                    let _ = out.send(Update::Scan { generation: job.generation, reply });
                 }
             }
             if p.config {
