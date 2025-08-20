@@ -122,4 +122,5 @@ if ($Release) {
     $json = $manifest | ConvertTo-Json -Depth 5
     [IO.File]::WriteAllText((Join-Path $dist "latest.json"), $json, (New-Object Text.UTF8Encoding $false))
     Write-Host "dist\latest.json written: publish it with whereti.releases after the GitHub release."
+    & "$PSScriptRoot\winget.ps1" -Version $version -Sha256 $hash
 }
