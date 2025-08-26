@@ -7,17 +7,6 @@ use crate::Entry;
 
 pub const ENTRIES: &[Entry] = &[
     Entry {
-        en: "Back (Esc)",
-        note: "Tooltip of the back arrow button at the top of the Settings page; keep the key name Esc.",
-        de: "Zurück (Esc)",
-        es: "Atrás (Esc)",
-        fr: "Retour (Échap)",
-        it: "Indietro (Esc)",
-        pl: "Wstecz (Esc)",
-        pt_br: "Voltar (Esc)",
-        ro: "Înapoi (Esc)",
-    },
-    Entry {
         en: "Settings",
         note: "Title of the Settings page.",
         de: "Einstellungen",

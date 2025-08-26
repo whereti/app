@@ -222,6 +222,7 @@ fn tip(ui: &mut egui::Ui, p: &Palette, width: f32, icon: Icon, title: &str, text
 fn primary_button(ui: &mut egui::Ui, p: &Palette, text: &str) -> egui::Response {
     let galley = ui.painter().layout_no_wrap(text.to_string(), FontId::new(14.0, semibold()), p.on_accent);
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(galley.size().x + 40.0, 40.0), Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, text));
     let fill = if resp.hovered() { theme::mix(p.accent, Color32::BLACK, 0.10) } else { p.accent };
     ui.painter().rect_filled(rect, 10.0, fill);
     ui.painter().galley(rect.center() - galley.size() / 2.0, galley, p.on_accent);

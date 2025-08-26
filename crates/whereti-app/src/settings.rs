@@ -268,7 +268,7 @@ fn general(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette, ctx: &egui::Con
             tr("whereti waits next to the clock, ready to search."),
             |ui| {
                 let mut on = app.settings.autostart;
-                if toggle(ui, p, &mut on).clicked() {
+                if toggle(ui, p, &mut on, tr("Start with Windows")).clicked() {
                     match shell::set_autostart(on) {
                         Ok(()) => app.settings.autostart = on,
                         Err(e) => app.flash(e),
@@ -284,7 +284,7 @@ fn general(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette, ctx: &egui::Con
             tr("Once a day, whereti asks whereti.com if there is a new version. Only its version number is sent."),
             |ui| {
                 let mut on = app.settings.updates;
-                if toggle(ui, p, &mut on).clicked() {
+                if toggle(ui, p, &mut on, tr("Check for updates")).clicked() {
                     app.settings.updates = on;
                     app.settings.save();
                 }
@@ -479,6 +479,7 @@ fn about(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
             ] {
                 let link = ui
                     .add(egui::Label::new(egui::RichText::new(label).size(13.0).color(p.accent)).sense(Sense::click()))
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
                     .on_hover_cursor(egui::CursorIcon::PointingHand)
                     .on_hover_text(url);
                 if link.clicked() {
@@ -822,6 +823,7 @@ pub(crate) fn stop_recording(app: &mut WheretiApp) {
 
 fn nav_item(ui: &mut egui::Ui, p: &Palette, icon: Icon, label: &str, selected: bool) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 38.0), Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::Tab, true, selected, label));
     let painter = ui.painter();
     if selected {
         painter.rect_filled(rect, 8.0, p.accent_soft);
@@ -908,6 +910,7 @@ fn segmented(ui: &mut egui::Ui, p: &Palette, options: &[&str], selected: usize) 
     for (i, (label, w)) in options.iter().zip(&widths).enumerate() {
         let r = egui::Rect::from_min_size(egui::pos2(x, rect.top() + 3.0), Vec2::new(*w, rect.height() - 6.0));
         let resp = ui.interact(r, ui.scope_id().with(("seg", label)), Sense::click());
+        resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::RadioButton, true, i == selected, *label));
         if i == selected {
             ui.painter().rect(r, 7.0, p.surface, Stroke::new(1.0, p.border), egui::StrokeKind::Inside);
         } else if resp.hovered() {
@@ -960,6 +963,7 @@ fn path_list(ui: &mut egui::Ui, p: &Palette, paths: &[String], icons: &mut crate
                 );
                 let x = egui::Rect::from_center_size(egui::pos2(rect.right() - 20.0, rect.center().y), Vec2::splat(26.0));
                 let xr = ui.interact(x, resp.id.with("x"), Sense::click());
+                xr.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, format!("{} {path}", tr("Remove"))));
                 if hovered || xr.hovered() {
                     if xr.hovered() {
                         ui.painter().rect_filled(x, 6.0, p.border);
@@ -979,6 +983,7 @@ fn button(ui: &mut egui::Ui, p: &Palette, text: &str, primary: bool) -> egui::Re
     let color = if primary { p.on_accent } else { p.text };
     let galley = ui.painter().layout_no_wrap(text.to_string(), FontId::new(13.5, semibold()), color);
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(galley.size().x + 30.0, 34.0), Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, text));
     let fill = match (primary, resp.hovered()) {
         (true, false) => p.accent,
         (true, true) => crate::theme::mix(p.accent, Color32::BLACK, 0.12),
@@ -992,12 +997,14 @@ fn button(ui: &mut egui::Ui, p: &Palette, text: &str, primary: bool) -> egui::Re
 }
 
 /// An on/off switch.
-fn toggle(ui: &mut egui::Ui, p: &Palette, on: &mut bool) -> egui::Response {
+fn toggle(ui: &mut egui::Ui, p: &Palette, on: &mut bool, name: &str) -> egui::Response {
     let (rect, mut resp) = ui.allocate_exact_size(Vec2::new(44.0, 24.0), Sense::click());
     if resp.clicked() {
         *on = !*on;
         resp.mark_changed();
     }
+    let state = *on;
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::Switch, true, state, name));
     let t = ui.ctx().animate_bool(resp.id, *on);
     let track = if *on { p.accent } else { p.border };
     ui.painter().rect_filled(rect, 12.0, track);

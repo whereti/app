@@ -775,6 +775,14 @@ impl WheretiApp {
                 let row = &rows[i];
                 if let Some(it) = launch_items.get(i) {
                     let resp = ui.interact(rect, list_id.with(i), Sense::click());
+                    let kind = match it.kind {
+                        crate::launch::Kind::App => tr("App"),
+                        crate::launch::Kind::Setting => tr("Windows settings"),
+                        crate::launch::Kind::ControlPanel => tr("Control Panel"),
+                    };
+                    resp.widget_info(|| {
+                        egui::WidgetInfo::selected(egui::Role::ListBoxOption, true, i == selected, format!("{}, {kind}", it.name))
+                    });
                     let icon = file_icons.get_shell(ui.ctx(), &it.target);
                     paint_launch_row(ui, p, rect, it, icon.as_ref(), i == selected, resp.hovered(), &needles);
                     if resp.double_clicked() {
@@ -785,6 +793,11 @@ impl WheretiApp {
                     continue;
                 }
                 let resp = ui.interact(rect, list_id.with(i), Sense::click_and_drag());
+                // name, then folder: what a screen reader says for the row
+                resp.widget_info(|| {
+                    let (folder, name) = row.path.rsplit_once('\\').unwrap_or(("", row.path.as_str()));
+                    egui::WidgetInfo::selected(egui::Role::ListBoxOption, true, i == selected, format!("{name}, {folder}"))
+                });
                 let icon = file_icons.get(ui.ctx(), &row.path, row.is_dir);
                 if content_start.is_some_and(|s| i >= s) {
                     let line = snippets.get(&row.path);
@@ -1090,6 +1103,7 @@ impl WheretiApp {
             painter.galley(at, g, color);
             if update_link {
                 let r = ui.interact(hit, ui.scope_id().with("update-link"), egui::Sense::click());
+                r.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Link, true, tr("Install update")));
                 if r.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                     self.settings.section = crate::settings::Section::About;
                     self.page = Page::Settings;
@@ -1357,6 +1371,18 @@ pub(crate) enum IconKind {
 /// A 32×32 icon button with a line icon; tinted when active.
 pub(crate) fn icon_button(ui: &mut egui::Ui, p: &Palette, kind: IconKind, active: bool) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(32.0), Sense::click());
+    // what a screen reader says for it
+    let name = match kind {
+        IconKind::Gear => tr("Settings (Ctrl+,)"),
+        IconKind::Close => tr("Clear (Esc)"),
+        IconKind::Back => tr("Back (Esc)"),
+        IconKind::Preview => tr("Preview"),
+    };
+    let enabled = ui.is_enabled();
+    match kind {
+        IconKind::Preview => resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::CheckBox, enabled, active, name)),
+        _ => resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, enabled, name)),
+    }
     let painter = ui.painter();
     if active {
         painter.rect_filled(rect, 8.0, p.accent_soft);
@@ -1386,6 +1412,7 @@ fn tab(ui: &mut egui::Ui, p: &Palette, text: &str, selected: bool) -> egui::Resp
     let font = FontId::new(13.5, if selected { semibold() } else { medium() });
     let galley = ui.painter().layout_no_wrap(text.to_string(), font, p.text);
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(galley.size().x, 34.0), Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::Tab, true, selected, text));
     let color = if selected || resp.hovered() { p.text } else { p.text2 };
     ui.painter().galley(Pos2::new(rect.left(), rect.top() + 6.0), galley, color);
     if selected {
@@ -1401,6 +1428,7 @@ pub(crate) fn chip(ui: &mut egui::Ui, p: &Palette, text: &str, selected: bool) -
     let galley = ui.painter().layout_no_wrap(text.to_string(), font, p.text2);
     let size = Vec2::new(galley.size().x + 24.0, 30.0);
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::RadioButton, true, selected, text));
     let painter = ui.painter();
     let (fill, stroke, color) = if selected {
         (p.accent_soft, Stroke::new(1.0, theme::with_alpha(p.accent, 0.55)), p.accent)
@@ -1474,6 +1502,7 @@ fn support_link(ui: &mut egui::Ui, p: &Palette, text: &str, color: Color32) -> e
     let g = ui.painter().layout_no_wrap(text.to_string(), font, color);
     let size = Vec2::new(g.size().x + 22.0, g.size().y.max(18.0) + 8.0);
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Link, true, text));
     if resp.hovered() {
         ui.painter().rect_filled(rect.expand(2.0), 8.0, p.hover);
     }
