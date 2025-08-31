@@ -58,7 +58,8 @@ if ($Release) {
 Write-Host "`n== Programs ==" -ForegroundColor Cyan
 Invoke-Native "building the programs" { cargo build --release --locked -p whereti-app -p whereti-service -p whereti-extract -p whereti-cli }
 
-if (Test-Path $dist) { Remove-Item $dist -Recurse -Force }
+# emptied rather than deleted: an Explorer window open on dist keeps the folder itself busy
+if (Test-Path $dist) { Get-ChildItem $dist -Force | Remove-Item -Recurse -Force }
 New-Item -ItemType Directory -Force $payload | Out-Null
 foreach ($p in $programs) {
     Copy-Item (Join-Path $repoRoot "target\release\$p") (Join-Path $payload $p)
