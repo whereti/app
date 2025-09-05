@@ -138,6 +138,8 @@ pub struct WheretiApp {
     pending_launch: Vec<crate::launch::Item>,
     /// "Search the documents not indexed yet", for the current search.
     scan: Option<Scan>,
+    /// Confetti after a supporter license is activated: when it started.
+    confetti: Option<Instant>,
 }
 
 impl WheretiApp {
@@ -192,6 +194,7 @@ impl WheretiApp {
             launch_items: Vec::new(),
             pending_launch: Vec::new(),
             scan: None,
+            confetti: None,
             snippets: {
                 let wake_ctx = ctx.clone();
                 crate::snippets::Snippets::start(move || wake_ctx.request_repaint())
@@ -590,11 +593,11 @@ impl WheretiApp {
             // on the right: an invitation to support whereti, or a thank-you
             ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
                 ui.add_space(6.0);
-                let (text, color) = match &self.settings.license {
-                    Some(l) => (trf!("Supporter: {name}", name = l.name), p.text3),
-                    None => (tr("Support whereti").to_string(), p.accent),
+                let (text, color, warm) = match &self.settings.license {
+                    Some(l) => (trf!("Supporter: {name}", name = l.name), supporter_gold(p), true),
+                    None => (tr("Support whereti").to_string(), p.accent, false),
                 };
-                if support_link(ui, p, &text, color).clicked() {
+                if support_link(ui, p, &text, color, warm).clicked() {
                     self.settings.section = crate::settings::Section::Support;
                     self.page = Page::Settings;
                 }
@@ -1152,6 +1155,7 @@ impl eframe::App for WheretiApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        self.paint_confetti(ui.ctx());
         let ctx = ui.ctx().clone();
         // The close button hides the window to the tray; "Ieșire" really quits.
         if ctx.input(|i| i.viewport().close_requested()) && !self.quitting && self.tray.is_some() {
@@ -1497,19 +1501,109 @@ fn empty_state(
 // ---------------------------------------------------------------- rows
 
 /// A heart and a short text, clickable.
-fn support_link(ui: &mut egui::Ui, p: &Palette, text: &str, color: Color32) -> egui::Response {
+/// The supporter's amber, from the pin in the logo; lighter on dark themes.
+pub(crate) fn supporter_gold(p: &Palette) -> Color32 {
+    if p.dark {
+        Color32::from_rgb(255, 196, 102)
+    } else {
+        Color32::from_rgb(201, 106, 18)
+    }
+}
+
+fn support_link(ui: &mut egui::Ui, p: &Palette, text: &str, color: Color32, warm: bool) -> egui::Response {
     let font = FontId::new(13.0, medium());
     let g = ui.painter().layout_no_wrap(text.to_string(), font, color);
     let size = Vec2::new(g.size().x + 22.0, g.size().y.max(18.0) + 8.0);
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Link, true, text));
-    if resp.hovered() {
+    if warm {
+        // a supporter's badge: a soft amber pill, a little stronger on hover
+        let a = if resp.hovered() { 0.22 } else { 0.13 };
+        ui.painter().rect_filled(rect.expand2(Vec2::new(6.0, 1.0)), 9.0, theme::with_alpha(color, a));
+    } else if resp.hovered() {
         ui.painter().rect_filled(rect.expand(2.0), 8.0, p.hover);
     }
     let heart = Rect::from_center_size(Pos2::new(rect.left() + 8.0, rect.center().y), Vec2::splat(15.0));
     crate::icons::paint(ui.painter(), heart, Icon::Heart, color);
     ui.painter().galley(Pos2::new(rect.left() + 22.0, rect.center().y - g.size().y / 2.0), g, color);
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+impl WheretiApp {
+    /// After a license is activated or removed: the logo everywhere, and a
+    /// little confetti for a new supporter.
+    pub(crate) fn supporter_changed(&mut self, ctx: &egui::Context, celebrate: bool) {
+        crate::tray::set_supporter(self.settings.license.is_some());
+        if let Some(t) = &self.tray {
+            let _ = t.icon.set_icon(Some(crate::tray::icon_with_progress(self.tray_progress)));
+        }
+        let icon = egui::IconData { rgba: crate::tray::logo_rgba_64(), width: 64, height: 64 };
+        ctx.send_viewport_cmd(ViewportCommand::Icon(Some(Arc::new(icon))));
+        if celebrate && animations_on() {
+            self.confetti = Some(Instant::now());
+        }
+    }
+
+    /// Confetti in the logo's colours, falling over the whole window.
+    fn paint_confetti(&mut self, ctx: &egui::Context) {
+        const LIFE: f32 = 2.6;
+        let Some(start) = self.confetti else { return };
+        let t = start.elapsed().as_secs_f32();
+        if t > LIFE {
+            self.confetti = None;
+            return;
+        }
+        let screen = ctx.content_rect();
+        let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::unique("confetti")));
+        let colors = [
+            Color32::from_rgb(47, 107, 255),
+            Color32::from_rgb(74, 75, 240),
+            Color32::from_rgb(108, 43, 217),
+            Color32::from_rgb(255, 214, 107),
+            Color32::from_rgb(255, 138, 61),
+        ];
+        for i in 0..110u32 {
+            // a fixed pseudo-random shape per piece
+            let h = |k: u32| {
+                // splitmix64's finaliser: unrelated values for every (piece, k)
+                let mut x = ((i as u64) << 32 | k as u64).wrapping_add(0x9E37_79B9_7F4A_7C15);
+                x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                ((x ^ (x >> 31)) % 10_000) as f32 / 10_000.0
+            };
+            let delay = h(1) * 0.5;
+            let lt = t - delay;
+            if lt <= 0.0 {
+                continue;
+            }
+            let x0 = screen.left() + screen.width() * (0.1 + 0.8 * h(2));
+            let vx = (h(3) - 0.5) * 160.0;
+            let vy = 60.0 + h(4) * 140.0;
+            let x = x0 + vx * lt + (lt * 3.0 + h(5) * 6.0).sin() * 18.0;
+            let y = screen.top() - 20.0 + vy * lt + 0.5 * 420.0 * lt * lt;
+            let fade = (1.0 - (lt / (LIFE - delay)).powi(3)).clamp(0.0, 1.0);
+            let color = theme::with_alpha(colors[(h(6) * colors.len() as f32) as usize % colors.len()], fade);
+            let angle = h(7) * std::f32::consts::TAU + lt * (h(8) * 8.0 - 4.0);
+            let (w, hgt) = (4.0 + h(9) * 4.0, 2.5 + h(10) * 2.5);
+            let (s, c) = angle.sin_cos();
+            let corner = |dx: f32, dy: f32| Pos2::new(x + dx * c - dy * s, y + dx * s + dy * c);
+            painter.add(egui::Shape::convex_polygon(
+                vec![corner(-w, -hgt), corner(w, -hgt), corner(w, hgt), corner(-w, hgt)],
+                color,
+                Stroke::NONE,
+            ));
+        }
+        ctx.request_repaint();
+    }
+}
+
+/// Windows' "Animation effects" setting (Accessibility, Visual effects).
+fn animations_on() -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SystemParametersInfoW, SPI_GETCLIENTAREAANIMATION};
+    let mut on: i32 = 1;
+    // SAFETY: the out value is a BOOL, as SPI_GETCLIENTAREAANIMATION expects.
+    unsafe { SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &mut on as *mut i32 as *mut _, 0) };
+    on != 0
 }
 
 /// "Search the documents not indexed yet" for one search.

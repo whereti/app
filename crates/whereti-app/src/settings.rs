@@ -508,8 +508,9 @@ fn support(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
             ui.add_space(16.0);
             ui.horizontal(|ui| {
                 let (badge, _) = ui.allocate_exact_size(Vec2::splat(44.0), Sense::hover());
-                ui.painter().circle_filled(badge.center(), 22.0, p.accent_soft);
-                crate::icons::paint(ui.painter(), badge.shrink(11.0), Icon::Heart, p.accent);
+                let gold = crate::app::supporter_gold(p);
+                ui.painter().circle_filled(badge.center(), 22.0, crate::theme::with_alpha(gold, 0.16));
+                crate::icons::paint(ui.painter(), badge.shrink(11.0), Icon::Heart, gold);
                 ui.add_space(12.0);
                 ui.vertical(|ui| {
                     ui.label(egui::RichText::new(trf!("Thank you, {name}!", name = l.name)).size(18.0).family(semibold()).color(p.text));
@@ -526,6 +527,8 @@ fn support(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
                 if button(ui, p, tr("Remove"), false).clicked() {
                     crate::license::remove();
                     app.settings.license = None;
+                    let ctx = ui.ctx().clone();
+                    app.supporter_changed(&ctx, false);
                 }
                 if button(ui, p, tr("Copy"), false).clicked() {
                     ui.ctx().copy_text(l.key.clone());
@@ -624,6 +627,8 @@ fn support(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
                             app.settings.license = Some(l);
                             app.settings.license_input.clear();
                             app.settings.license_error = None;
+                            let ctx = ui.ctx().clone();
+                            app.supporter_changed(&ctx, true);
                         }
                         Err(e) => app.settings.license_error = Some(e.to_string()),
                     },

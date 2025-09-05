@@ -233,15 +233,63 @@ pub fn install(
     Ok(Tray { icon, open_item, quit_item: quit, manager, registered, hotkey })
 }
 
+/// A supporter's logo has a gold edge (tray, taskbar, Alt+Tab).
+static SUPPORTER: AtomicBool = AtomicBool::new(false);
+
+pub fn set_supporter(on: bool) {
+    SUPPORTER.store(on, Ordering::Relaxed);
+}
+
 /// The whereti logo, 32×32 (rendered from media/logo-small.svg by
 /// tools/render-icons).
 pub fn logo_rgba_32() -> Vec<u8> {
-    include_bytes!("../../../media/icons/whereti-32.rgba").to_vec()
+    let mut px = include_bytes!("../../../media/icons/whereti-32.rgba").to_vec();
+    if SUPPORTER.load(Ordering::Relaxed) {
+        gold_edge(&mut px, 32);
+    }
+    px
 }
 
 /// The logo at 64×64, for the window (taskbar, Alt+Tab).
 pub fn logo_rgba_64() -> Vec<u8> {
-    include_bytes!("../../../media/icons/whereti-64.rgba").to_vec()
+    let mut px = include_bytes!("../../../media/icons/whereti-64.rgba").to_vec();
+    if SUPPORTER.load(Ordering::Relaxed) {
+        gold_edge(&mut px, 64);
+    }
+    px
+}
+
+/// Paints the rim of the rounded tile in the pin's gold (light at the top,
+/// amber at the bottom): every opaque pixel near a transparent one.
+fn gold_edge(px: &mut [u8], size: usize) {
+    let w = (size / 16).max(2) as isize;
+    let alpha = |x: isize, y: isize| -> u8 {
+        if x < 0 || y < 0 || x >= size as isize || y >= size as isize {
+            0
+        } else {
+            px[(y as usize * size + x as usize) * 4 + 3]
+        }
+    };
+    let mut rim = Vec::new();
+    for y in 0..size as isize {
+        for x in 0..size as isize {
+            if alpha(x, y) < 64 {
+                continue;
+            }
+            let near_edge = (-w..=w).any(|dy| (-w..=w).any(|dx| dx * dx + dy * dy <= w * w && alpha(x + dx, y + dy) < 64));
+            if near_edge {
+                rim.push((x as usize, y as usize));
+            }
+        }
+    }
+    for (x, y) in rim {
+        let t = y as f32 / (size - 1) as f32;
+        let (r, g, b) = (255.0, 214.0 + (138.0 - 214.0) * t, 107.0 + (61.0 - 107.0) * t);
+        let i = (y * size + x) * 4;
+        px[i] = r as u8;
+        px[i + 1] = g as u8;
+        px[i + 2] = b as u8;
+    }
 }
 
 fn magnifier_icon() -> Icon {
