@@ -13,7 +13,7 @@ use std::path::Path;
 
 const SIZES: [u32; 9] = [16, 20, 24, 32, 40, 48, 64, 128, 256];
 const ICO_SIZES: [u32; 8] = [16, 20, 24, 32, 40, 48, 64, 256];
-const RAW_SIZES: [u32; 2] = [32, 64];
+const RAW_SIZES: [u32; 3] = [32, 64, 128];
 
 fn main() {
     let media = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../media");

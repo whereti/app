@@ -593,11 +593,12 @@ impl WheretiApp {
             // on the right: an invitation to support whereti, or a thank-you
             ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
                 ui.add_space(6.0);
-                let (text, color, warm) = match &self.settings.license {
-                    Some(l) => (trf!("Supporter: {name}", name = l.name), supporter_gold(p), true),
-                    None => (tr("Support whereti").to_string(), p.accent, false),
+                // a supporter: quiet grey text, only the heart in amber
+                let (text, color, heart) = match &self.settings.license {
+                    Some(l) => (trf!("Supporter: {name}", name = l.name), p.text3, supporter_gold(p)),
+                    None => (tr("Support whereti").to_string(), p.accent, p.accent),
                 };
-                if support_link(ui, p, &text, color, warm).clicked() {
+                if support_link(ui, p, &text, color, heart).clicked() {
                     self.settings.section = crate::settings::Section::Support;
                     self.page = Page::Settings;
                 }
@@ -1510,21 +1511,17 @@ pub(crate) fn supporter_gold(p: &Palette) -> Color32 {
     }
 }
 
-fn support_link(ui: &mut egui::Ui, p: &Palette, text: &str, color: Color32, warm: bool) -> egui::Response {
+fn support_link(ui: &mut egui::Ui, p: &Palette, text: &str, color: Color32, heart_color: Color32) -> egui::Response {
     let font = FontId::new(13.0, medium());
     let g = ui.painter().layout_no_wrap(text.to_string(), font, color);
     let size = Vec2::new(g.size().x + 22.0, g.size().y.max(18.0) + 8.0);
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Link, true, text));
-    if warm {
-        // a supporter's badge: a soft amber pill, a little stronger on hover
-        let a = if resp.hovered() { 0.22 } else { 0.13 };
-        ui.painter().rect_filled(rect.expand2(Vec2::new(6.0, 1.0)), 9.0, theme::with_alpha(color, a));
-    } else if resp.hovered() {
+    if resp.hovered() {
         ui.painter().rect_filled(rect.expand(2.0), 8.0, p.hover);
     }
-    let heart = Rect::from_center_size(Pos2::new(rect.left() + 8.0, rect.center().y), Vec2::splat(15.0));
-    crate::icons::paint(ui.painter(), heart, Icon::Heart, color);
+    let heart = Rect::from_center_size(Pos2::new(rect.left() + 8.0, rect.center().y), Vec2::splat(13.0));
+    crate::icons::paint(ui.painter(), heart, Icon::Heart, heart_color);
     ui.painter().galley(Pos2::new(rect.left() + 22.0, rect.center().y - g.size().y / 2.0), g, color);
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }

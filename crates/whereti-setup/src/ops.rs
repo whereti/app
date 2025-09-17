@@ -72,8 +72,8 @@ pub fn install(log: &mut dyn FnMut(&str)) -> Result<(), String> {
     let dir = install_dir();
     log("Stopping the running whereti…");
     stop_service();
-    kill("whereti.exe");
-    kill("whereti-extract.exe");
+    close_running(&dir);
+    remove_leftovers(&dir);
 
     log("Copying the files…");
     std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
@@ -83,7 +83,8 @@ pub fn install(log: &mut dyn FnMut(&str)) -> Result<(), String> {
     let me = std::env::current_exe().map_err(|e| e.to_string())?;
     let uninstaller = dir.join("uninstall.exe");
     if me != uninstaller {
-        std::fs::copy(&me, &uninstaller).map_err(|e| format!("cannot write the uninstaller: {e}"))?;
+        let bytes = std::fs::read(&me).map_err(|e| format!("cannot read the installer: {e}"))?;
+        write_file(&uninstaller, &bytes)?;
     }
 
     log("Installing the search service…");
@@ -99,19 +100,98 @@ pub fn install(log: &mut dyn FnMut(&str)) -> Result<(), String> {
     Ok(())
 }
 
-/// Writes next to the target, then renames: a half-written program is never left behind.
+/// Writes next to the target, then renames: a half-written program is never
+/// left behind. A file still held open (a whereti in another user's session,
+/// an antivirus scan) is moved aside, which Windows allows even for a running
+/// program, and deleted at the next install or restart.
 fn write_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let tmp = path.with_extension("new");
     std::fs::write(&tmp, bytes).map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
-    for attempt in 0..20 {
+    for attempt in 0..8 {
         match std::fs::rename(&tmp, path) {
             Ok(()) => return Ok(()),
             // a process that was just stopped may hold the file a moment longer
-            Err(_) if attempt < 19 => std::thread::sleep(Duration::from_millis(250)),
-            Err(e) => return Err(format!("cannot replace {}: {e} (is whereti still running?)", path.display())),
+            Err(_) if attempt < 7 => std::thread::sleep(Duration::from_millis(250)),
+            Err(_) => {}
         }
     }
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+    let aside = path.with_file_name(format!("{name}.{stamp}{OLD}"));
+    std::fs::rename(path, &aside)
+        .and_then(|()| std::fs::rename(&tmp, path))
+        .map_err(|e| format!("cannot replace {}: {e}", path.display()))?;
+    delete_at_restart(&aside);
     Ok(())
+}
+
+/// The ending of a program moved aside by `write_file`.
+const OLD: &str = ".old";
+
+/// Deletes the programs moved aside by an earlier install, where possible.
+fn remove_leftovers(dir: &Path) {
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        if entry.file_name().to_string_lossy().ends_with(OLD) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+        if entry.path().extension().is_some_and(|e| e == "new") {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+fn delete_at_restart(path: &Path) {
+    use windows::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_DELAY_UNTIL_REBOOT};
+    // SAFETY: a valid path string and a null target, as the API documents for deletion.
+    let _ = unsafe { MoveFileExW(&HSTRING::from(path.as_os_str()), PCWSTR::null(), MOVEFILE_DELAY_UNTIL_REBOOT) };
+}
+
+/// Closes every program running from the install folder (the app in every
+/// user's session, wt, the extractor, a service that would not stop) and
+/// waits until each has really exited, so its files can be replaced.
+fn close_running(dir: &Path) {
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+    };
+    use windows::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, TerminateProcess, WaitForSingleObject, PROCESS_NAME_WIN32,
+        PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+    };
+    let folder = dir.to_string_lossy().to_lowercase();
+    let folder = folder.trim_end_matches('\\').to_string() + "\\";
+    let me = std::process::id();
+    let mut closing = Vec::new();
+    // SAFETY: the snapshot and process handles are checked and closed below;
+    // the buffers are sized as passed.
+    unsafe {
+        let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else { return };
+        let mut entry = PROCESSENTRY32W { dwSize: size_of::<PROCESSENTRY32W>() as u32, ..Default::default() };
+        let mut more = Process32FirstW(snap, &mut entry).is_ok();
+        while more {
+            let pid = entry.th32ProcessID;
+            if pid != me && pid != 0 {
+                let access = PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE | PROCESS_SYNCHRONIZE;
+                if let Ok(h) = OpenProcess(access, false, pid) {
+                    let mut buf = [0u16; 1024];
+                    let mut len = buf.len() as u32;
+                    let path = QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, windows::core::PWSTR(buf.as_mut_ptr()), &mut len)
+                        .ok()
+                        .map(|()| String::from_utf16_lossy(&buf[..len as usize]).to_lowercase());
+                    if path.is_some_and(|p| p.starts_with(&folder)) && TerminateProcess(h, 1).is_ok() {
+                        closing.push(h);
+                    } else {
+                        let _ = CloseHandle(h);
+                    }
+                }
+            }
+            more = Process32NextW(snap, &mut entry).is_ok();
+        }
+        let _ = CloseHandle(snap);
+        for h in closing {
+            WaitForSingleObject(h, 10_000);
+            let _ = CloseHandle(h);
+        }
+    }
 }
 
 fn run(exe: &Path, args: &[&str]) -> Result<(), String> {
@@ -150,10 +230,6 @@ fn stop_service() {
             _ => std::thread::sleep(Duration::from_millis(200)),
         }
     }
-}
-
-fn kill(image: &str) {
-    let _ = Command::new("taskkill").args(["/IM", image, "/F"]).output();
 }
 
 fn shortcut(link: &Path, target: &Path) -> Result<(), String> {
@@ -232,8 +308,7 @@ pub fn uninstall(log: &mut dyn FnMut(&str)) -> Result<(), String> {
     if service_exists() && service.is_file() {
         run(&service, &["uninstall"])?;
     }
-    kill("whereti.exe");
-    kill("whereti-extract.exe");
+    close_running(&dir);
 
     log("Removing the files…");
     let me = std::env::current_exe().ok();

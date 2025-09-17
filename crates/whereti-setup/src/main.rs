@@ -55,7 +55,7 @@ fn main() {
         renderer: eframe::Renderer::Glow,
         viewport: egui::ViewportBuilder::default()
             .with_title(if uninstalling { "Uninstall whereti" } else { "whereti setup" })
-            .with_inner_size([560.0, 460.0])
+            .with_inner_size([600.0, 600.0])
             .with_resizable(false)
             .with_maximize_button(false)
             .with_icon(Arc::new(egui::IconData { rgba: logo_rgba(), width: 64, height: 64 })),
@@ -67,8 +67,22 @@ fn main() {
         options,
         Box::new(move |cc| {
             setup_fonts(&cc.egui_ctx);
-            let state = if uninstalling { State::ConfirmUninstall } else { State::Ready { update: ops::installed_version() } };
-            Ok(Box::new(Setup { state: Arc::new(Mutex::new(state)), autostart: true }))
+            let mut state = if uninstalling { State::ConfirmUninstall } else { State::Ready { update: ops::installed_version() } };
+            // `--preview <screen>`: shows one screen without doing anything (to check the design)
+            if let Some(screen) = args.iter().position(|a| a == "--preview").and_then(|i| args.get(i + 1)) {
+                state = match screen.as_str() {
+                    "fresh" => State::Ready { update: None },
+                    "update" => State::Ready { update: Some("0.0.1".into()) },
+                    "working" => State::Working,
+                    "installed" => State::Installed { updated: false },
+                    "updated" => State::Installed { updated: true },
+                    "failed" => State::Failed("cannot replace C:\\Program Files\\whereti\\whereti.exe (is whereti still running?)".into()),
+                    "remove" => State::ConfirmUninstall,
+                    "removed" => State::Removed,
+                    _ => state,
+                };
+            }
+            Ok(Box::new(Setup { state: Arc::new(Mutex::new(state)), autostart: true, logo: None, content_h: 0.0 }))
         }),
     );
     // No window could be opened (graphics driver…): say why somewhere findable.
@@ -106,7 +120,8 @@ fn silent_uninstall() -> Result<(), String> {
 enum State {
     Ready { update: Option<String> },
     Working,
-    Installed,
+    /// `updated`: an older whereti was replaced (settings and index kept).
+    Installed { updated: bool },
     Failed(String),
     ConfirmUninstall,
     Removing,
@@ -116,6 +131,10 @@ enum State {
 struct Setup {
     state: Arc<Mutex<State>>,
     autostart: bool,
+    /// The logo, 128×128, loaded once.
+    logo: Option<egui::TextureHandle>,
+    /// The height of the last screen drawn, to centre the next one vertically.
+    content_h: f32,
 }
 
 impl Setup {
@@ -123,6 +142,7 @@ impl Setup {
         let state = self.state.clone();
         let ctx = ctx.clone();
         let autostart = self.autostart;
+        let updated = ops::installed_version().is_some();
         *state.lock().unwrap() = if uninstall { State::Removing } else { State::Working };
         std::thread::spawn(move || {
             let result = if uninstall {
@@ -132,7 +152,7 @@ impl Setup {
                 elevated_or_not("--do-install", ops::install).map(|()| ops::set_autostart(autostart))
             };
             *state.lock().unwrap() = match (result, uninstall) {
-                (Ok(()), false) => State::Installed,
+                (Ok(()), false) => State::Installed { updated },
                 (Ok(()), true) => State::Removed,
                 (Err(e), false) if e == "cancelled" => State::Ready { update: ops::installed_version() },
                 (Err(e), true) if e == "cancelled" => State::ConfirmUninstall,
@@ -146,6 +166,11 @@ impl Setup {
 /// The whereti logo, 64×64 (rendered by tools/render-icons).
 fn logo_rgba() -> Vec<u8> {
     include_bytes!("../../../media/icons/whereti-64.rgba").to_vec()
+}
+
+/// The logo at 128×128, shown large on every screen.
+fn logo_128() -> Vec<u8> {
+    include_bytes!("../../../media/icons/whereti-128.rgba").to_vec()
 }
 
 /// Compares "0.10.2" with "0.9.0" by numbers, not as text.
@@ -253,40 +278,86 @@ fn button(ui: &mut egui::Ui, l: &Look, text: &str, primary: bool) -> egui::Respo
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
-fn badge(ui: &mut egui::Ui, l: &Look, kind: u8) {
-    let (r, _) = ui.allocate_exact_size(Vec2::splat(64.0), Sense::hover());
-    let c = r.center();
+/// What the logo carries on a screen.
+#[derive(Clone, Copy, PartialEq)]
+enum Mark {
+    None,
+    /// a ring turning around the logo
+    Busy,
+    Done,
+    Error,
+}
+
+/// The logo, large and centred, with a soft shadow and the screen's mark.
+fn hero(ui: &mut egui::Ui, l: &Look, logo: &egui::TextureHandle, mark: Mark) {
+    let size = 96.0;
+    let (r, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), size + 8.0), Sense::hover());
+    let tile = egui::Rect::from_center_size(r.center(), Vec2::splat(size));
     let p = ui.painter();
-    match kind {
-        // magnifier: what whereti is
-        0 => {
-            p.circle_filled(c, 32.0, l.accent.gamma_multiply(if l.dark { 0.25 } else { 0.12 }));
-            p.circle_stroke(c - Vec2::splat(3.0), 11.0, Stroke::new(2.4, l.accent));
-            p.line_segment([c + Vec2::splat(5.0), c + Vec2::splat(13.0)], Stroke::new(3.0, l.accent));
+    // shadow: a few soft layers under the tile
+    for (grow, alpha) in [(10.0, 0.05), (6.0, 0.07), (3.0, 0.08)] {
+        let shade = if l.dark {
+            Color32::from_rgba_unmultiplied(0, 0, 0, (alpha * 2.4 * 255.0) as u8)
+        } else {
+            Color32::from_rgba_unmultiplied(40, 50, 140, (alpha * 255.0) as u8)
+        };
+        p.rect_filled(tile.translate(Vec2::new(0.0, 5.0)).expand(grow), 22.0 + grow, shade);
+    }
+    p.image(logo.id(), tile, egui::Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
+    match mark {
+        Mark::None => {}
+        Mark::Busy => {
+            let c = tile.center();
+            let rad = size * 0.72;
+            p.circle_stroke(c, rad, Stroke::new(3.0, l.border));
+            let t = ui.input(|i| i.time) as f32 * 3.2;
+            let pts: Vec<Pos2> = (0..=24).map(|k| c + Vec2::angled(t + k as f32 * 0.075) * rad).collect();
+            p.add(egui::Shape::line(pts, Stroke::new(3.0, l.accent)));
+            ui.ctx().request_repaint();
         }
-        // check: done
-        1 => {
-            p.circle_filled(c, 30.0, l.ok);
-            let s = Stroke::new(3.0, Color32::WHITE);
-            p.line_segment([c + Vec2::new(-11.0, 1.0), c + Vec2::new(-3.0, 9.0)], s);
-            p.line_segment([c + Vec2::new(-3.0, 9.0), c + Vec2::new(12.0, -7.0)], s);
-        }
-        // error
-        _ => {
-            p.circle_filled(c, 30.0, l.error);
-            p.text(c, egui::Align2::CENTER_CENTER, "!", FontId::new(26.0, semibold()), Color32::WHITE);
+        Mark::Done | Mark::Error => {
+            let c = tile.right_bottom() - Vec2::splat(6.0);
+            let fill = if mark == Mark::Done { l.ok } else { l.error };
+            p.circle_filled(c, 18.0, l.bg);
+            p.circle_filled(c, 15.0, fill);
+            if mark == Mark::Done {
+                let s = Stroke::new(2.6, Color32::WHITE);
+                p.line_segment([c + Vec2::new(-6.5, 0.5), c + Vec2::new(-2.0, 5.0)], s);
+                p.line_segment([c + Vec2::new(-2.0, 5.0), c + Vec2::new(6.5, -4.5)], s);
+            } else {
+                p.text(c, egui::Align2::CENTER_CENTER, "!", FontId::new(18.0, semibold()), Color32::WHITE);
+            }
         }
     }
 }
 
-fn spinner(ui: &mut egui::Ui, l: &Look) {
-    let (r, _) = ui.allocate_exact_size(Vec2::splat(64.0), Sense::hover());
-    let c = r.center();
-    ui.painter().circle_stroke(c, 24.0, Stroke::new(3.0, l.border));
-    let t = ui.input(|i| i.time) as f32 * 4.5;
-    let pts: Vec<Pos2> = (0..=20).map(|k| c + Vec2::angled(t + k as f32 * 0.09) * 24.0).collect();
-    ui.painter().add(egui::Shape::line(pts, Stroke::new(3.0, l.accent)));
-    ui.ctx().request_repaint();
+/// Text centred line by line, wrapped at `width`.
+fn centred(ui: &mut egui::Ui, text: &str, font: FontId, color: Color32, width: f32) {
+    let mut job = egui::text::LayoutJob::simple(text.to_string(), font, color, width);
+    job.halign = egui::Align::Center;
+    let g = ui.fonts_mut(|f| f.layout_job(job));
+    let (r, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), g.size().y), Sense::hover());
+    ui.painter().galley(Pos2::new(r.center().x, r.top()), g, color);
+}
+
+/// Buttons side by side, centred as a group.
+fn button_row(ui: &mut egui::Ui, l: &Look, buttons: &[(&str, bool)]) -> Option<usize> {
+    let font = FontId::new(14.0, semibold());
+    let gap = 10.0;
+    let widths: Vec<f32> =
+        buttons.iter().map(|(t, _)| ui.painter().layout_no_wrap(t.to_string(), font.clone(), l.text).size().x + 44.0).collect();
+    let total: f32 = widths.iter().sum::<f32>() + gap * (buttons.len().saturating_sub(1)) as f32;
+    let mut clicked = None;
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = gap;
+        ui.add_space(((ui.available_width() - total) / 2.0).max(0.0));
+        for (i, (text, primary)) in buttons.iter().enumerate() {
+            if button(ui, l, text, *primary).clicked() {
+                clicked = Some(i);
+            }
+        }
+    });
+    clicked
 }
 
 impl eframe::App for Setup {
@@ -294,164 +365,182 @@ impl eframe::App for Setup {
         let ctx = ui.ctx().clone();
         let l = look(&ctx);
         let state = self.state.lock().unwrap().clone();
-        egui::CentralPanel::default().frame(Frame::NONE.fill(l.bg).inner_margin(Margin::same(32))).show(ui, |ui| {
+        let logo = self
+            .logo
+            .get_or_insert_with(|| {
+                let image = egui::ColorImage::from_rgba_unmultiplied([128, 128], &logo_128());
+                ctx.load_texture("logo", image, egui::TextureOptions::LINEAR)
+            })
+            .clone();
+        egui::CentralPanel::default().frame(Frame::NONE.fill(l.bg).inner_margin(Margin::symmetric(36, 28))).show(ui, |ui| {
+            let width = ui.available_width().min(440.0);
             let title = |ui: &mut egui::Ui, text: &str| {
-                ui.label(egui::RichText::new(text).size(24.0).family(FontFamily::Name("display".into())).color(l.text));
+                centred(ui, text, FontId::new(25.0, FontFamily::Name("display".into())), l.text, width);
             };
-            let body = |ui: &mut egui::Ui, text: &str| {
-                ui.add(egui::Label::new(egui::RichText::new(text).size(13.5).color(l.text2)).wrap());
-            };
+            let body = |ui: &mut egui::Ui, text: &str| centred(ui, text, FontId::proportional(13.5), l.text2, width);
+            // centred vertically, measured on the previous frame
+            let space = ((ui.available_height() - self.content_h) / 2.0).max(0.0);
+            ui.add_space(space);
+            let top = ui.cursor().top();
             match state {
                 State::Ready { update } => {
-                    badge(ui, &l, 0);
-                    ui.add_space(14.0);
+                    hero(ui, &l, &logo, Mark::None);
+                    ui.add_space(18.0);
                     // what is installed now decides what this installer offers
                     let installed = update.as_deref().map(|v| version_cmp(v, ops::VERSION));
-                    match (&update, installed) {
-                        (Some(_), Some(std::cmp::Ordering::Equal)) => title(
-                            ui,
-                            &trf!("whereti {version} is already installed", version = ops::VERSION),
-                        ),
-                        (Some(v), Some(std::cmp::Ordering::Greater)) => title(
-                            ui,
-                            &trf!("A newer whereti is installed ({version})", version = v),
-                        ),
-                        (Some(v), _) => title(ui, &trf!("Update whereti {old} → {new}", old = v, new = ops::VERSION)),
-                        (None, _) => title(ui, tr("Install whereti")),
-                    }
-                    ui.add_space(4.0);
+                    let heading = match (&update, installed) {
+                        (Some(_), Some(std::cmp::Ordering::Equal)) => {
+                            trf!("whereti {version} is already installed", version = ops::VERSION)
+                        }
+                        (Some(v), Some(std::cmp::Ordering::Greater)) => {
+                            trf!("A newer whereti is installed ({version})", version = v)
+                        }
+                        (Some(v), _) => trf!("Update whereti {old} → {new}", old = v, new = ops::VERSION),
+                        (None, _) => tr("Install whereti").to_string(),
+                    };
+                    title(ui, &heading);
+                    ui.add_space(6.0);
                     body(ui, tr("Instant search for every file on your PC, by its name and by what is written inside PDF, Word, Excel and other documents."));
-                    ui.add_space(16.0);
-                    Frame::NONE
-                        .fill(l.surface)
-                        .stroke(Stroke::new(1.0, l.border))
-                        .corner_radius(CornerRadius::same(12))
-                        .inner_margin(Margin::same(14))
-                        .show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            for line in [
-                                tr("Free and open source (MIT). Nothing leaves your PC."),
-                                tr("Builds its index in the background, without slowing the PC."),
-                                &trf!("Open it anywhere with {hotkey}.", hotkey = "Ctrl+Shift+Space"),
-                            ] {
-                                ui.horizontal(|ui| {
-                                    let (r, _) = ui.allocate_exact_size(Vec2::new(16.0, 18.0), Sense::hover());
-                                    ui.painter().circle_filled(r.center(), 3.0, l.accent);
-                                    ui.label(egui::RichText::new(line).size(13.0).color(l.text));
-                                });
-                                ui.add_space(4.0);
-                            }
-                        });
-                    ui.add_space(12.0);
-                    let label = egui::RichText::new(tr("Start whereti with Windows")).size(13.0).color(l.text);
-                    ui.checkbox(&mut self.autostart, label);
                     ui.add_space(18.0);
+                    // three promises, in a card centred under the text
+                    let card_w = width.min(400.0);
                     ui.horizontal(|ui| {
-                        if matches!(installed, Some(std::cmp::Ordering::Equal | std::cmp::Ordering::Greater)) {
-                            // nothing to update: open it, or install this copy again on purpose
-                            if button(ui, &l, tr("Open whereti"), true).clicked() {
+                        ui.add_space(((ui.available_width() - card_w) / 2.0).max(0.0));
+                        Frame::NONE
+                            .fill(l.surface)
+                            .stroke(Stroke::new(1.0, l.border))
+                            .corner_radius(CornerRadius::same(12))
+                            .inner_margin(Margin::symmetric(16, 12))
+                            .show(ui, |ui| {
+                                ui.set_width(card_w - 32.0);
+                                ui.vertical(|ui| {
+                                    for line in [
+                                        tr("Free and open source (MIT). Your files never leave your PC."),
+                                        tr("Builds its index in the background, without slowing the PC."),
+                                        &trf!("Open it anywhere with {hotkey}.", hotkey = "Ctrl+Shift+Space"),
+                                    ] {
+                                        ui.horizontal(|ui| {
+                                            let (r, _) = ui.allocate_exact_size(Vec2::new(14.0, 18.0), Sense::hover());
+                                            ui.painter().circle_filled(r.center(), 3.0, l.accent);
+                                            ui.add(egui::Label::new(egui::RichText::new(line).size(13.0).color(l.text)).wrap());
+                                        });
+                                        ui.add_space(3.0);
+                                    }
+                                });
+                            });
+                    });
+                    ui.add_space(14.0);
+                    let fresh = !matches!(installed, Some(std::cmp::Ordering::Equal | std::cmp::Ordering::Greater));
+                    if fresh {
+                        ui.vertical_centered(|ui| {
+                            let label = egui::RichText::new(tr("Start whereti with Windows")).size(13.0).color(l.text);
+                            ui.checkbox(&mut self.autostart, label);
+                        });
+                        ui.add_space(14.0);
+                    }
+                    if !fresh {
+                        // nothing to update: open it, or install this copy again on purpose
+                        let again = if installed == Some(std::cmp::Ordering::Equal) {
+                            tr("Reinstall")
+                        } else {
+                            tr("Install this older version")
+                        };
+                        match button_row(ui, &l, &[(tr("Open whereti"), true), (again, false)]) {
+                            Some(0) => {
                                 ops::launch_app();
                                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                             }
-                            ui.add_space(8.0);
-                            let again = if installed == Some(std::cmp::Ordering::Equal) {
-                                tr("Reinstall")
-                            } else {
-                                tr("Install this older version")
-                            };
-                            if button(ui, &l, again, false).clicked() {
-                                self.start(&ctx, false);
-                            }
-                            return;
+                            Some(_) => self.start(&ctx, false),
+                            None => {}
                         }
+                    } else {
                         let label = if update.is_some() { tr("Update") } else { tr("Install") };
-                        if button(ui, &l, label, true).clicked() {
+                        if button_row(ui, &l, &[(label, true)]).is_some() {
                             self.start(&ctx, false);
                         }
-                        ui.add_space(10.0);
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "{} · {}",
-                                ops::install_dir().display(),
-                                tr("asks for administrator permission once")
-                            ))
-                            .size(11.5)
-                            .color(l.text3),
-                        );
-                    });
+                    }
+                    ui.add_space(12.0);
+                    let note = format!("{} · {}", ops::install_dir().display(), tr("asks for administrator permission once"));
+                    centred(ui, &note, FontId::proportional(11.5), l.text3, width);
                 }
                 State::Working | State::Removing => {
-                    ui.add_space(50.0);
-                    ui.vertical_centered(|ui| {
-                        spinner(ui, &l);
-                        ui.add_space(16.0);
-                        let text = if matches!(state, State::Working) {
-                            tr("Installing whereti…")
-                        } else {
-                            tr("Removing whereti…")
-                        };
-                        title(ui, text);
-                        ui.add_space(4.0);
-                        body(ui, tr("This takes a few seconds."));
-                    });
+                    hero(ui, &l, &logo, Mark::Busy);
+                    ui.add_space(46.0);
+                    let text = if matches!(state, State::Working) {
+                        tr("Installing whereti…")
+                    } else {
+                        tr("Removing whereti…")
+                    };
+                    title(ui, text);
+                    ui.add_space(6.0);
+                    body(ui, tr("This takes a few seconds."));
                 }
-                State::Installed => {
-                    badge(ui, &l, 1);
-                    ui.add_space(14.0);
-                    title(ui, tr("whereti is installed"));
-                    ui.add_space(4.0);
-                    body(ui, tr("It is building its index now. That takes about a minute, and whereti shows the progress. You can search right away."));
+                State::Installed { updated } => {
+                    hero(ui, &l, &logo, Mark::Done);
                     ui.add_space(22.0);
-                    ui.horizontal(|ui| {
-                        if button(ui, &l, tr("Open whereti"), true).clicked() {
-                            ops::launch_app();
+                    if updated {
+                        title(ui, &trf!("whereti is updated to {version}", version = ops::VERSION));
+                        ui.add_space(6.0);
+                        body(ui, tr("Your settings and your index are kept, so you can search right away."));
+                    } else {
+                        title(ui, tr("whereti is installed"));
+                        ui.add_space(6.0);
+                        body(ui, tr("It is building its index now. That takes about a minute, and whereti shows the progress. You can search right away."));
+                    }
+                    ui.add_space(24.0);
+                    match button_row(ui, &l, &[(tr("Open whereti"), true), (tr("Close"), false)]) {
+                        Some(0) => {
+                            if updated {
+                                ops::open_app();
+                            } else {
+                                ops::launch_app();
+                            }
                             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                         }
-                        ui.add_space(8.0);
-                        if button(ui, &l, tr("Close"), false).clicked() {
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                        }
-                    });
+                        Some(_) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                        None => {}
+                    }
                 }
                 State::Failed(e) => {
-                    badge(ui, &l, 2);
-                    ui.add_space(14.0);
-                    title(ui, tr("Something went wrong"));
-                    ui.add_space(4.0);
-                    body(ui, &e);
+                    hero(ui, &l, &logo, Mark::Error);
                     ui.add_space(22.0);
-                    if button(ui, &l, tr("Try again"), true).clicked() {
+                    title(ui, tr("Something went wrong"));
+                    ui.add_space(6.0);
+                    body(ui, &e);
+                    ui.add_space(24.0);
+                    if button_row(ui, &l, &[(tr("Try again"), true)]).is_some() {
                         *self.state.lock().unwrap() = State::Ready { update: ops::installed_version() };
                     }
                 }
                 State::ConfirmUninstall => {
-                    badge(ui, &l, 0);
-                    ui.add_space(14.0);
-                    title(ui, tr("Remove whereti?"));
-                    ui.add_space(4.0);
-                    body(ui, tr("The app, its search service and its index are removed. Your own files are not touched."));
+                    hero(ui, &l, &logo, Mark::None);
                     ui.add_space(22.0);
-                    ui.horizontal(|ui| {
-                        if button(ui, &l, tr("Remove"), true).clicked() {
-                            self.start(&ctx, true);
-                        }
-                        ui.add_space(8.0);
-                        if button(ui, &l, tr("Cancel"), false).clicked() {
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                        }
-                    });
+                    title(ui, tr("Remove whereti?"));
+                    ui.add_space(6.0);
+                    body(ui, tr("The app, its search service and its index are removed. Your own files are not touched."));
+                    ui.add_space(24.0);
+                    match button_row(ui, &l, &[(tr("Remove"), true), (tr("Cancel"), false)]) {
+                        Some(0) => self.start(&ctx, true),
+                        Some(_) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                        None => {}
+                    }
                 }
                 State::Removed => {
-                    badge(ui, &l, 1);
-                    ui.add_space(14.0);
-                    title(ui, tr("whereti was removed"));
-                    ui.add_space(4.0);
-                    body(ui, tr("Thank you for trying it."));
+                    hero(ui, &l, &logo, Mark::Done);
                     ui.add_space(22.0);
-                    if button(ui, &l, tr("Close"), true).clicked() {
+                    title(ui, tr("whereti was removed"));
+                    ui.add_space(6.0);
+                    body(ui, tr("Thank you for trying it."));
+                    ui.add_space(24.0);
+                    if button_row(ui, &l, &[(tr("Close"), true)]).is_some() {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
                 }
+            }
+            let h = ui.cursor().top() - ui.spacing().item_spacing.y - top;
+            if (h - self.content_h).abs() > 0.5 {
+                self.content_h = h;
+                ctx.request_repaint();
             }
         });
     }
