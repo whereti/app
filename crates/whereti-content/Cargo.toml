@@ -8,7 +8,7 @@ repository.workspace = true
 [dependencies]
 parking_lot = "0.13.0"
 tantivy = { version = "0.27.0", default-features = false, features = ["mmap"] }
-whereti-query = { version = "0.0.3", path = "../whereti-query" }
+whereti-query = { version = "0.0.4", path = "../whereti-query" }
 
 [dev-dependencies]
 tempfile = "3.27.0"
