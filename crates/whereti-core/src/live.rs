@@ -20,13 +20,14 @@ use whereti_ntfs::mft::{MftEntry, MftScan};
 use whereti_query::fold;
 
 use crate::build::{
-    attr_flags, build, compute_dir_order, ext_id, filetime_to_minutes, is_noise_dir, Exclusions, VolumeScan,
+    attr_flags, build, compute_dir_order, ext_id, filetime_to_minutes, place_flags, Exclusions, VolumeScan,
 };
 use crate::index::*;
 
 const ROOT_RECORD: u64 = 5;
 const FIRST_USER_RECORD: u64 = 16;
 const KEEP_FLAGS: u16 = FLAG_ROOT | FLAG_NON_ASCII | FLAG_TAIL | FLAG_DELETED | FLAG_DETACHED | FLAG_GONE;
+// FLAG_NOISE and FLAG_HOME are worked out again from the parent (place_flags)
 
 /// Current on-disk state of one MFT record.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -352,12 +353,7 @@ impl NameIndex {
     }
 
     fn noise_for(&self, parent: Option<u32>, name: &str, is_dir: bool) -> u16 {
-        let parent_noise = parent.is_some_and(|p| self.flags[p as usize] & FLAG_NOISE != 0);
-        if parent_noise || (is_dir && is_noise_dir(&fold(name))) {
-            FLAG_NOISE
-        } else {
-            0
-        }
+        place_flags(self, parent, &fold(name), is_dir)
     }
 
     fn set_tail_name(&mut self, e: u32, name: &str) {

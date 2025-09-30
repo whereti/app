@@ -465,6 +465,9 @@ const NOISE_DIRS: &[&str] = &[
     // tools and environments
     "venv", "site-packages", ".cargo", ".rustup", ".yarn", ".idea", ".vscode", ".vscode-server", ".codex", ".conda",
     "anaconda3", "miniconda3", ".docker", ".android", ".kotlin",
+    // editor and tool extensions, test data, Windows' own stores
+    "extensions", "testdata", "test-data", "fixtures", "__fixtures__", "__snapshots__", "winsxs", "$recycle.bin",
+    "system volume information", "packages", "dist-packages",
     // generated folders (also left out of the index by default; ranked last if a user keeps them)
     "node_modules", "bower_components", ".git", ".svn", ".hg", ".npm", ".pnpm-store", ".next", ".nuxt", ".turbo",
     "__pycache__", ".venv", ".tox", ".mypy_cache", ".pytest_cache", ".gradle", ".m2", ".nuget", ".vs",
@@ -474,29 +477,91 @@ pub(crate) fn is_noise_dir(folded_name: &str) -> bool {
     NOISE_DIRS.contains(&folded_name)
 }
 
-/// Sets FLAG_NOISE on noise folders and everything below them (and clears
-/// it elsewhere, so a saved index follows the current list).
+/// The user's own folders, directly in their profile (`C:\Users\<name>\…`).
+const HOME_DIRS: &[&str] =
+    &["desktop", "documents", "downloads", "pictures", "videos", "music", "dropbox", "google drive", "icloud drive"];
+
+/// FLAG_NOISE or FLAG_HOME for an entry, from its folded name and its parent
+/// (whose flags must already be right). Files only inherit.
+pub(crate) fn place_flags(idx: &NameIndex, parent: Option<u32>, folded: &str, is_dir: bool) -> u16 {
+    let Some(p) = parent else { return 0 };
+    let pf = idx.flags[p as usize];
+    if pf & FLAG_NOISE != 0 {
+        return FLAG_NOISE;
+    }
+    if !is_dir {
+        return pf & FLAG_HOME;
+    }
+    let folded_name = |i: u32| {
+        let mut s = String::new();
+        whereti_query::fold_into(idx.name(i), &mut s);
+        s
+    };
+    let is_root = |i: u32| idx.flags[i as usize] & FLAG_ROOT != 0;
+    let noise = is_noise_dir(folded)
+        // tool folders: .vscode, .claude, .antigravity, .gradle…
+        || folded.starts_with('.')
+        // Go's module cache (go\pkg\mod) and C:\Windows
+        || (folded == "mod" && folded_name(p) == "pkg")
+        || (folded == "windows" && is_root(p));
+    if noise {
+        return FLAG_NOISE;
+    }
+    if pf & FLAG_HOME != 0 {
+        return FLAG_HOME;
+    }
+    let in_profile = idx
+        .parent(p)
+        .is_some_and(|g| folded_name(g) == "users" && idx.parent(g).is_some_and(is_root));
+    if in_profile && (HOME_DIRS.contains(&folded) || folded.starts_with("onedrive")) {
+        FLAG_HOME
+    } else {
+        0
+    }
+}
+
+/// Sets FLAG_NOISE and FLAG_HOME on every entry (and clears them elsewhere,
+/// so a saved index follows the current lists).
 pub(crate) fn mark_noise(idx: &mut NameIndex) {
     for f in &mut idx.flags {
-        *f &= !FLAG_NOISE;
+        *f &= !(FLAG_NOISE | FLAG_HOME);
     }
     let mut folded = String::new();
     for k in 0..idx.dir_order.len() {
         let d = idx.dir_order[k];
-        let parent_noise = idx.parent(d).is_some_and(|p| idx.flags[p as usize] & FLAG_NOISE != 0);
         folded.clear();
         whereti_query::fold_into(idx.name(d), &mut folded);
-        if parent_noise || is_noise_dir(&folded) {
-            idx.flags[d as usize] |= FLAG_NOISE;
-        }
+        let place = place_flags(idx, idx.parent(d), &folded, true);
+        idx.flags[d as usize] |= place;
     }
     for i in 0..idx.len() {
         if idx.flags[i] & FLAG_DIR == 0 {
-            if let Some(p) = idx.parent(i as u32) {
-                if idx.flags[p as usize] & FLAG_NOISE != 0 {
-                    idx.flags[i] |= FLAG_NOISE;
-                }
-            }
+            let place = place_flags(idx, idx.parent(i as u32), "", false);
+            idx.flags[i] |= place;
         }
+    }
+}
+
+/// How much a file type matters to a person (negative = more), by folded
+/// extension: their documents, pictures, music, videos and programs first,
+/// the files programs keep for themselves last.
+pub(crate) fn ext_weight(ext: &str) -> i8 {
+    match ext {
+        // documents
+        "pdf" | "doc" | "docx" | "odt" | "rtf" | "txt" | "md" | "xls" | "xlsx" | "xlsm" | "ods" | "csv" | "ppt"
+        | "pptx" | "odp" | "pages" | "numbers" | "key" | "epub" | "eml" | "msg" | "one"
+        // pictures
+        | "jpg" | "jpeg" | "png" | "gif" | "heic" | "heif" | "webp" | "bmp" | "tif" | "tiff" | "raw" | "cr2"
+        | "cr3" | "nef" | "arw" | "dng" | "psd" | "ai" | "svg"
+        // music and video
+        | "mp3" | "m4a" | "flac" | "wav" | "ogg" | "opus" | "aac" | "wma" | "mp4" | "mov" | "mkv" | "avi"
+        | "wmv" | "webm" | "m4v"
+        // archives, programs, shortcuts, drawings
+        | "zip" | "rar" | "7z" | "exe" | "msi" | "lnk" | "url" | "dwg" | "skp" | "blend" => -4,
+        // what programs keep for themselves
+        "dll" | "sys" | "log" | "tmp" | "temp" | "dat" | "bin" | "cache" | "pdb" | "obj" | "o" | "lib" | "a"
+        | "so" | "mui" | "cat" | "manifest" | "etl" | "idx" | "pack" | "map" | "lock" | "pyc" | "class" | "ldb"
+        | "sst" | "blob" | "db-wal" | "db-shm" | "nupkg" | "old" | "bak" => 6,
+        _ => 0,
     }
 }

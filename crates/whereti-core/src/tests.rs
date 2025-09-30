@@ -314,3 +314,46 @@ fn generated_folders_are_left_out_and_build_folders_rank_last() {
     let _ = std::fs::remove_file(&dir);
     assert_eq!(find(&back, "raport"), find(&idx, "raport"));
 }
+
+#[test]
+fn importance_orders_results_inside_a_match_level() {
+    use crate::index::{FLAG_HOME, FLAG_NOISE};
+    let c = scan(vec![
+        d(5, 5, "."),
+        d(23, 5, "Users"),
+        d(24, 23, "ana"),
+        d(25, 24, "Documents"),
+        f(40, 25, "reformatter.docx"),
+        d(26, 24, "go"),
+        d(27, 26, "pkg"),
+        d(28, 27, "mod"),
+        f(41, 28, "reformatter.go"),
+        d(29, 24, ".antigravity"),
+        f(42, 29, "reformatter.xml"),
+        d(30, 5, "proiecte"),
+        f(43, 30, "reformatter.dll"),
+        f(44, 30, "reformatter.go"),
+    ]);
+    let vols = vec![VolumeScan { letter: 'C', serial: 1, journal_id: 10, next_usn: 100, scan: c }];
+    let idx = build(vols, &Exclusions::default()).0;
+    let flags_of = |path: &str| {
+        let i = (0..idx.len() as u32).find(|&i| idx.full_path(i) == path).unwrap_or_else(|| panic!("{path}"));
+        idx.flags(i)
+    };
+    assert!(flags_of(r"C:\Users\ana\Documents\reformatter.docx") & FLAG_HOME != 0);
+    assert!(flags_of(r"C:\Users\ana\go\pkg\mod\reformatter.go") & FLAG_NOISE != 0);
+    assert!(flags_of(r"C:\Users\ana\.antigravity\reformatter.xml") & FLAG_NOISE != 0);
+    assert_eq!(flags_of(r"C:\proiecte\reformatter.go") & (FLAG_HOME | FLAG_NOISE), 0);
+
+    // every name has "formatter" inside a word: the same match level
+    let r = find(&idx, "formatter");
+    assert_eq!(
+        r[..3],
+        [r"C:\Users\ana\Documents\reformatter.docx", r"C:\proiecte\reformatter.go", r"C:\proiecte\reformatter.dll"],
+        "{r:#?}"
+    );
+    assert_eq!(r.len(), 5);
+    // a better match still wins over a more important place
+    let r = find(&idx, "reformatter.go");
+    assert_eq!(r[0], r"C:\proiecte\reformatter.go");
+}

@@ -29,6 +29,9 @@ pub const FLAG_DETACHED: u16 = 1 << 8;
 pub const FLAG_GONE: u16 = 1 << 9;
 /// Current name is in the `tail` list (renamed or added after the build).
 pub const FLAG_TAIL: u16 = 1 << 10;
+/// Inside one of the user's own folders (Desktop, Documents, Downloads,
+/// Pictures, Videos, Music, OneDrive…): ranked before other places.
+pub const FLAG_HOME: u16 = 1 << 11;
 
 /// Entries never returned by a search.
 pub(crate) const HIDDEN_FROM_SEARCH: u16 = FLAG_ROOT | FLAG_GONE;

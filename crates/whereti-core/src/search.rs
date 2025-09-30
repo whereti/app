@@ -16,7 +16,8 @@ use crate::index::*;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SortBy {
     /// Exact name > name starts with the word > a word in the name starts
-    /// with it > anywhere; then alphabetical.
+    /// with it > anywhere; inside each, the more important first (see
+    /// `importance`), then alphabetical.
     #[default]
     Relevance,
     Name,
@@ -368,16 +369,21 @@ impl NameIndex {
         let rank = |i: u32| self.name_rank[i as usize];
         let mut keyed: Vec<(u64, u32, u32)> = match opts.sort {
             SortBy::Relevance | SortBy::Name => {
-                // The order is (score, alphabetical rank). Put every hit in a
-                // bucket by score and by the top bits of its rank, count the
-                // buckets, and fully order only the hits in the buckets that
-                // can reach the top `limit` - thousands, not millions.
+                // The order is (score, importance, alphabetical rank). Put
+                // every hit in a bucket by score, importance and the top bits
+                // of its rank, count the buckets, and fully order only the
+                // hits in the buckets that can reach the top `limit` -
+                // thousands, not millions.
                 let needle = needle.map(str::as_bytes);
                 let relevance = opts.sort == SortBy::Relevance;
-                let shift = (32 - (self.len().max(1) as u32).leading_zeros()).saturating_sub(8);
+                let weigh = relevance.then(|| self.weigher());
+                let shift = (32 - (self.len().max(1) as u32).leading_zeros()).saturating_sub(7);
                 let bucket = |i: u32| -> u16 {
-                    let score = if relevance { self.relevance(i, needle) as u16 } else { 0 };
-                    (score << 8) | (rank(i) >> shift).min(255) as u16
+                    let key = match &weigh {
+                        Some(w) => (self.relevance(i, needle) as u16) << 5 | self.importance(i, w) as u16,
+                        None => 0,
+                    };
+                    (key << 7) | (rank(i) >> shift).min(127) as u16
                 };
                 let buckets: Vec<u16> = hits.par_iter().with_min_len(8192).map(|&i| bucket(i)).collect();
                 let count = buckets
@@ -405,7 +411,7 @@ impl NameIndex {
                 hits.iter()
                     .zip(&buckets)
                     .filter(|(_, &b)| b <= cutoff)
-                    .map(|(&i, &b)| ((b >> 8) as u64, rank(i), i))
+                    .map(|(&i, &b)| ((b >> 7) as u64, rank(i), i))
                     .collect()
             }
             SortBy::Size | SortBy::Modified => {
@@ -435,6 +441,46 @@ impl NameIndex {
         }
         keyed.sort_unstable();
         keyed.into_iter().map(|(_, _, i)| i).collect()
+    }
+
+    /// What `importance` needs once per search.
+    pub(crate) fn weigher(&self) -> Weigher {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| (d.as_secs() + 11_644_473_600) / 60)
+            .unwrap_or(0)
+            .min(u32::MAX as u64) as u32;
+        let ext = self.exts.iter().map(|e| crate::build::ext_weight(e)).collect();
+        Weigher { now, ext }
+    }
+
+    /// 0 (most) to 31 (least): how much an entry likely matters to the
+    /// person, without knowing anything about them. The user's own folders,
+    /// their kind of files (documents, pictures, music, video, programs) and
+    /// recent changes come first; files that programs keep for themselves
+    /// last. Ranks inside one match level only: a better match always wins.
+    pub(crate) fn importance(&self, i: u32, w: &Weigher) -> u8 {
+        let iu = i as usize;
+        let f = self.flags[iu];
+        let mut score: i32 = 16;
+        if f & FLAG_HOME != 0 {
+            score -= 6;
+        }
+        if f & FLAG_DIR != 0 {
+            score -= 1;
+        } else {
+            let e = self.ext[iu] as usize;
+            score += if e == 0 { 3 } else { w.ext.get(e).copied().unwrap_or(0) as i32 };
+        }
+        const DAY: u32 = 24 * 60;
+        score -= match w.now.saturating_sub(self.mtime[iu]) {
+            a if a < DAY => 4,
+            a if a < 7 * DAY => 3,
+            a if a < 30 * DAY => 2,
+            a if a < 365 * DAY => 1,
+            _ => 0,
+        };
+        score.clamp(0, 31) as u8
     }
 
     /// 0 = exact name, 1 = name starts with the word, 2 = a word in the name
@@ -469,6 +515,13 @@ impl NameIndex {
         };
         score + penalty
     }
+}
+
+pub(crate) struct Weigher {
+    /// Minutes since 1601, like `mtime`.
+    now: u32,
+    /// `ext_weight` of every extension id.
+    ext: Vec<i8>,
 }
 
 /// Set `WT_TRACE=1` to print how long each search phase takes.
@@ -711,12 +764,13 @@ mod tests {
             let idx = churned(seed, 120);
             for needle in ["a", "ra", "raport", "masina", "data", ".txt", "(1)", "s"] {
                 let hits = idx.scan_names(needle);
+                let w = idx.weigher();
                 let mut all: Vec<(u64, u32, u32)> = hits
                     .iter()
                     .map(|&i| {
                         let sc = idx.relevance(i, Some(needle.as_bytes()));
                         assert_eq!(sc, reference_relevance(&idx, i, needle.as_bytes()), "score of {}", idx.name(i));
-                        (sc as u64, idx.name_rank[i as usize], i)
+                        ((sc as u64) << 5 | idx.importance(i, &w) as u64, idx.name_rank[i as usize], i)
                     })
                     .collect();
                 all.sort_unstable();
@@ -739,7 +793,7 @@ mod tests {
                     .iter()
                     .map(|&i| {
                         let k = match sort {
-                            SortBy::Relevance => idx.relevance(i, None) as u64,
+                            SortBy::Relevance => (idx.relevance(i, None) as u64) << 5 | idx.importance(i, &idx.weigher()) as u64,
                             SortBy::Name => 0,
                             SortBy::Size => u64::MAX - idx.size[i as usize],
                             SortBy::Modified => (u32::MAX - idx.mtime[i as usize]) as u64,
