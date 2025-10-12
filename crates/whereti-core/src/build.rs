@@ -503,7 +503,10 @@ pub(crate) fn place_flags(idx: &NameIndex, parent: Option<u32>, folded: &str, is
         || folded.starts_with('.')
         // Go's module cache (go\pkg\mod) and C:\Windows
         || (folded == "mod" && folded_name(p) == "pkg")
-        || (folded == "windows" && is_root(p));
+        || (folded == "windows" && is_root(p))
+        // language runtimes installed at the root of a drive (C:\Python313…)
+        || (is_root(p) && ["python", "ruby", "php", "jdk", "perl", "nodejs"].iter().any(|r| folded.starts_with(r)))
+        || (is_root(p) && folded == "go");
     if noise {
         return FLAG_NOISE;
     }

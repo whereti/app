@@ -333,6 +333,10 @@ fn importance_orders_results_inside_a_match_level() {
         d(30, 5, "proiecte"),
         f(43, 30, "reformatter.dll"),
         f(44, 30, "reformatter.go"),
+        d(31, 5, "Python313"),
+        f(45, 31, "README"),
+        f(46, 25, "README.md"),
+        f(47, 25, "README notes.txt"),
     ]);
     let vols = vec![VolumeScan { letter: 'C', serial: 1, journal_id: 10, next_usn: 100, scan: c }];
     let idx = build(vols, &Exclusions::default()).0;
@@ -356,4 +360,10 @@ fn importance_orders_results_inside_a_match_level() {
     // a better match still wins over a more important place
     let r = find(&idx, "reformatter.go");
     assert_eq!(r[0], r"C:\proiecte\reformatter.go");
+    // "readme" is README.md exactly; a runtime at the root of C: is a tool folder
+    let r = find(&idx, "readme");
+    assert_eq!(
+        r,
+        [r"C:\Users\ana\Documents\README.md", r"C:\Users\ana\Documents\README notes.txt", r"C:\Python313\README"]
+    );
 }

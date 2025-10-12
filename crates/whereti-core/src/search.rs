@@ -483,7 +483,7 @@ impl NameIndex {
         score.clamp(0, 31) as u8
     }
 
-    /// 0 = exact name, 1 = name starts with the word, 2 = a word in the name
+    /// 0 = exact name (with or without its extension), 1 = name starts with the word, 2 = a word in the name
     /// starts with it, 3 = anywhere; +4 hidden/system, +8 cache/build folder.
     /// Compares in place (no copy): the needle is folded, ASCII names are
     /// compared ignoring case, other names through their folded copy.
@@ -505,7 +505,12 @@ impl NameIndex {
         let score = if name.eq_ignore_ascii_case(needle) {
             0
         } else if name.len() >= n && name[..n].eq_ignore_ascii_case(needle) {
-            1
+            // "readme" is README.md exactly: the name without its extension
+            if name.get(n) == Some(&b'.') && !name[n + 1..].contains(&b'.') {
+                0
+            } else {
+                1
+            }
         } else if (1..name.len().saturating_sub(n) + 1)
             .any(|p| !name[p - 1].is_ascii_alphanumeric() && name[p..p + n].eq_ignore_ascii_case(needle))
         {
@@ -746,7 +751,9 @@ mod tests {
         let penalty = if f & (FLAG_HIDDEN | FLAG_SYSTEM) != 0 { 4 } else { 0 } + if f & FLAG_NOISE != 0 { 8 } else { 0 };
         let mut scratch = Vec::new();
         let name = idx.folded_name(i, &mut scratch).to_vec();
-        let score = if name == needle {
+        let n = needle.len();
+        let stem = name.starts_with(needle) && name.get(n) == Some(&b'.') && !name[n + 1..].contains(&b'.');
+        let score = if name == needle || stem {
             0
         } else if name.starts_with(needle) {
             1
