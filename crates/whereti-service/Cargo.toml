@@ -6,8 +6,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-whereti-engine = { version = "0.0.5", path = "../whereti-engine" }
-whereti-ipc = { version = "0.0.5", path = "../whereti-ipc" }
+whereti-engine = { version = "0.0.6", path = "../whereti-engine" }
+whereti-ipc = { version = "0.0.6", path = "../whereti-ipc" }
 windows-service = "0.8.1"
 
 [build-dependencies]
