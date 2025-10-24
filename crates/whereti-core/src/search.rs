@@ -78,6 +78,14 @@ struct Scratch {
 
 impl NameIndex {
     pub fn search(&self, query: &Query, opts: &SearchOptions) -> SearchResults {
+        self.search_with_usage(query, opts, &[])
+    }
+
+    /// Like `search`, with the files this user opens often or lately
+    /// (`(full path, weight 1-12)`, from the app): those of them among the
+    /// hits rank as if they were more important, and are never sent down
+    /// as noise.
+    pub fn search_with_usage(&self, query: &Query, opts: &SearchOptions, usage: &[(String, u8)]) -> SearchResults {
         let t0 = std::time::Instant::now();
         let mut warnings = Vec::new();
         let hits = self.matching_entries(query, &mut warnings);
@@ -87,7 +95,8 @@ impl NameIndex {
             _ => None,
         });
         let total = hits.len();
-        let hits = self.top(hits, opts, rank_needle.as_deref());
+        let used = if opts.sort == SortBy::Relevance { self.usage_positions(&hits, usage) } else { Vec::new() };
+        let hits = self.top(hits, opts, rank_needle.as_deref(), &used);
         if trace_enabled() {
             let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
             eprintln!("[trace] match {:.2} ms · rank {:.2} ms · {} hits", ms(t_eval), ms(t0.elapsed() - t_eval), total);
@@ -361,7 +370,37 @@ impl NameIndex {
     }
 
     /// Ranks all hits and returns the best `opts.limit`, in order.
-    fn top(&self, hits: Vec<u32>, opts: &SearchOptions, needle: Option<&str>) -> Vec<u32> {
+    /// Where the used files are among `hits`, with their weight.
+    fn usage_positions(&self, hits: &[u32], usage: &[(String, u8)]) -> Vec<(usize, u8)> {
+        let wanted: Vec<(&[u8], &str, u8)> = usage
+            .iter()
+            .filter_map(|(path, w)| Some((path.rsplit('\\').next()?.as_bytes(), path.as_str(), *w)))
+            .filter(|(name, _, _)| !name.is_empty() && name.len() < 128)
+            .collect();
+        if wanted.is_empty() {
+            return Vec::new();
+        }
+        // most hits are ruled out by the length of their name alone
+        let lengths = wanted.iter().fold(0u128, |m, (name, _, _)| m | 1u128 << name.len());
+        hits.par_iter()
+            .enumerate()
+            .with_min_len(8192)
+            .filter_map(|(pos, &i)| {
+                let name = self.name_bytes(i);
+                if name.len() >= 128 || lengths & (1u128 << name.len()) == 0 {
+                    return None;
+                }
+                let (_, _, w) = wanted.iter().find(|(n, path, _)| {
+                    n.eq_ignore_ascii_case(name) && self.full_path(i).eq_ignore_ascii_case(path)
+                })?;
+                Some((pos, *w))
+            })
+            .collect()
+    }
+
+    /// `used`: positions in `hits` of files the user opens often or lately,
+    /// with their weight (Relevance only).
+    fn top(&self, hits: Vec<u32>, opts: &SearchOptions, needle: Option<&str>, used: &[(usize, u8)]) -> Vec<u32> {
         let limit = opts.limit.min(hits.len());
         if limit == 0 {
             return Vec::new();
@@ -385,7 +424,17 @@ impl NameIndex {
                     };
                     (key << 7) | (rank(i) >> shift).min(127) as u16
                 };
-                let buckets: Vec<u16> = hits.par_iter().with_min_len(8192).map(|&i| bucket(i)).collect();
+                let mut buckets: Vec<u16> = hits.par_iter().with_min_len(8192).map(|&i| bucket(i)).collect();
+                if let Some(w) = &weigh {
+                    for &(pos, weight) in used {
+                        // a used file: its match level without the noise or
+                        // hidden penalty, and more important by its weight
+                        let i = hits[pos];
+                        let level = (self.relevance(i, needle) & 3) as u16;
+                        let imp = self.importance(i, w).saturating_sub(weight) as u16;
+                        buckets[pos] = (level << 5 | imp) << 7 | (rank(i) >> shift).min(127) as u16;
+                    }
+                }
                 let count = buckets
                     .par_chunks(1 << 16)
                     .map(|c| {
@@ -784,7 +833,7 @@ mod tests {
                 for limit in [1, 2, 3, 7, 50, 100_000] {
                     let want: Vec<u32> = all.iter().take(limit).map(|k| k.2).collect();
                     let opts = SearchOptions { limit, sort: SortBy::Relevance };
-                    assert_eq!(idx.top(hits.clone(), &opts, Some(needle)), want, "seed {seed}, {needle:?}, limit {limit}");
+                    assert_eq!(idx.top(hits.clone(), &opts, Some(needle), &[]), want, "seed {seed}, {needle:?}, limit {limit}");
                 }
             }
             // no word to rank by (e.g. a path or ext: query), and alphabetical order
@@ -812,7 +861,7 @@ mod tests {
                 for limit in [1, 5, 33, 100_000] {
                     let want: Vec<u32> = all.iter().take(limit).map(|k| k.2).collect();
                     let opts = SearchOptions { limit, sort };
-                    assert_eq!(idx.top(hits.clone(), &opts, needle), want, "seed {seed}, {sort:?}, limit {limit}");
+                    assert_eq!(idx.top(hits.clone(), &opts, needle, &[]), want, "seed {seed}, {sort:?}, limit {limit}");
                 }
             }
         }

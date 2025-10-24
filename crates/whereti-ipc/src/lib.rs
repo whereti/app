@@ -28,7 +28,7 @@ use windows_sys::Win32::System::Pipes::{
 };
 
 pub const PIPE_NAME: &str = r"\\.\pipe\whereti";
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 const MAX_MESSAGE: usize = 64 << 20;
 
 /// The account that created the pipe (OW), SYSTEM and Administrators: full
@@ -52,6 +52,10 @@ pub struct SearchRequest {
     pub query: String,
     pub limit: u32,
     pub sort: Sort,
+    /// Files this user opens often or lately that may match (full path,
+    /// weight 1-12): ranked higher. Kept on the user's PC by the app; the
+    /// service only uses them for this one search.
+    pub usage: Vec<(String, u8)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -487,7 +491,7 @@ mod tests {
                 std::thread::spawn(move || {
                     let mut c = Client::connect_to(&name, Duration::from_secs(5)).unwrap();
                     for k in 0..50u32 {
-                        let req = Request::Search(SearchRequest { query: "x".into(), limit: t * 100 + k, sort: Sort::Name });
+                        let req = Request::Search(SearchRequest { query: "x".into(), limit: t * 100 + k, sort: Sort::Name, usage: Vec::new() });
                         match c.call(&req).unwrap() {
                             Response::Search(r) => assert_eq!(r.total, (t * 100 + k) as u64),
                             other => panic!("{other:?}"),

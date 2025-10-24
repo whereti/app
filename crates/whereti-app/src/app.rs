@@ -378,7 +378,8 @@ impl WheretiApp {
     fn open_selected(&mut self, ctx: &egui::Context, reveal: bool) {
         let Some(row) = self.rows.get(self.selected) else { return };
         let path = row.path.clone();
-        let result = if self.is_launch(self.selected) {
+        let launch = self.is_launch(self.selected);
+        let result = if launch {
             crate::launch::open(&path)
         } else if reveal {
             shell::reveal(&path)
@@ -386,7 +387,12 @@ impl WheretiApp {
             shell::open(&path)
         };
         match result {
-            Ok(()) => self.hide(ctx),
+            Ok(()) => {
+                if !launch {
+                    crate::usage::record(&path);
+                }
+                self.hide(ctx)
+            }
             Err(e) => self.flash(e),
         }
     }

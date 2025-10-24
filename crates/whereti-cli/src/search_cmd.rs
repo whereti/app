@@ -57,6 +57,7 @@ fn run_via_service(mut client: Client, args: &SearchArgs) -> Result<(), String> 
     let req = Request::Search(SearchRequest {
         query: args.query.join(" "),
         limit: args.limit as u32,
+        usage: Vec::new(),
         sort: match args.sort {
             Sort::Relevance => whereti_ipc::Sort::Relevance,
             Sort::Name => whereti_ipc::Sort::Name,
@@ -90,6 +91,7 @@ fn run_via_service(mut client: Client, args: &SearchArgs) -> Result<(), String> 
         query: args.query.join(" "),
         limit: args.limit as u32,
         sort: whereti_ipc::Sort::Relevance,
+        usage: Vec::new(),
     });
     let t = Instant::now();
     if let Response::Content(c) = client.call(&content_req).map_err(|e| e.to_string())? {

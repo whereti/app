@@ -360,6 +360,20 @@ fn importance_orders_results_inside_a_match_level() {
     // a better match still wins over a more important place
     let r = find(&idx, "reformatter.go");
     assert_eq!(r[0], r"C:\proiecte\reformatter.go");
+    // a file the user opens often rises, even out of a tool folder; a
+    // used path that is not among the hits changes nothing
+    let q = parse("formatter", &ctx());
+    let opts = SearchOptions { limit: 100, sort: SortBy::Relevance };
+    let used = [(r"C:\Users\ana\go\pkg\mod\reformatter.go".to_string(), 12), (r"C:\nowhere\reformatter.go".to_string(), 12)];
+    let r = idx.search_with_usage(&q, &opts, &used);
+    assert_eq!(idx.full_path(r.hits[0]), r"C:\Users\ana\go\pkg\mod\reformatter.go");
+    assert_eq!(r.hits.len(), 5);
+    // a used file that does not match the query is never added
+    let q = parse("reformatter.docx", &ctx());
+    let used = [(r"C:\Users\ana\Documents\README notes.txt".to_string(), 12)];
+    let r = idx.search_with_usage(&q, &opts, &used);
+    assert_eq!(idx.full_path(r.hits[0]), r"C:\Users\ana\Documents\reformatter.docx");
+
     // "readme" is README.md exactly; a runtime at the root of C: is a tool folder
     let r = find(&idx, "readme");
     assert_eq!(

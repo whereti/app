@@ -37,6 +37,8 @@ pub struct SettingsState {
     pub preview: bool,
     /// Ask whereti.com once a day whether a new version exists.
     pub updates: bool,
+    /// Rank the files the user opens often or lately higher (usage.rs).
+    pub learn: bool,
     /// The chosen language; `None` = the Windows display language.
     pub lang: Option<Lang>,
     config: Option<ConfigReply>,
@@ -67,6 +69,7 @@ impl SettingsState {
             preview: true,
             lang: None,
             updates: true,
+            learn: true,
             config: None,
             exclusions: Vec::new(),
             section: Section::General,
@@ -87,10 +90,12 @@ impl SettingsState {
                     Some(("language", v)) => s.lang = Lang::from_code(v),
                     Some(("welcomed", "yes")) => s.welcomed = true,
                     Some(("updates", "off")) => s.updates = false,
+                    Some(("learn", "off")) => s.learn = false,
                     _ => {}
                 }
             }
         }
+        crate::usage::set_enabled(s.learn);
         s
     }
 
@@ -116,6 +121,9 @@ impl SettingsState {
         }
         if !self.updates {
             text.push_str("updates=off\n");
+        }
+        if !self.learn {
+            text.push_str("learn=off\n");
         }
         let path = settings_file();
         if let Some(dir) = path.parent() {
@@ -351,6 +359,30 @@ fn search(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
             ui.label(egui::RichText::new(text).size(12.0).color(p.text2));
             ui.add_space(8.0);
         }
+    });
+    ui.add_space(14.0);
+
+    // ---- learning from what the user opens
+    card(ui, p, |ui| {
+        row(
+            ui,
+            p,
+            tr("Learn from what you open"),
+            tr("Files you open often or lately, in whereti or in other apps, come first. This stays on your PC."),
+            |ui| {
+                let mut on = app.settings.learn;
+                if toggle(ui, p, &mut on, tr("Learn from what you open")).clicked() {
+                    app.settings.learn = on;
+                    crate::usage::set_enabled(on);
+                    app.settings.save();
+                }
+                ui.add_space(8.0);
+                if button(ui, p, tr("Forget"), false).clicked() {
+                    crate::usage::forget();
+                    app.flash(tr("whereti forgot what you opened.").to_string());
+                }
+            },
+        );
     });
     ui.add_space(14.0);
 

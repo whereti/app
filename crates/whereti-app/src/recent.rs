@@ -28,14 +28,17 @@ thread_local! {
         Default::default();
 }
 
-/// Newest first. Runs on the searcher thread.
-pub fn recent_files(limit: usize) -> Vec<Row> {
+/// The files Windows lists as recently opened, with when: newest first, at
+/// most `MAX_LINKS` (also used to rank search results, usage.rs).
+pub fn opened_files() -> Vec<(SystemTime, PathBuf)> {
+    opened_from_links(MAX_LINKS)
+}
+
+fn opened_from_links(max: usize) -> Vec<(SystemTime, PathBuf)> {
     // SAFETY: COM on this thread; a second call returns S_FALSE, which is fine.
     let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
     let appdata = std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_default();
-    let mut items: Vec<(SystemTime, PathBuf)> = Vec::new();
-
-    // 1. opened files, from Windows' recent shortcuts
+    let mut items = Vec::new();
     let mut links: Vec<(SystemTime, PathBuf)> = std::fs::read_dir(appdata.join(r"Microsoft\Windows\Recent"))
         .into_iter()
         .flatten()
@@ -44,7 +47,7 @@ pub fn recent_files(limit: usize) -> Vec<Row> {
         .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
         .collect();
     links.sort_by_key(|l| std::cmp::Reverse(l.0));
-    for (opened, link) in links.into_iter().take(MAX_LINKS.min(limit + 50)) {
+    for (opened, link) in links.into_iter().take(max) {
         let cached = TARGETS.with(|t| t.borrow().get(&link).filter(|c| c.0 == opened).map(|c| c.1.clone()));
         let target = match cached {
             Some(t) => t,
@@ -58,6 +61,13 @@ pub fn recent_files(limit: usize) -> Vec<Row> {
             items.push((opened, target));
         }
     }
+    items
+}
+
+/// Newest first. Runs on the searcher thread.
+pub fn recent_files(limit: usize) -> Vec<Row> {
+    // 1. opened files, from Windows' recent shortcuts
+    let mut items = opened_from_links(MAX_LINKS.min(limit + 50));
 
     // 2. fresh downloads
     if let Some(home) = std::env::var_os("USERPROFILE") {

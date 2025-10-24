@@ -21,6 +21,7 @@ mod shell;
 mod theme;
 mod tray;
 mod update;
+mod usage;
 mod welcome;
 mod win;
 

@@ -206,7 +206,7 @@ impl Engine {
                         Sort::Modified => SortBy::Modified,
                     },
                 };
-                let res = idx.search(&query, &opts);
+                let res = idx.search_with_usage(&query, &opts, &r.usage);
                 let rows = res
                     .hits
                     .iter()
