@@ -368,6 +368,14 @@ fn importance_orders_results_inside_a_match_level() {
     let r = idx.search_with_usage(&q, &opts, &used);
     assert_eq!(idx.full_path(r.hits[0]), r"C:\Users\ana\go\pkg\mod\reformatter.go");
     assert_eq!(r.hits.len(), 5);
+    // much use lifts a file above closer matches of the name
+    // ("README notes.txt" only starts with "readme"; README.md is it exactly)
+    let q = parse("readme", &ctx());
+    let notes = r"C:\Users\ana\Documents\README notes.txt";
+    let r = idx.search_with_usage(&q, &opts, &[(notes.to_string(), 2)]);
+    assert_eq!(idx.full_path(r.hits[0]), r"C:\Users\ana\Documents\README.md", "a little use does not");
+    let r = idx.search_with_usage(&q, &opts, &[(notes.to_string(), 8)]);
+    assert_eq!(idx.full_path(r.hits[0]), notes);
     // a used file that does not match the query is never added
     let q = parse("reformatter.docx", &ctx());
     let used = [(r"C:\Users\ana\Documents\README notes.txt".to_string(), 12)];

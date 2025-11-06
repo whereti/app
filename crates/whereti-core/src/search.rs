@@ -427,10 +427,12 @@ impl NameIndex {
                 let mut buckets: Vec<u16> = hits.par_iter().with_min_len(8192).map(|&i| bucket(i)).collect();
                 if let Some(w) = &weigh {
                     for &(pos, weight) in used {
-                        // a used file: its match level without the noise or
-                        // hidden penalty, and more important by its weight
+                        // a used file: no noise or hidden penalty, up one
+                        // match level per 4 of weight (a file opened
+                        // yesterday beats an old one that only starts with
+                        // the word), and more important by its weight
                         let i = hits[pos];
-                        let level = (self.relevance(i, needle) & 3) as u16;
+                        let level = (self.relevance(i, needle) & 3).saturating_sub(weight / 4) as u16;
                         let imp = self.importance(i, w).saturating_sub(weight) as u16;
                         buckets[pos] = (level << 5 | imp) << 7 | (rank(i) >> shift).min(127) as u16;
                     }
