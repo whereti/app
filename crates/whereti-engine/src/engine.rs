@@ -245,7 +245,7 @@ impl Engine {
                     return Response::Content(Default::default());
                 };
                 let query = whereti_query::parse(&r.query, &system::date_ctx());
-                Response::Content(self.content.search(idx, &query, r.limit.min(MAX_LIMIT) as usize, caller))
+                Response::Content(self.content.search(idx, &query, r.limit.min(MAX_LIMIT) as usize, &r.usage, caller))
             }
             Request::ScanUnindexed(r) => {
                 let query = whereti_query::parse(&r.query, &system::date_ctx());

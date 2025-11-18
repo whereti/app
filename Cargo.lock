@@ -5059,6 +5059,7 @@ dependencies = [
  "whereti-ntfs",
  "whereti-query",
  "windows-sys 0.61.2",
+ "xxhash-rust",
 ]
 
 [[package]]

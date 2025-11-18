@@ -178,11 +178,12 @@ fn worker(jobs: Receiver<Msg>, out: Sender<Update>, wake: impl Fn()) {
                     match jobs.recv_timeout(CONTENT_DEBOUNCE) {
                         Ok(m) => carried = Some(m),
                         Err(_) => {
+                            let usage = crate::usage::for_query(&job.query);
                             let req = Request::ContentSearch(SearchRequest {
                                 query: job.query,
                                 limit: 200,
                                 sort: job.sort,
-                                usage: Vec::new(),
+                                usage,
                             });
                             if let Response::Content(reply) = c.call(&req)? {
                                 let _ = out.send(Update::Content { generation: job.generation, reply });

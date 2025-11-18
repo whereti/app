@@ -495,7 +495,7 @@ impl NameIndex {
     }
 
     /// What `importance` needs once per search.
-    pub(crate) fn weigher(&self) -> Weigher {
+    pub fn weigher(&self) -> Weigher {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| (d.as_secs() + 11_644_473_600) / 60)
@@ -510,7 +510,7 @@ impl NameIndex {
     /// their kind of files (documents, pictures, music, video, programs) and
     /// recent changes come first; files that programs keep for themselves
     /// last. Ranks inside one match level only: a better match always wins.
-    pub(crate) fn importance(&self, i: u32, w: &Weigher) -> u8 {
+    pub fn importance(&self, i: u32, w: &Weigher) -> u8 {
         let iu = i as usize;
         let f = self.flags[iu];
         let mut score: i32 = 16;
@@ -573,7 +573,7 @@ impl NameIndex {
     }
 }
 
-pub(crate) struct Weigher {
+pub struct Weigher {
     /// Minutes since 1601, like `mtime`.
     now: u32,
     /// `ext_weight` of every extension id.

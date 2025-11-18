@@ -88,6 +88,9 @@ pub struct Content {
     exts: HashSet<&'static str>,
     /// Last hint from a user session: (when, busy, away).
     hint: Mutex<Option<(Instant, bool, bool)>>,
+    /// Content hashes for grouping identical copies: path -> (size,
+    /// modified, hash), so a file is read again only after it changes.
+    hashes: Mutex<HashMap<String, (u64, u32, u64)>>,
     /// Where the content index lives (for the one-time OCR pass marker).
     dir: PathBuf,
 }
@@ -113,6 +116,7 @@ impl Content {
             known_keys: RwLock::new(HashSet::new()),
             exts: whereti_extract::extensions().into_iter().collect(),
             hint: Mutex::new(None),
+            hashes: Mutex::new(HashMap::new()),
             dir: dir.to_path_buf(),
         })
     }
@@ -426,7 +430,15 @@ impl Content {
     /// Content search (PLAN.md §6.5). The words come from `content:` terms,
     /// or - without them - from the plain words of the query; every other
     /// condition (ext:, path:, dm:, size:…) filters the files found.
-    pub fn search(&self, idx: &NameIndex, query: &Query, limit: usize, caller: &dyn Caller) -> ContentReply {
+    /// `usage`: files this user opens often or lately (full path, weight 1-12).
+    pub fn search(
+        &self,
+        idx: &NameIndex,
+        query: &Query,
+        limit: usize,
+        usage: &[(String, u8)],
+        caller: &dyn Caller,
+    ) -> ContentReply {
         let t = Instant::now();
         let Some(index) = self.index.as_ref() else { return ContentReply::default() };
         let (words, filters) = split_query(query);
@@ -438,27 +450,40 @@ impl Content {
             Err(e) => return ContentReply { note: Some(format!("content search failed: {e}")), ..Default::default() },
         };
         let mut entries = Vec::with_capacity(hits.keys.len());
-        for (k, _) in &hits.keys {
+        let mut text_score: HashMap<u32, f32> = HashMap::new();
+        for (k, score) in &hits.keys {
             let (letter, record) = split_key(*k);
             if let Some(e) = idx.volume_index(letter).and_then(|v| idx.live_entry_of(v, record)) {
                 if !entries.contains(&e) {
                     entries.push(e);
+                    text_score.insert(e, *score);
                 }
             }
         }
         let entries = idx.filter(&filters, &entries);
         let paths: Vec<String> = entries.iter().map(|&e| idx.full_path(e)).collect();
         let allowed = caller.can_read(&paths);
+        let w = idx.weigher();
+        let mut found: Vec<(f32, u32, String)> = entries
+            .iter()
+            .zip(paths)
+            .zip(allowed)
+            .filter(|(_, ok)| *ok)
+            .map(|((&e, path), _)| {
+                let used = usage.iter().find(|(p, _)| p.eq_ignore_ascii_case(&path)).map(|u| u.1);
+                let score = text_score.get(&e).copied().unwrap_or(0.0) * weight(idx.importance(e, &w), idx.flags(e), used);
+                (score, e, path)
+            })
+            .collect();
+        found.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.2.cmp(&b.2)));
+        let groups = self.group_copies(idx, &found);
+        let visible = groups.len() as u64;
         let mut rows = Vec::new();
-        let mut visible = 0u64;
-        for ((e, path), ok) in entries.iter().zip(paths).zip(allowed) {
-            if !ok {
-                continue;
-            }
-            visible += 1;
-            if rows.len() < limit {
-                rows.push(Row { path, is_dir: false, size: idx.size(*e), modified: idx.modified(*e), flags: idx.flags(*e) });
-            }
+        let mut copies = Vec::new();
+        for (first, others) in groups.into_iter().take(limit) {
+            let (_, e, path) = &found[first];
+            rows.push(Row { path: path.clone(), is_dir: false, size: idx.size(*e), modified: idx.modified(*e), flags: idx.flags(*e) });
+            copies.push(others.into_iter().map(|k| found[k].2.clone()).collect());
         }
         let status = self.status();
         let note = (status.state != "ready").then(|| {
@@ -466,10 +491,89 @@ impl Content {
         });
         ContentReply {
             rows,
+            copies,
             total: if hits.keys.len() < SEARCH_DEPTH { visible } else { hits.total as u64 },
             micros: t.elapsed().as_micros() as u64,
             note,
         }
+    }
+}
+
+/// How much the place, type, date and use of a document add to how well
+/// its text matches: the same signals as for names (PLAN.md §48-50).
+fn weight(importance: u8, flags: u16, used: Option<u8>) -> f32 {
+    // importance 0 (most) .. 31 (least): x1.64 .. x0.40
+    let mut f = 1.0 + (16.0 - importance as f32) * 0.04;
+    match used {
+        Some(u) => f *= 1.0 + u as f32 * 0.15,
+        None if flags & (FLAG_NOISE | FLAG_HIDDEN | FLAG_SYSTEM) != 0 => f *= 0.5,
+        None => {}
+    }
+    f
+}
+
+/// Files above this size are never read to group copies.
+const MAX_HASHED: u64 = 64 * 1024 * 1024;
+
+impl Content {
+    /// Groups the found documents that are the same file in several places
+    /// (same size, same bytes): `(best, [the other copies])`, in the order
+    /// of `found`. Only files of a size another one shares are read.
+    fn group_copies(&self, idx: &NameIndex, found: &[(f32, u32, String)]) -> Vec<(usize, Vec<usize>)> {
+        let mut by_size: HashMap<u64, Vec<usize>> = HashMap::new();
+        for (k, (_, e, _)) in found.iter().enumerate() {
+            let size = idx.size(*e);
+            if size > 0 && size <= MAX_HASHED {
+                by_size.entry(size).or_default().push(k);
+            }
+        }
+        let mut copy_of: HashMap<usize, usize> = HashMap::new();
+        for same_size in by_size.values().filter(|v| v.len() > 1) {
+            let mut first_with: HashMap<u64, usize> = HashMap::new();
+            for &k in same_size {
+                let (_, e, path) = &found[k];
+                let Some(h) = self.content_hash(path, idx.size(*e), idx.modified(*e)) else { continue };
+                match first_with.get(&h) {
+                    Some(&first) => {
+                        copy_of.insert(k, first);
+                    }
+                    None => {
+                        first_with.insert(h, k);
+                    }
+                }
+            }
+        }
+        let mut groups: Vec<(usize, Vec<usize>)> = Vec::new();
+        let mut slot: HashMap<usize, usize> = HashMap::new();
+        for k in 0..found.len() {
+            match copy_of.get(&k) {
+                Some(first) => groups[slot[first]].1.push(k),
+                None => {
+                    slot.insert(k, groups.len());
+                    groups.push((k, Vec::new()));
+                }
+            }
+        }
+        groups
+    }
+
+    fn content_hash(&self, path: &str, size: u64, modified: u32) -> Option<u64> {
+        if let Some(&(s, m, h)) = self.hashes.lock().get(path) {
+            if s == size && m == modified {
+                return Some(h);
+            }
+        }
+        let bytes = std::fs::read(path).ok()?;
+        if bytes.len() as u64 != size {
+            return None;
+        }
+        let h = xxhash_rust::xxh3::xxh3_64(&bytes);
+        let mut cache = self.hashes.lock();
+        if cache.len() > 20_000 {
+            cache.clear();
+        }
+        cache.insert(path.to_string(), (size, modified, h));
+        Some(h)
     }
 }
 
@@ -752,6 +856,17 @@ pub fn validate_folders(paths: &[String]) -> Result<Vec<String>, String> {
 mod tests {
     use super::*;
     use whereti_query::{parse, DateCtx};
+
+    #[test]
+    fn place_type_date_and_use_weigh_on_content_results() {
+        // more important documents count more, files of tool folders less
+        assert!(weight(0, 0, None) > weight(16, 0, None));
+        assert!(weight(16, 0, None) > weight(31, 0, None));
+        assert_eq!(weight(16, FLAG_NOISE, None), 0.5);
+        // a used file is never halved as noise, and counts more with use
+        assert!(weight(16, FLAG_NOISE, Some(1)) > weight(16, 0, None));
+        assert!(weight(16, 0, Some(12)) > weight(16, 0, Some(2)));
+    }
 
     fn split(q: &str) -> (String, usize) {
         let (w, f) = split_query(&parse(q, &DateCtx { now: 0, tz_offset: 0 }));

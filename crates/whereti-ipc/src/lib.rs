@@ -28,7 +28,7 @@ use windows_sys::Win32::System::Pipes::{
 };
 
 pub const PIPE_NAME: &str = r"\\.\pipe\whereti";
-pub const PROTOCOL_VERSION: u32 = 6;
+pub const PROTOCOL_VERSION: u32 = 7;
 const MAX_MESSAGE: usize = 64 << 20;
 
 /// The account that created the pipe (OW), SYSTEM and Administrators: full
@@ -119,6 +119,9 @@ pub struct SearchReply {
 pub struct ContentReply {
     /// Best first.
     pub rows: Vec<Row>,
+    /// For each row: the other files with exactly the same content (same
+    /// size and same bytes), shown as one result.
+    pub copies: Vec<Vec<String>>,
     /// Files whose text matches, before filters and the limit.
     pub total: u64,
     pub micros: u64,

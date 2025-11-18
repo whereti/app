@@ -91,6 +91,8 @@ pub struct WheretiApp {
     total: u64,
     /// `rows[content_start..]` were found in file contents (not by name).
     content_start: Option<usize>,
+    /// Content result -> the other files with exactly the same content.
+    copies: std::collections::HashMap<String, Vec<String>>,
     /// A content search for the current query is on its way.
     content_pending: bool,
     round_trip: Duration,
@@ -159,6 +161,7 @@ impl WheretiApp {
             rows: Vec::new(),
             total: 0,
             content_start: None,
+            copies: Default::default(),
             content_pending: false,
             round_trip: Duration::ZERO,
             warnings: Vec::new(),
@@ -304,6 +307,7 @@ impl WheretiApp {
                     self.rows = rows;
                     self.total = reply.total;
                     self.content_start = None;
+                    self.copies.clear();
                     self.round_trip = round_trip;
                     self.warnings = reply.warnings;
                     self.selected = 0;
@@ -316,7 +320,18 @@ impl WheretiApp {
                     }
                     self.content_pending = false;
                     let named: std::collections::HashSet<String> = self.rows.iter().map(|r| r.path.clone()).collect();
-                    let extra: Vec<Row> = reply.rows.into_iter().filter(|r| !named.contains(&r.path)).collect();
+                    let mut copies = reply.copies.into_iter();
+                    let mut extra = Vec::new();
+                    for r in reply.rows {
+                        let others = copies.next().unwrap_or_default();
+                        if named.contains(&r.path) {
+                            continue;
+                        }
+                        if !others.is_empty() {
+                            self.copies.insert(r.path.clone(), others);
+                        }
+                        extra.push(r);
+                    }
                     if !extra.is_empty() {
                         self.content_start = Some(self.rows.len());
                         self.rows.extend(extra);
@@ -760,6 +775,7 @@ impl WheretiApp {
         let launch_items = &self.launch_items;
         let file_icons = &mut self.file_icons;
         let snippets = &mut self.snippets;
+        let copies = &self.copies;
         let selected = self.selected;
         let tz = self.tz;
         let now = now_minutes();
@@ -811,7 +827,17 @@ impl WheretiApp {
                 let icon = file_icons.get(ui.ctx(), &row.path, row.is_dir);
                 if content_start.is_some_and(|s| i >= s) {
                     let line = snippets.get(&row.path);
-                    paint_content_row(ui, p, rect, row, icon.as_ref(), &line, i == selected, resp.hovered(), tz, now, &needles);
+                    let others = copies.get(&row.path).map_or(&[][..], |v| v.as_slice());
+                    let hovered = resp.hovered();
+                    paint_content_row(ui, p, rect, row, icon.as_ref(), &line, others, i == selected, hovered, tz, now, &needles);
+                    if hovered && !others.is_empty() {
+                        // where the other copies are
+                        let folders: Vec<&str> = others.iter().map(|o| o.rsplit_once('\\').map_or(o.as_str(), |x| x.0)).collect();
+                        let text = format!("{}\n{}", tr("The same file is also in:"), folders.join("\n"));
+                        egui::Tooltip::for_widget(&resp).show(|ui| {
+                            ui.label(text);
+                        });
+                    }
                 } else {
                     paint_row(ui, p, rect, row, icon.as_ref(), i == selected, resp.hovered(), tz, now, &needles);
                 }
@@ -1736,6 +1762,7 @@ fn paint_content_row(
     row: &Row,
     icon: Option<&egui::TextureHandle>,
     line: &crate::snippets::Line,
+    copies: &[String],
     selected: bool,
     hovered: bool,
     tz: i32,
@@ -1792,7 +1819,18 @@ fn paint_content_row(
         }
     }
     let folder_text = middle_elide(ui, folder, FontId::proportional(12.0), text_w);
-    painter.text(Pos2::new(text_left, inner.top() + 47.0), Align2::LEFT_TOP, folder_text, FontId::proportional(12.0), p.text3);
+    let folder_rect =
+        painter.text(Pos2::new(text_left, inner.top() + 47.0), Align2::LEFT_TOP, folder_text, FontId::proportional(12.0), p.text3);
+    if !copies.is_empty() {
+        // the same file elsewhere: one result, with how many more
+        painter.text(
+            Pos2::new(folder_rect.right() + 10.0, inner.top() + 47.0),
+            Align2::LEFT_TOP,
+            crate::trn!("+{n} copy|+{n} copies", copies.len()),
+            FontId::new(12.0, medium()),
+            p.accent,
+        );
+    }
 
     let size = if row.is_dir { String::new() } else { shell::size(row.size) };
     let y = inner.top() + 16.0;
