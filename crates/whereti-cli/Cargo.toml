@@ -7,12 +7,12 @@ repository.workspace = true
 
 [dependencies]
 clap = { version = "4.6.7", features = ["derive"] }
-whereti-core = { version = "0.0.8", path = "../whereti-core" }
-whereti-extract = { version = "0.0.8", path = "../whereti-extract" }
-whereti-engine = { version = "0.0.8", path = "../whereti-engine" }
-whereti-ipc = { version = "0.0.8", path = "../whereti-ipc" }
-whereti-ntfs = { version = "0.0.8", path = "../whereti-ntfs" }
-whereti-query = { version = "0.0.8", path = "../whereti-query" }
+whereti-core = { version = "0.0.9", path = "../whereti-core" }
+whereti-extract = { version = "0.0.9", path = "../whereti-extract" }
+whereti-engine = { version = "0.0.9", path = "../whereti-engine" }
+whereti-ipc = { version = "0.0.9", path = "../whereti-ipc" }
+whereti-ntfs = { version = "0.0.9", path = "../whereti-ntfs" }
+whereti-query = { version = "0.0.9", path = "../whereti-query" }
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_ProcessStatus", "Win32_System_Threading", "Win32_System_Time"] }
 
 [[bin]]
