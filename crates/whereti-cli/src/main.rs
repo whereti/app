@@ -13,6 +13,7 @@ mod extract_cmd;
 mod index_cmd;
 mod inspect_cmd;
 mod live_cmd;
+mod rank_cmd;
 mod search_cmd;
 use whereti_ntfs::compare::{self, Diff};
 use whereti_ntfs::mft::{self, MftScan};
@@ -50,6 +51,8 @@ enum Cmd {
     Content(search_cmd::ContentArgs),
     /// Extract the text of documents (in the sandboxed worker), with timings
     Extract(extract_cmd::ExtractArgs),
+    /// Measure how well results are ordered, on a set of real searches (scripts\rank-set.ps1)
+    RankEval(rank_cmd::RankArgs),
 }
 
 #[derive(Args)]
@@ -123,6 +126,7 @@ fn main() -> ExitCode {
         Cmd::Inspect(args) => inspect_cmd::run(args).map(|_| ExitCode::SUCCESS),
         Cmd::Content(args) => search_cmd::content(args).map(|_| ExitCode::SUCCESS),
         Cmd::Extract(args) => extract_cmd::run(args).map(|_| ExitCode::SUCCESS),
+        Cmd::RankEval(args) => rank_cmd::run(args).map(|_| ExitCode::SUCCESS),
     };
     match result {
         Ok(code) => code,
