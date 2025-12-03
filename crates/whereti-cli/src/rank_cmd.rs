@@ -124,7 +124,7 @@ fn usage_for(query: &str, cases: &[Case], now: u64) -> Vec<(String, u8)> {
             out.push((c.expected.clone(), recent_weight(now.saturating_sub(t))));
         }
     }
-    out.sort_by(|a, b| b.1.cmp(&a.1));
+    out.sort_by_key(|u| std::cmp::Reverse(u.1));
     out.truncate(32);
     out
 }
@@ -166,12 +166,12 @@ pub fn run(args: RankArgs) -> Result<(), String> {
         }
     }
     println!("{} searches from {}\n", cases.len(), path.display());
-    println!("{:<34}{:>6}  {:>6}  {:>6}  {:>6}   {}", "", "1st", "top 3", "top 10", "missed", "MRR");
+    println!("{:<34}{:>6}  {:>6}  {:>6}  {:>6}   MRR", "", "1st", "top 3", "top 10", "missed");
     for (w, label) in [(0, "one word"), (1, "two words")] {
         println!("{}", scores[w][0].line(&format!("{label}, without what you open")));
         println!("{}", scores[w][1].line(&format!("{label}, as the app ranks")));
     }
-    misses.sort_by(|a, b| b.0.cmp(&a.0));
+    misses.sort_by_key(|m| std::cmp::Reverse(m.0));
     if !misses.is_empty() && args.worst > 0 {
         println!("\nworst, as the app ranks (place, search, expected; then what came first):");
         for (rank, c, first) in misses.iter().take(args.worst) {
