@@ -164,8 +164,10 @@ fn worker(jobs: Receiver<Msg>, out: Sender<Update>, wake: impl Fn()) {
                 let req = Request::Search(SearchRequest { query: job.query.clone(), limit: job.limit, sort: job.sort, usage });
                 let t = Instant::now();
                 match c.call(&req)? {
-                    Response::Search(reply) => {
-                        let _ = out.send(Update::Results { generation: job.generation, reply, round_trip: t.elapsed() });
+                    Response::Search(mut reply) => {
+                        let round_trip = t.elapsed();
+                        refresh_rows(&mut reply);
+                        let _ = out.send(Update::Results { generation: job.generation, reply, round_trip });
                         wake();
                     }
                     Response::Error(e) => {
@@ -219,4 +221,39 @@ fn worker(jobs: Receiver<Msg>, out: Sender<Update>, wake: impl Fn()) {
         }
         wake();
     }
+}
+
+/// Rows read again from disk before they are shown.
+const REFRESHED: usize = 60;
+
+/// The index learns a file's size and date from the NTFS journal, which
+/// writes them for a file held open for writing (a log, a database) only
+/// when it is closed. So the first rows, the ones on screen, take their size
+/// and date from the disk itself, and files deleted a moment ago are dropped.
+fn refresh_rows(reply: &mut SearchReply) {
+    let mut gone = 0u64;
+    let mut k = 0;
+    reply.rows.retain_mut(|row| {
+        k += 1;
+        if k > REFRESHED || row.path.starts_with(r"\\") {
+            return true;
+        }
+        match std::fs::metadata(&row.path) {
+            Ok(m) => {
+                if !m.is_dir() {
+                    row.size = m.len();
+                }
+                if let Ok(t) = m.modified() {
+                    row.modified = crate::recent::minutes_since_1601(t);
+                }
+                true
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                gone += 1;
+                false
+            }
+            Err(_) => true,
+        }
+    });
+    reply.total = reply.total.saturating_sub(gone);
 }

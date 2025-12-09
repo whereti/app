@@ -491,6 +491,22 @@ impl NameIndex {
                 scan: MftScan::default(),
             })
             .collect();
+        // Exact room first: a list grown by doubling holds both the old and
+        // the new copy for a moment, hundreds of MB on a big disk (PLAN.md §52).
+        let mut need = vec![(0usize, 0usize); scans.len()];
+        for i in 0..self.len() as u32 {
+            let f = self.flags[i as usize];
+            if f & FLAG_GONE != 0 || rec_of[i as usize] == u64::MAX {
+                continue;
+            }
+            let n = &mut need[self.volume[i as usize] as usize];
+            n.0 += 1;
+            n.1 += if f & FLAG_ROOT != 0 { 1 } else { self.name(i).len() };
+        }
+        for (s, (entries, bytes)) in scans.iter_mut().zip(need) {
+            s.scan.entries.reserve_exact(entries);
+            s.scan.names.reserve_exact(bytes);
+        }
         for i in 0..self.len() as u32 {
             let f = self.flags[i as usize];
             let record = rec_of[i as usize];

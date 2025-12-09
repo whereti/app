@@ -76,7 +76,10 @@ fn open_log() -> Result<Logger, String> {
 fn run_service() -> Result<(), String> {
     let (stop_tx, stop_rx) = mpsc::channel();
     let handler = move |control| match control {
-        ServiceControl::Stop | ServiceControl::Shutdown => {
+        // Preshutdown comes before the other services are told to stop, with
+        // more time than Shutdown: the index is usually saved before Windows
+        // goes down (and if not, the old file stays and the journal fills in).
+        ServiceControl::Stop | ServiceControl::Preshutdown | ServiceControl::Shutdown => {
             let _ = stop_tx.send(());
             ServiceControlHandlerResult::NoError
         }
@@ -113,7 +116,7 @@ fn run_service() -> Result<(), String> {
             return Err(e.to_string());
         }
     };
-    set(ServiceState::Running, ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN, 0);
+    set(ServiceState::Running, ServiceControlAccept::STOP | ServiceControlAccept::PRESHUTDOWN, 0);
 
     let _ = stop_rx.recv();
     set(ServiceState::StopPending, ServiceControlAccept::empty(), 20);

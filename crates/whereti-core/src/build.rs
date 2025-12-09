@@ -237,6 +237,16 @@ fn add_volume(
             stats.excluded += 1;
         }
     }
+    // exact room for the kept entries: no doubling, no second copy (§52)
+    let kept = (next - base) as usize;
+    idx.names.reserve_exact(scan.names.len() + kept);
+    idx.name_off.reserve_exact(kept);
+    idx.parent.reserve_exact(kept);
+    idx.flags.reserve_exact(kept);
+    idx.ext.reserve_exact(kept);
+    idx.size.reserve_exact(kept);
+    idx.mtime.reserve_exact(kept);
+    idx.volume.reserve_exact(kept);
     let vol_no = idx.volumes.len() as u8;
     let mut folded = String::new();
     for i in 0..n {

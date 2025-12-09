@@ -149,7 +149,7 @@ fn is_partial_download(p: &Path) -> bool {
     matches!(ext.as_str(), "crdownload" | "part" | "partial" | "download" | "tmp")
 }
 
-fn minutes_since_1601(t: SystemTime) -> u32 {
+pub(crate) fn minutes_since_1601(t: SystemTime) -> u32 {
     let unix = t.duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs() / 60).unwrap_or(0);
     (unix + 134_774 * 1440) as u32
 }

@@ -243,6 +243,7 @@ impl Client {
         loop {
             match OpenOptions::new().access_mode(CLIENT_ACCESS).open(name) {
                 Ok(pipe) => {
+                    check_server(&pipe)?;
                     let mut c = Client { pipe };
                     match c.call(&Request::Hello { version: PROTOCOL_VERSION })? {
                         Response::Hello { version, .. } if version == PROTOCOL_VERSION => return Ok(c),
@@ -271,6 +272,95 @@ impl Client {
     pub fn call(&mut self, req: &Request) -> io::Result<Response> {
         write_message(&mut self.pipe, req)?;
         read_message(&mut self.pipe)?.ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "service closed the connection"))
+    }
+}
+
+/// The service's name in the Service Control Manager.
+const SERVICE_NAME: &str = "whereti";
+
+/// Refuses a pipe that someone else created under whereti's name. When the
+/// service is not running the name is free, and any program could create it
+/// to read the searches sent to it. Accepted: the whereti service itself (the
+/// process the Service Control Manager runs for it), an elevated process
+/// (`wt serve` from an administrator terminal), or this process (tests).
+fn check_server(pipe: &File) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::Pipes::GetNamedPipeServerProcessId;
+    let mut pid = 0u32;
+    // SAFETY: a valid client pipe handle and an out value.
+    if unsafe { GetNamedPipeServerProcessId(pipe.as_raw_handle() as _, &mut pid) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if pid == std::process::id() || service_pid() == Some(pid) || is_elevated(pid) {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("the whereti pipe is served by another program (process {pid}), not the whereti service"),
+        ))
+    }
+}
+
+/// The process the running whereti service is in.
+fn service_pid() -> Option<u32> {
+    use windows_sys::Win32::System::Services::{
+        CloseServiceHandle, OpenSCManagerW, OpenServiceW, QueryServiceStatusEx, SC_MANAGER_CONNECT, SC_STATUS_PROCESS_INFO,
+        SERVICE_QUERY_STATUS, SERVICE_STATUS_PROCESS,
+    };
+    let name: Vec<u16> = SERVICE_NAME.encode_utf16().chain([0]).collect();
+    // SAFETY: handles are checked and closed; the buffer is a
+    // SERVICE_STATUS_PROCESS of the size passed.
+    unsafe {
+        let scm = OpenSCManagerW(std::ptr::null(), std::ptr::null(), SC_MANAGER_CONNECT);
+        if scm.is_null() {
+            return None;
+        }
+        let svc = OpenServiceW(scm, name.as_ptr(), SERVICE_QUERY_STATUS);
+        let mut out = None;
+        if !svc.is_null() {
+            let mut st: SERVICE_STATUS_PROCESS = std::mem::zeroed();
+            let mut needed = 0u32;
+            let ok = QueryServiceStatusEx(
+                svc,
+                SC_STATUS_PROCESS_INFO,
+                &mut st as *mut _ as *mut u8,
+                size_of::<SERVICE_STATUS_PROCESS>() as u32,
+                &mut needed,
+            );
+            if ok != 0 && st.dwProcessId != 0 {
+                out = Some(st.dwProcessId);
+            }
+            CloseServiceHandle(svc);
+        }
+        CloseServiceHandle(scm);
+        out
+    }
+}
+
+/// Runs with administrator rights (only an administrator could have made it).
+fn is_elevated(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
+    use windows_sys::Win32::System::Threading::{OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION};
+    // SAFETY: handles are checked and closed; the out value is a
+    // TOKEN_ELEVATION of the size passed.
+    unsafe {
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if process.is_null() {
+            return false;
+        }
+        let mut token = std::ptr::null_mut();
+        let mut elevated = false;
+        if OpenProcessToken(process, TOKEN_QUERY, &mut token) != 0 {
+            let mut e = TOKEN_ELEVATION { TokenIsElevated: 0 };
+            let mut len = 0u32;
+            if GetTokenInformation(token, TokenElevation, &mut e as *mut _ as *mut _, size_of::<TOKEN_ELEVATION>() as u32, &mut len) != 0 {
+                elevated = e.TokenIsElevated != 0;
+            }
+            CloseHandle(token);
+        }
+        CloseHandle(process);
+        elevated
     }
 }
 
@@ -458,6 +548,36 @@ fn create_instance(pipe_name: &str, first: bool) -> io::Result<OwnedHandle> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_pipe_made_by_another_program_is_refused() {
+        // From an administrator terminal (or CI) the other program would be
+        // elevated too, and so accepted: nothing to show there.
+        if is_elevated(std::process::id()) {
+            return;
+        }
+        let name = format!("whereti-test-foreign-{}", std::process::id());
+        let script = format!(
+            "$p = New-Object System.IO.Pipes.NamedPipeServerStream('{name}'); $p.WaitForConnection(); Start-Sleep -Milliseconds 300"
+        );
+        let mut child = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .spawn()
+            .expect("powershell");
+        let full = format!(r"\\.\pipe\{name}");
+        let start = Instant::now();
+        let err = loop {
+            match Client::connect_to(&full, Duration::from_secs(5)) {
+                Err(e) if e.kind() == io::ErrorKind::NotFound && start.elapsed() < Duration::from_secs(20) => {
+                    std::thread::sleep(Duration::from_millis(100)); // not created yet
+                }
+                Err(e) => break e,
+                Ok(_) => panic!("a pipe served by another program was accepted"),
+            }
+        };
+        let _ = child.wait();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
+    }
 
     #[test]
     fn messages_round_trip() {
