@@ -14,7 +14,7 @@ path = "src/main.rs"
 eframe = { version = "0.37.0", default-features = false, features = ["accesskit", "default_fonts", "glow"] }
 windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Com", "Win32_System_Registry", "Win32_System_Threading", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_ToolHelp"] }
 windows-service = "0.8.1"
-whereti-i18n = { version = "0.0.9", path = "../whereti-i18n" }
+whereti-i18n = { version = "0.0.10", path = "../whereti-i18n" }
 
 [build-dependencies]
 winresource = "0.1.34"
