@@ -1,0 +1,11 @@
+[package]
+name = "whereti-places"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Where a photo was taken: its GPS position from EXIF, named offline with GeoNames places"
+
+[dependencies]
+flate2 = "1.1.10"
+kamadak-exif = "0.6.1"

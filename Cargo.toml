@@ -10,8 +10,10 @@ default-members = [
     "crates/whereti-core",
     "crates/whereti-engine",
     "crates/whereti-extract",
+    "crates/whereti-i18n",
     "crates/whereti-ipc",
     "crates/whereti-ntfs",
+    "crates/whereti-places",
     "crates/whereti-query",
     "crates/whereti-service",
 ]

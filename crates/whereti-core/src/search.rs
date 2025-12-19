@@ -222,7 +222,7 @@ impl NameIndex {
             Term::Mine => Matcher::Mine,
             Term::FilesOnly => Matcher::Files,
             // Answered by the content index, never by names.
-            Term::Content(_) => Matcher::Never,
+            Term::Content(_) | Term::Place(_) => Matcher::Never,
             Term::All(ts) => Matcher::All(ts.iter().map(|t| self.compile(t, warnings)).collect()),
         }
     }

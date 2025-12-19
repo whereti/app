@@ -90,7 +90,7 @@ impl Snippets {
                             t
                         }
                     };
-                    let snippet = text.and_then(|t| make(&t, &needles));
+                    let snippet = text.and_then(|t| make(&t, &needles)).or_else(|| place_line(&path, &needles));
                     if tx.send((needles, path, snippet)).is_err() {
                         return;
                     }
@@ -144,6 +144,35 @@ impl Snippets {
 
 /// The excerpt around the first match: the whole phrase if the text has it,
 /// else the first (long enough) word. Whitespace is collapsed.
+/// A photo found by where it was taken: "Rome, Lazio, Italy", plus the
+/// name that matched when it is another one ("· Roma").
+fn place_line(path: &str, needles: &[String]) -> Option<Snippet> {
+    let ext = path.rsplit_once('.')?.1.to_ascii_lowercase();
+    let head = match ext.as_str() {
+        "heic" | "heif" => 64 << 20,
+        "jpg" | "jpeg" | "jpe" | "jfif" | "tif" | "tiff" | "png" | "webp" => 512 << 10,
+        _ => return None,
+    };
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path).ok()?.take(head).read_to_end(&mut bytes).ok()?;
+    let (lat, lon) = whereti_places::gps(&bytes)?;
+    let place = whereti_places::place_of(lat, lon)?;
+    let label = place.label();
+    if let Some(s) = make(&label, needles) {
+        return Some(s);
+    }
+    let names = place.city.iter().chain(place.region.iter()).chain(place.country.iter());
+    let matched: Vec<&String> =
+        names.filter(|n| needles.iter().any(|w| whereti_query::fold(n).contains(w.as_str()))).take(2).collect();
+    let text = if matched.is_empty() {
+        label
+    } else {
+        format!("{label} · {}", matched.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "))
+    };
+    make(&text, needles).or(Some(Snippet { marks: vec![false; text.chars().count()], text }))
+}
+
 pub fn make(text: &str, needles: &[String]) -> Option<Snippet> {
     let long: Vec<String> = needles.iter().filter(|n| n.chars().count() >= 3).cloned().collect();
     let words: &[String] = if long.is_empty() { needles } else { &long };

@@ -44,6 +44,9 @@ pub enum Term {
     Mine,
     /// Content search (not available in the name index).
     Content(String),
+    /// Where a photo was taken: a town, region or country (`loc:roma`),
+    /// looked up in the content index among photos.
+    Place(String),
     /// Every term must match (e.g. `folder:raport` = folder AND "raport").
     All(Vec<Term>),
 }
@@ -215,6 +218,7 @@ fn parse_function(prefix: &str, value: &str, quoted: bool, ctx: &DateCtx) -> Opt
         "dm" | "datemodified" => date::parse_range(value, ctx).map(|(min, max)| Term::Modified { min, max }),
         "regex" if !value.is_empty() => Some(Term::Regex(value.to_string())),
         "c" | "content" if !value.is_empty() => Some(Term::Content(fold(value))),
+        "loc" | "location" | "place" if !value.is_empty() => Some(Term::Place(fold(value))),
         "mine" if value.is_empty() => Some(Term::Mine),
         "folder" | "file" => {
             let kind = if prefix == "folder" { Term::FoldersOnly } else { Term::FilesOnly };

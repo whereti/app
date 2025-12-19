@@ -490,6 +490,8 @@ fn about(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
                 tr("Your files never leave your PC. No account, no tracking."),
             ),
             (tr("Open source"), tr("Free, under the MIT license.")),
+            // GeoNames asks for this credit (CC BY 4.0)
+            (tr("Places"), tr("Where your photos were taken is named with data from GeoNames (geonames.org, CC BY 4.0).")),
             (
                 tr("Supporter license"),
                 supporter_text.as_str(),

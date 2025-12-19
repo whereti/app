@@ -246,6 +246,21 @@ impl Content {
                 shared.log.log(format!("content: {} documents without text are read again with OCR", before - known.len()));
             }
         }
+        // Once, when places arrive: photos indexed before are read again,
+        // now with where they were taken.
+        let places_marker = self.dir.join("places-1");
+        let places_pass = !places_marker.exists();
+        if places_pass {
+            let before = known.len();
+            let photos: HashSet<u64> = {
+                let guard = shared.index.read();
+                guard.as_ref().map(photo_keys).unwrap_or_default()
+            };
+            known.retain(|k, _| !photos.contains(k));
+            if known.len() < before {
+                shared.log.log(format!("content: {} photos are read again for where they were taken", before - known.len()));
+            }
+        }
         self.update_counts(index, &known);
         let sandbox = Sandbox::beside_current_exe().map(|mut s| {
             s.timeout = Duration::from_secs(30);
@@ -265,6 +280,9 @@ impl Content {
                     Ok(()) => {
                         if ocr_pass && self.status.lock().queued == 0 && !ocr_marker.exists() {
                             let _ = std::fs::write(&ocr_marker, "documents without text were read again with OCR\n");
+                        }
+                        if places_pass && self.status.lock().queued == 0 && !places_marker.exists() {
+                            let _ = std::fs::write(&places_marker, "photos were read again for where they were taken\n");
                         }
                     }
                     Err(e) => {
@@ -655,6 +673,8 @@ impl Content {
 /// that filter the files. With `content:` terms, plain words stay name
 /// conditions (`raport content:total` = name has „raport”, text has „total”).
 pub fn split_query(query: &Query) -> (String, Query) {
+    // content: makes the other words name filters; loc: does not (a photo's
+    // name says nothing, its text is where it was taken)
     let content_clause = |c: &Clause| !c.negated && matches!(c.any_of.as_slice(), [Term::Content(_)]);
     let explicit = query.clauses.iter().any(content_clause);
     let mut words = Vec::new();
@@ -662,9 +682,15 @@ pub fn split_query(query: &Query) -> (String, Query) {
     for c in &query.clauses {
         match (c.negated, c.any_of.as_slice()) {
             (false, [Term::Content(t)]) => words.push(t.clone()),
+            (false, [Term::Place(t)]) => {
+                // the place names are in the text of photos: look among photos only
+                words.push(t.clone());
+                let photos = PHOTO_EXTS.iter().map(|e| e.to_string()).collect();
+                filters.clauses.push(Clause { negated: false, any_of: vec![Term::Ext(photos)] });
+            }
             (false, [Term::Text(t)]) if !explicit => words.push(t.clone()),
             // a negated or OR-ed content term cannot filter by name
-            _ if c.any_of.iter().any(|t| matches!(t, Term::Content(_))) => {}
+            _ if c.any_of.iter().any(|t| matches!(t, Term::Content(_) | Term::Place(_))) => {}
             _ => filters.clauses.push(c.clone()),
         }
     }
@@ -676,6 +702,26 @@ struct Candidate {
     path: String,
     size: u64,
     modified: u32,
+    /// A photo in a pictures folder: only where it was taken is read, not
+    /// its text (OCR on every holiday photo would cost hours).
+    photo_only: bool,
+}
+
+/// Photos a camera or phone writes its GPS position into.
+const PHOTO_EXTS: &[&str] = &["jpg", "jpeg", "jpe", "jfif", "heic", "heif", "tif", "tiff", "png", "webp"];
+
+/// Where a photo was taken, as text for the index: "Rome, Lazio, Italy"
+/// and then every name of the place. `None` without a GPS position.
+fn place_text(path: &Path, ext: &str) -> Option<String> {
+    if !PHOTO_EXTS.contains(&ext) {
+        return None;
+    }
+    // EXIF is at the start of a JPEG; a HEIC keeps it anywhere in the file
+    let head = if matches!(ext, "heic" | "heif") { 64 << 20 } else { 512 << 10 };
+    let bytes = read_head(path, head).ok()?;
+    let (lat, lon) = whereti_places::gps(&bytes)?;
+    let place = whereti_places::place_of(lat, lon)?;
+    Some(format!("{}\n{}", place.label(), place.search_text()))
 }
 
 /// The files to index, by key: documents everywhere, and text/code inside
@@ -723,9 +769,85 @@ fn files_in(idx: &NameIndex, folders: &[String]) -> HashMap<u64, Candidate> {
     for (e, r) in entries.into_iter().zip(records) {
         let Some(record) = r else { continue };
         let k = key(idx.volume_of(e).letter(), record);
-        out.entry(k).or_insert_with(|| Candidate { key: k, path: idx.full_path(e), size: idx.size(e), modified: idx.modified(e) });
+        out.entry(k).or_insert_with(|| Candidate {
+            key: k,
+            path: idx.full_path(e),
+            size: idx.size(e),
+            modified: idx.modified(e),
+            photo_only: false,
+        });
+    }
+    // photos in the pictures folders: where they were taken
+    let pictures = picture_folders();
+    if !pictures.is_empty() {
+        let paths = pictures
+            .iter()
+            .map(|f| {
+                let mut p = fold(f.trim_end_matches('\\'));
+                p.push('\\');
+                Term::Path(p)
+            })
+            .collect();
+        let photos = Query {
+            clauses: vec![
+                file(),
+                Clause { negated: false, any_of: paths },
+                Clause { negated: false, any_of: vec![Term::Ext(PHOTO_EXTS.iter().map(|e| e.to_string()).collect())] },
+            ],
+        };
+        let entries: Vec<u32> =
+            idx.matching(&photos).into_iter().filter(|&e| idx.flags(e) & SKIP == 0 && idx.size(e) >= MIN_PICTURE).collect();
+        let records = idx.records_of(&entries);
+        for (e, r) in entries.into_iter().zip(records) {
+            let Some(record) = r else { continue };
+            let k = key(idx.volume_of(e).letter(), record);
+            // a photo in a content folder is read in full (its text too)
+            out.entry(k).or_insert_with(|| Candidate {
+                key: k,
+                path: idx.full_path(e),
+                size: idx.size(e),
+                modified: idx.modified(e),
+                photo_only: true,
+            });
+        }
     }
     out
+}
+
+/// Every user's Pictures folder, and OneDrive's (cloud-only photos are
+/// never read: they are skipped like every cloud-only file).
+fn picture_folders() -> Vec<String> {
+    let drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into());
+    let Ok(dir) = std::fs::read_dir(format!(r"{drive}\Users")) else { return Vec::new() };
+    let mut out = Vec::new();
+    for p in dir.flatten().map(|e| e.path()).filter(|p| p.is_dir()) {
+        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("").to_ascii_lowercase();
+        if matches!(name.as_str(), "public" | "default" | "default user" | "all users") {
+            continue;
+        }
+        // OneDrive names the folder in the language of Windows
+        for sub in ["Pictures", r"OneDrive\Pictures", r"OneDrive\Imagini", r"OneDrive\Bilder", r"OneDrive\Imágenes", r"OneDrive\Images", r"OneDrive\Immagini", r"OneDrive\Obrazy", r"OneDrive\Imagens"] {
+            let f = p.join(sub);
+            if f.is_dir() && !std::fs::symlink_metadata(&f).is_ok_and(|m| m.file_type().is_symlink()) {
+                out.push(f.display().to_string());
+            }
+        }
+    }
+    out
+}
+
+/// Keys of every photo in the name index (for the one-time places pass).
+fn photo_keys(idx: &NameIndex) -> HashSet<u64> {
+    let q = Query {
+        clauses: vec![Clause { negated: false, any_of: vec![Term::Ext(PHOTO_EXTS.iter().map(|e| e.to_string()).collect())] }],
+    };
+    let entries = idx.matching(&q);
+    let records = idx.records_of(&entries);
+    entries
+        .into_iter()
+        .zip(records)
+        .filter_map(|(e, r)| Some(key(idx.volume_of(e).letter(), r?)))
+        .collect()
 }
 
 /// Pictures smaller than this are icons and thumbnails; larger ones are
@@ -745,6 +867,13 @@ fn extract(c: &Candidate, sandbox: Option<&Sandbox>) -> Option<(Indexed, String)
     let path = Path::new(&c.path);
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
     let kind = whereti_extract::kind_of(&ext)?;
+    if c.photo_only {
+        return Some(match place_text(path, &ext) {
+            Some(text) => (what(Status::Ok), text),
+            None => (what(Status::Empty), String::new()),
+        });
+    }
+    let place = if kind == Kind::Image { place_text(path, &ext) } else { None };
     let result = if kind == Kind::Text {
         // Plain text needs no parser: read the head in-process.
         read_head(path, TEXT_HEAD).and_then(|b| whereti_extract::extract(&ext, &b, MAX_CHARS).map_err(SandboxError::Extract))
@@ -752,6 +881,15 @@ fn extract(c: &Candidate, sandbox: Option<&Sandbox>) -> Option<(Indexed, String)
         return Some((what(Status::TooLarge), String::new()));
     } else {
         sandbox?.extract_file(path, MAX_CHARS)
+    };
+    // a photo: where it was taken, then the text OCR read in it
+    let result = match (result, place) {
+        (Ok(mut e), Some(p)) => {
+            e.text = format!("{p}\n{}", e.text);
+            Ok(e)
+        }
+        (Err(_), Some(p)) => Ok(whereti_extract::Extracted { text: p, truncated: false }),
+        (r, None) => r,
     };
     Some(match result {
         Ok(e) if e.text.trim().is_empty() => (what(Status::Empty), String::new()),
@@ -858,6 +996,17 @@ mod tests {
     use whereti_query::{parse, DateCtx};
 
     #[test]
+    fn loc_looks_for_the_place_among_photos() {
+        let ctx = DateCtx { now: 0, tz_offset: 0 };
+        let (words, filters) = split_query(&parse("loc:Roma", &ctx));
+        assert_eq!(words, "roma");
+        assert!(filters.clauses.iter().any(|c| matches!(c.any_of.as_slice(), [Term::Ext(e)] if e.contains(&"heic".to_string()))));
+        // with other words, all of them must be in the photo's text
+        let (words, _) = split_query(&parse("loc:italia plaja", &ctx));
+        assert_eq!(words, "italia plaja");
+    }
+
+    #[test]
     fn place_type_date_and_use_weigh_on_content_results() {
         // more important documents count more, files of tool folders less
         assert!(weight(0, 0, None) > weight(16, 0, None));
@@ -908,7 +1057,7 @@ mod tests {
         let file = |name: &str, text: &str, modified: u32| {
             let path = dir.join(name);
             std::fs::write(&path, text).unwrap();
-            Candidate { key: modified as u64, path: path.to_string_lossy().into_owned(), size: text.len() as u64, modified }
+            Candidate { key: modified as u64, path: path.to_string_lossy().into_owned(), size: text.len() as u64, modified, photo_only: false }
         };
         let plan = ScanPlan {
             needles: vec![fold("chirie"), fold("Iulie")],
