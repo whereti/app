@@ -8,12 +8,12 @@ repository.workspace = true
 [dependencies]
 parking_lot = "0.13.0"
 rayon = "1.12.0"
-whereti-content = { version = "0.0.10", path = "../whereti-content" }
-whereti-core = { version = "0.0.10", path = "../whereti-core" }
-whereti-extract = { version = "0.0.10", path = "../whereti-extract" }
-whereti-ipc = { version = "0.0.10", path = "../whereti-ipc" }
-whereti-ntfs = { version = "0.0.10", path = "../whereti-ntfs" }
-whereti-places = { version = "0.0.10", path = "../whereti-places" }
-whereti-query = { version = "0.0.10", path = "../whereti-query" }
+whereti-content = { version = "0.0.11", path = "../whereti-content" }
+whereti-core = { version = "0.0.11", path = "../whereti-core" }
+whereti-extract = { version = "0.0.11", path = "../whereti-extract" }
+whereti-ipc = { version = "0.0.11", path = "../whereti-ipc" }
+whereti-ntfs = { version = "0.0.11", path = "../whereti-ntfs" }
+whereti-places = { version = "0.0.11", path = "../whereti-places" }
+whereti-query = { version = "0.0.11", path = "../whereti-query" }
 xxhash-rust = { version = "0.8.19", features = ["xxh3"] }
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Threading", "Win32_System_ProcessStatus", "Win32_System_Time", "Win32_System_SystemInformation", "Win32_System_Power", "Win32_System_IO", "Win32_System_LibraryLoader", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi"] }
