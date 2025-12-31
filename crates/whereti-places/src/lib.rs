@@ -207,7 +207,13 @@ pub fn gps(bytes: &[u8]) -> Option<(f64, f64)> {
 
 fn gps_inner(bytes: &[u8]) -> Option<(f64, f64)> {
     use exif::{In, Tag, Value};
-    let exif = exif::Reader::new().read_from_container(&mut std::io::Cursor::new(bytes)).ok()?;
+    // Tolerant: some apps write small mistakes (a stray "next IFD" pointer)
+    // around a GPS position that is fine; keep what can be read.
+    let exif = exif::Reader::new()
+        .continue_on_error(true)
+        .read_from_container(&mut std::io::Cursor::new(bytes))
+        .or_else(|e| e.distill_partial_result(|_| {}))
+        .ok()?;
     let degrees = |tag: Tag| -> Option<f64> {
         match &exif.get_field(tag, In::PRIMARY)?.value {
             Value::Rational(v) if v.len() >= 3 && v.iter().all(|r| r.denom != 0) => {

@@ -91,6 +91,9 @@ pub struct Content {
     /// Content hashes for grouping identical copies: path -> (size,
     /// modified, hash), so a file is read again only after it changes.
     hashes: Mutex<HashMap<String, (u64, u32, u64)>>,
+    /// The users' Pictures folders, as of the last round (photos there are
+    /// read for where they were taken).
+    pictures: RwLock<Vec<String>>,
     /// Where the content index lives (for the one-time OCR pass marker).
     dir: PathBuf,
 }
@@ -117,6 +120,7 @@ impl Content {
             exts: whereti_extract::extensions().into_iter().collect(),
             hint: Mutex::new(None),
             hashes: Mutex::new(HashMap::new()),
+            pictures: RwLock::new(picture_folders()),
             dir: dir.to_path_buf(),
         })
     }
@@ -149,7 +153,14 @@ impl Content {
         if self.dirty.load(Ordering::Relaxed) || self.index.is_none() || vol >= idx.volumes().len() {
             return;
         }
-        let folders: Vec<String> = self.folders.read().iter().map(|f| format!("{}\\", fold(f.trim_end_matches('\\')))).collect();
+        // a photo added to Pictures counts too
+        let folders: Vec<String> = self
+            .folders
+            .read()
+            .iter()
+            .chain(self.pictures.read().iter())
+            .map(|f| format!("{}\\", fold(f.trim_end_matches('\\'))))
+            .collect();
         let letter = idx.volumes()[vol].letter();
         let known = self.known_keys.read();
         for &r in records {
@@ -162,7 +173,7 @@ impl Content {
             if !is_dir {
                 let name = idx.name(e);
                 let ext = name.rsplit_once('.').map(|(_, x)| x.to_ascii_lowercase()).unwrap_or_default();
-                if !self.exts.contains(ext.as_str()) {
+                if !self.exts.contains(ext.as_str()) && !PHOTO_EXTS.contains(&ext.as_str()) {
                     continue;
                 }
                 // a document anywhere (outside noise) counts right away
@@ -314,10 +325,12 @@ impl Content {
             self.set_state("scanning");
         }
         let folders = self.folders();
+        let pictures = picture_folders();
+        *self.pictures.write() = pictures.clone();
         let wanted = {
             let guard = shared.index.read();
             let Some(idx) = guard.as_ref() else { return Ok(()) };
-            files_in(idx, &folders)
+            files_in(idx, &folders, &pictures)
         };
         let removed: Vec<u64> = known.keys().filter(|k| !wanted.contains_key(k)).copied().collect();
         for k in &removed {
@@ -615,7 +628,7 @@ impl Content {
         }
         let known = self.known_keys.read();
         let mut candidates: Vec<Candidate> =
-            files_in(idx, &self.folders()).into_values().filter(|c| !known.contains(&c.key)).collect();
+            files_in(idx, &self.folders(), &[]).into_values().filter(|c| !known.contains(&c.key)).collect();
         drop(known);
         if !filters.clauses.is_empty() {
             let entries: Vec<u32> = candidates
@@ -726,7 +739,7 @@ fn place_text(path: &Path, ext: &str) -> Option<String> {
 
 /// The files to index, by key: documents everywhere, and text/code inside
 /// the content folders (all outside cloud-only, hidden, system and noise).
-fn files_in(idx: &NameIndex, folders: &[String]) -> HashMap<u64, Candidate> {
+fn files_in(idx: &NameIndex, folders: &[String], pictures: &[String]) -> HashMap<u64, Candidate> {
     let file = || Clause { negated: false, any_of: vec![Term::FilesOnly] };
     let documents = Query {
         clauses: vec![
@@ -778,7 +791,6 @@ fn files_in(idx: &NameIndex, folders: &[String]) -> HashMap<u64, Candidate> {
         });
     }
     // photos in the pictures folders: where they were taken
-    let pictures = picture_folders();
     if !pictures.is_empty() {
         let paths = pictures
             .iter()
