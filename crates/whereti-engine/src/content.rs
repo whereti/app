@@ -259,7 +259,7 @@ impl Content {
         }
         // Once, when places arrive: photos indexed before are read again,
         // now with where they were taken.
-        let places_marker = self.dir.join("places-1");
+        let places_marker = self.dir.join("places-2"); // 2: again, with the tolerant EXIF reader (0.0.12)
         let places_pass = !places_marker.exists();
         if places_pass {
             let before = known.len();
