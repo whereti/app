@@ -11,6 +11,6 @@ bytemuck = { version = "1.25.2", features = ["derive"] }
 memchr = "2.8.3"
 rayon = "1.12.0"
 regex = "1.13.1"
-whereti-ntfs = { version = "0.0.12", path = "../whereti-ntfs" }
-whereti-query = { version = "0.0.12", path = "../whereti-query" }
+whereti-ntfs = { version = "0.0.13", path = "../whereti-ntfs" }
+whereti-query = { version = "0.0.13", path = "../whereti-query" }
 xxhash-rust = { version = "0.8.19", features = ["xxh3"] }
