@@ -24,6 +24,8 @@ pub enum Icon {
     Plug,
     Sparkle,
     Heart,
+    /// A question mark in a circle (the search commands).
+    Help,
 }
 
 /// Draws `icon` centred in `rect` (the rect's smaller side is the icon size).
@@ -65,6 +67,11 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
                 color,
                 Stroke::NONE,
             ));
+        }
+        Icon::Help => {
+            painter.circle_stroke(p(12.0, 12.0), 9.0 * k, s);
+            line(&[(9.4, 9.6), (9.9, 8.2), (11.0, 7.4), (12.4, 7.3), (13.8, 7.9), (14.6, 9.1), (14.4, 10.5), (13.3, 11.5), (12.3, 12.3), (12.0, 13.6)]);
+            painter.circle_filled(p(12.0, 16.6), 1.1 * k, color);
         }
         Icon::Search => {
             painter.circle_stroke(p(10.5, 10.5), 6.5 * k, s);

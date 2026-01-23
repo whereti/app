@@ -142,6 +142,10 @@ pub struct WheretiApp {
     scan: Option<Scan>,
     /// Confetti after a supporter license is activated: when it started.
     confetti: Option<Instant>,
+    /// The "?" panel of search commands is open (F1).
+    help_open: bool,
+    /// Where the search field is, to place the "?" panel under it.
+    search_rect: Rect,
 }
 
 impl WheretiApp {
@@ -198,6 +202,8 @@ impl WheretiApp {
             pending_launch: Vec::new(),
             scan: None,
             confetti: None,
+            help_open: false,
+            search_rect: Rect::NOTHING,
             snippets: {
                 let wake_ctx = ctx.clone();
                 crate::snippets::Snippets::start(move || wake_ctx.request_repaint())
@@ -422,6 +428,14 @@ impl WheretiApp {
         }
         let page = ((self.view_height / ROW_HEIGHT) as usize).max(1);
         let search_page = self.page == Page::Search;
+        let f1 = ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::F1));
+        if f1 {
+            self.help_open = !self.help_open;
+        }
+        if self.help_open && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+            self.help_open = false;
+            return;
+        }
         let (down, up, pg_down, pg_up, ctrl_enter, enter, copy, esc, settings, menu, tab) = ctx.input_mut(|i| {
             (
                 i.consume_key(Modifiers::NONE, Key::ArrowDown),
@@ -588,9 +602,14 @@ impl WheretiApp {
                     } else if let Some(k) = self.hotkey_label() {
                         key_hint(ui, p, &k);
                     }
+                    let help = icon_button(ui, p, IconKind::Help, self.help_open).on_hover_text(tr("Search commands (F1)"));
+                    if help.clicked() {
+                        self.help_open = !self.help_open;
+                    }
                 });
             });
         });
+        self.search_rect = out.response.rect;
         if focused {
             // soft focus ring outside the hairline
             let r = out.response.rect.expand(2.5);
@@ -1206,6 +1225,8 @@ impl eframe::App for WheretiApp {
             ctx.request_repaint_after(STATUS_EVERY);
         }
         let p = Palette::of(&ctx, self.accent);
+        // the "?" panel floats above everything (placed under last frame's search field)
+        self.help_panel(&ctx, &p);
         if self.hwnd.is_none() {
             self.hwnd = crate::win::hwnd(frame);
         }
@@ -1403,6 +1424,7 @@ pub(crate) enum IconKind {
     Close,
     Back,
     Preview,
+    Help,
 }
 
 /// A 32×32 icon button with a line icon; tinted when active.
@@ -1414,10 +1436,13 @@ pub(crate) fn icon_button(ui: &mut egui::Ui, p: &Palette, kind: IconKind, active
         IconKind::Close => tr("Clear (Esc)"),
         IconKind::Back => tr("Back (Esc)"),
         IconKind::Preview => tr("Preview"),
+        IconKind::Help => tr("Search commands (F1)"),
     };
     let enabled = ui.is_enabled();
     match kind {
-        IconKind::Preview => resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::CheckBox, enabled, active, name)),
+        IconKind::Preview | IconKind::Help => {
+            resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::CheckBox, enabled, active, name))
+        }
         _ => resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, enabled, name)),
     }
     let painter = ui.painter();
@@ -1438,6 +1463,7 @@ pub(crate) fn icon_button(ui: &mut egui::Ui, p: &Palette, kind: IconKind, active
         IconKind::Close => Icon::Close,
         IconKind::Back => Icon::Back,
         IconKind::Preview => Icon::Panel,
+        IconKind::Help => Icon::Help,
     };
     let size = if matches!(kind, IconKind::Close) { 16.0 } else { 19.0 };
     icons::paint(painter, Rect::from_center_size(rect.center(), Vec2::splat(size)), icon, col);
@@ -1570,6 +1596,110 @@ impl WheretiApp {
         ctx.send_viewport_cmd(ViewportCommand::Icon(Some(Arc::new(icon))));
         if celebrate && animations_on() {
             self.confetti = Some(Instant::now());
+        }
+    }
+
+    /// The "?" panel under the search field: what can be typed, in three
+    /// groups, each with an example that is typed and searched on a click.
+    fn help_panel(&mut self, ctx: &egui::Context, p: &Palette) {
+        if !self.help_open || self.search_rect == Rect::NOTHING {
+            return;
+        }
+        // examples with words are in the user's language; commands are not
+        let groups: [(&str, Vec<(String, &str)>); 3] = [
+            (
+                tr("Words"),
+                vec![
+                    (tr("report 2025").to_string(), tr("Every word, anywhere in the name")),
+                    (tr("\"annual report\"").to_string(), tr("These words together, exactly as typed")),
+                    (format!("{} | {}", tr("invoice"), tr("receipt")), tr("One or the other")),
+                    (tr("report !draft").to_string(), tr("Leave out names with this word")),
+                    ("img_????.jpg".to_string(), tr("* stands for any letters, ? for one letter")),
+                ],
+            ),
+            (
+                tr("Filters"),
+                vec![
+                    ("ext:pdf;docx".to_string(), tr("Only these file types")),
+                    ("dm:today".to_string(), tr("Changed on a day: also yesterday, thisweek, lastmonth, 2025, 2025-03")),
+                    ("size:>10mb".to_string(), tr("By size: also large, huge, 1mb..5mb")),
+                    (tr("folder:projects").to_string(), tr("Only folders (file: only files)")),
+                    (r"path:C:\Users".to_string(), tr("Only inside a folder")),
+                    ("mine:".to_string(), tr("Only your own files, without programs and system files")),
+                ],
+            ),
+            (
+                tr("Inside files and photos"),
+                vec![
+                    (tr("content:rent").to_string(), tr("Files that have the words inside")),
+                    (tr("loc:italy").to_string(), tr("Photos taken in a town, region or country")),
+                    (r"regex:^IMG_\d{4}".to_string(), tr("A regular expression, for experts")),
+                ],
+            ),
+        ];
+        let width = self.search_rect.width().min(660.0);
+        let top = self.search_rect.left_bottom() + Vec2::new(0.0, 8.0);
+        // always under the field: a small window scrolls instead of the
+        // panel being pushed up over the field
+        let max_height = (ctx.content_rect().bottom() - top.y - 16.0).max(160.0);
+        let mut chosen: Option<String> = None;
+        let area = egui::Area::new(egui::Id::unique("search-help"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(top)
+            .constrain(false)
+            .show(ctx, |ui| {
+                Frame::NONE
+                    .fill(p.surface)
+                    .stroke(Stroke::new(1.0, p.border))
+                    .corner_radius(CornerRadius::same(12))
+                    .shadow(egui::epaint::Shadow { offset: [0, 6], blur: 24, spread: 0, color: theme::with_alpha(Color32::BLACK, 0.16) })
+                    .inner_margin(Margin::same(16))
+                    .show(ui, |ui| {
+                        ui.set_width(width - 32.0);
+                        ui.label(egui::RichText::new(tr("Search commands")).size(15.0).family(semibold()).color(p.text));
+                        ui.label(egui::RichText::new(tr("Click an example to try it.")).size(12.5).color(p.text2));
+                        egui::ScrollArea::vertical().max_height(max_height - 80.0).auto_shrink([false, true]).show(ui, |ui| {
+                        for (title, rows) in &groups {
+                            ui.add_space(10.0);
+                            ui.label(egui::RichText::new(title.to_uppercase()).size(11.5).family(semibold()).color(p.text3));
+                            ui.add_space(2.0);
+                            egui::Grid::new(("help-group", *title)).num_columns(2).spacing([14.0, 4.0]).show(ui, |ui| {
+                                for (example, what) in rows {
+                                    let font = FontId::monospace(12.5);
+                                    let galley = ui.painter().layout_no_wrap(example.clone(), font, p.accent);
+                                    let size = galley.size() + Vec2::new(16.0, 6.0);
+                                    let (rect, resp) = ui.allocate_exact_size(Vec2::new(size.x.max(150.0), size.y), Sense::click());
+                                    let name = example.clone();
+                                    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, &name));
+                                    let fill = if resp.hovered() { theme::with_alpha(p.accent, 0.16) } else { p.accent_soft };
+                                    ui.painter().rect_filled(rect, 6.0, fill);
+                                    ui.painter().galley(rect.left_top() + Vec2::new(8.0, 3.0), galley, p.accent);
+                                    if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                                        chosen = Some(example.clone());
+                                    }
+                                    ui.label(egui::RichText::new(*what).size(13.0).color(p.text2));
+                                    ui.end_row();
+                                }
+                            });
+                        }
+                        });
+                    });
+            });
+        if let Some(q) = chosen {
+            self.query = q;
+            self.page = Page::Search;
+            self.help_open = false;
+            self.focus_search = true;
+            self.run_search();
+            return;
+        }
+        // a click anywhere else closes it (the search field and its "?" excepted)
+        let clicked_outside = ctx.input(|i| {
+            i.pointer.any_pressed()
+                && i.pointer.interact_pos().is_some_and(|pos| !area.response.rect.contains(pos) && !self.search_rect.contains(pos))
+        });
+        if clicked_outside {
+            self.help_open = false;
         }
     }
 
