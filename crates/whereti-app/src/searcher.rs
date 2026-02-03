@@ -50,6 +50,7 @@ enum Msg {
     Status,
     Config,
     SetExclusions(Vec<String>),
+    SetPhotoTags(bool),
 }
 
 pub struct Searcher {
@@ -89,6 +90,12 @@ impl Searcher {
         let _ = self.tx.send(Msg::SetExclusions(paths));
     }
 
+    /// Objects and animals in photos on or off (the service downloads the
+    /// model the first time).
+    pub fn set_photo_tags(&self, on: bool) {
+        let _ = self.tx.send(Msg::SetPhotoTags(on));
+    }
+
 
     pub fn updates(&self) -> impl Iterator<Item = Update> + '_ {
         std::iter::from_fn(|| self.rx.try_recv().ok())
@@ -102,6 +109,7 @@ struct Pending {
     status: bool,
     config: bool,
     exclusions: Option<Vec<String>>,
+    photo_tags: Option<bool>,
 }
 
 fn worker(jobs: Receiver<Msg>, out: Sender<Update>, wake: impl Fn()) {
@@ -118,6 +126,10 @@ fn worker(jobs: Receiver<Msg>, out: Sender<Update>, wake: impl Fn()) {
             Msg::SetExclusions(e) => {
                 p.exclusions = Some(e);
                 p.config = true;
+            }
+            Msg::SetPhotoTags(on) => {
+                p.photo_tags = Some(on);
+                p.status = true;
             }
         };
         take(first);
@@ -145,6 +157,11 @@ fn worker(jobs: Receiver<Msg>, out: Sender<Update>, wake: impl Fn()) {
         }
         let c = client.as_mut().expect("connected");
         let result = (|| -> std::io::Result<()> {
+            if let Some(on) = p.photo_tags {
+                if let Response::Error(e) = c.call(&Request::SetPhotoTags { on })? {
+                    let _ = out.send(Update::Done(e));
+                }
+            }
             if let Some(paths) = p.exclusions {
                 let msg = match c.call(&Request::SetExclusions { paths })? {
                     Response::Ok => crate::i18n::tr("Exclusions saved. The index is being rebuilt.").to_string(),

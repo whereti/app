@@ -1,0 +1,10 @@
+[package]
+name = "whereti-net"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "whereti's few HTTPS requests (updates, the photo model) through WinHTTP, and SHA-256"
+
+[dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Networking_WinHttp", "Win32_Security_Cryptography"] }

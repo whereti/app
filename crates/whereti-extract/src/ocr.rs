@@ -143,7 +143,7 @@ pub(crate) fn looks_scanned(text: &str, pages: usize) -> bool {
     chars < SCAN_CHARS_PER_PAGE * pages.max(1)
 }
 
-fn memory_stream(bytes: &[u8]) -> windows::core::Result<IRandomAccessStream> {
+pub(crate) fn memory_stream(bytes: &[u8]) -> windows::core::Result<IRandomAccessStream> {
     let stream = InMemoryRandomAccessStream::new()?;
     let writer = DataWriter::CreateDataWriter(&stream)?;
     writer.WriteBytes(bytes)?;

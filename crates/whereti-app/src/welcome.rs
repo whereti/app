@@ -102,6 +102,42 @@ pub fn show(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
                     });
                 ui.add_space(12.0);
 
+                // ---- objects and animals in photos: asked once
+                let tags = crate::settings::photo_tags_state(app);
+                if !app.settings.photo_tags_asked && tags == "off" {
+                    Frame::NONE
+                        .fill(p.surface)
+                        .stroke(Stroke::new(1.0, p.border))
+                        .corner_radius(CornerRadius::same(14))
+                        .inner_margin(Margin::symmetric(20, 16))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.label(egui::RichText::new(tr("Recognize what is in your photos?")).size(15.0).family(semibold()).color(p.text));
+                            ui.add_space(4.0);
+                            ui.add(egui::Label::new(egui::RichText::new(crate::settings::photo_tags_text()).size(12.5).color(p.text2)).wrap());
+                            ui.add_space(10.0);
+                            ui.horizontal(|ui| {
+                                let mut answered = false;
+                                if primary_button(ui, p, tr("Yes, recognize them")).clicked() {
+                                    app.searcher.set_photo_tags(true);
+                                    answered = true;
+                                }
+                                ui.add_space(8.0);
+                                if crate::settings::button(ui, p, tr("Not now"), false).clicked() {
+                                    answered = true;
+                                }
+                                if answered {
+                                    app.settings.photo_tags_asked = true;
+                                    app.settings.save();
+                                }
+                            });
+                        });
+                    ui.add_space(12.0);
+                } else if let Some(line) = crate::settings::photo_tags_line(&tags) {
+                    ui.label(egui::RichText::new(line).size(12.5).color(p.text2));
+                    ui.add_space(12.0);
+                }
+
                 // ---- tips
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 10.0;

@@ -9,6 +9,7 @@
 
 mod email;
 mod ocr;
+pub mod tags;
 mod ole;
 mod rtf;
 #[cfg(test)]

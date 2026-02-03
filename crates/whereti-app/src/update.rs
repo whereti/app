@@ -254,6 +254,11 @@ impl Updater {
     }
 }
 
+/// "whereti/0.0.14": the only thing a request says about the PC.
+fn agent() -> String {
+    format!("whereti/{VERSION}")
+}
+
 fn arch() -> &'static str {
     if cfg!(target_arch = "aarch64") {
         "aarch64"
@@ -287,7 +292,7 @@ pub fn newer(a: &str, b: &str) -> bool {
 /// The one request: `None` when whereti is current.
 fn check() -> Result<Option<Offer>, String> {
     let url = format!("{ENDPOINT}/windows/{}/{VERSION}", arch());
-    let (status, body) = http_get(&url, 64 * 1024, &mut |_, _| {})?;
+    let (status, body) = whereti_net::http_get(&url, &agent(), 64 * 1024, &mut |_, _| {})?;
     match status {
         204 => Ok(None),
         200 => parse_offer(&body),
@@ -312,11 +317,11 @@ fn parse_offer(body: &[u8]) -> Result<Option<Offer>, String> {
 
 fn download_and_run(offer: &Offer, progress: &mut dyn FnMut(u64, u64)) -> Result<(), String> {
     use crate::i18n::tr;
-    let (status, bytes) = http_get(&offer.url, MAX_INSTALLER, progress)?;
+    let (status, bytes) = whereti_net::http_get(&offer.url, &agent(), MAX_INSTALLER, progress)?;
     if status != 200 {
         return Err(crate::trf!("The download failed (error {status}).", status));
     }
-    if sha256_hex(&bytes)? != offer.sha256 {
+    if whereti_net::sha256_hex(&bytes)? != offer.sha256 {
         return Err(tr("The download is damaged. Try again later.").into());
     }
     let dir = std::env::temp_dir().join("whereti-update");
@@ -375,18 +380,6 @@ impl EncodeWide for std::ffi::OsStr {
     }
 }
 
-fn sha256_hex(data: &[u8]) -> Result<String, String> {
-    use windows_sys::Win32::Security::Cryptography::{BCryptHash, BCRYPT_SHA256_ALG_HANDLE};
-    let mut out = [0u8; 32];
-    // SAFETY: buffers and lengths match; the pseudo-handle needs no opening.
-    let status = unsafe {
-        BCryptHash(BCRYPT_SHA256_ALG_HANDLE, std::ptr::null(), 0, data.as_ptr(), data.len() as u32, out.as_mut_ptr(), 32)
-    };
-    if status != 0 {
-        return Err(format!("hashing failed ({status:#x})"));
-    }
-    Ok(out.iter().map(|b| format!("{b:02x}")).collect())
-}
 
 /// A valid Authenticode signature whose signer is Software Hive S.R.L.
 /// Revocation lists are not fetched, so this sends nothing anywhere.
@@ -437,94 +430,6 @@ fn verify_publisher(file: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// HTTPS GET through WinHTTP (Windows' own TLS, proxy settings honoured,
-/// cookies off). Follows redirects; never more than `max` bytes.
-fn http_get(url: &str, max: u64, progress: &mut dyn FnMut(u64, u64)) -> Result<(u16, Vec<u8>), String> {
-    use windows_sys::Win32::Networking::WinHttp::*;
-    let Some(rest) = url.strip_prefix("https://") else { return Err("only https".into()) };
-    let (host, path) = rest.split_once('/').map_or((rest, "/".to_string()), |(h, p)| (h, format!("/{p}")));
-    let w = |s: &str| -> Vec<u16> { s.encode_utf16().chain([0]).collect() };
-    let (agent, host_w, path_w, get) = (w(&format!("whereti/{VERSION}")), w(host), w(&path), w("GET"));
-    struct H(*mut core::ffi::c_void);
-    impl Drop for H {
-        fn drop(&mut self) {
-            if !self.0.is_null() {
-                // SAFETY: a handle WinHTTP gave us, closed once.
-                unsafe { WinHttpCloseHandle(self.0) };
-            }
-        }
-    }
-    let err = |what: &str| format!("{what} failed ({})", std::io::Error::last_os_error());
-    // SAFETY: NUL-terminated strings that outlive the handles; every handle
-    // is closed by H; buffers match their lengths.
-    unsafe {
-        let session = H(WinHttpOpen(agent.as_ptr(), WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, std::ptr::null(), std::ptr::null(), 0));
-        if session.0.is_null() {
-            return Err(err("connecting"));
-        }
-        WinHttpSetTimeouts(session.0, 15_000, 15_000, 30_000, 60_000);
-        let connect = H(WinHttpConnect(session.0, host_w.as_ptr(), 443, 0));
-        if connect.0.is_null() {
-            return Err(err("connecting"));
-        }
-        let request = H(WinHttpOpenRequest(
-            connect.0,
-            get.as_ptr(),
-            path_w.as_ptr(),
-            std::ptr::null(),
-            std::ptr::null(),
-            std::ptr::null(),
-            WINHTTP_FLAG_SECURE,
-        ));
-        if request.0.is_null() {
-            return Err(err("the request"));
-        }
-        let no_cookies: u32 = WINHTTP_DISABLE_COOKIES;
-        WinHttpSetOption(request.0, WINHTTP_OPTION_DISABLE_FEATURE, &no_cookies as *const u32 as *const _, 4);
-        if WinHttpSendRequest(request.0, std::ptr::null(), 0, std::ptr::null(), 0, 0, 0) == 0
-            || WinHttpReceiveResponse(request.0, std::ptr::null_mut()) == 0
-        {
-            return Err(err("the request"));
-        }
-        let mut status = 0u32;
-        let mut len = 4u32;
-        WinHttpQueryHeaders(
-            request.0,
-            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-            std::ptr::null(),
-            &mut status as *mut u32 as *mut _,
-            &mut len,
-            std::ptr::null_mut(),
-        );
-        let mut total = 0u64;
-        let mut tlen = 8u32;
-        WinHttpQueryHeaders(
-            request.0,
-            WINHTTP_QUERY_CONTENT_LENGTH | WINHTTP_QUERY_FLAG_NUMBER64,
-            std::ptr::null(),
-            &mut total as *mut u64 as *mut _,
-            &mut tlen,
-            std::ptr::null_mut(),
-        );
-        let mut body = Vec::new();
-        let mut buf = vec![0u8; 64 * 1024];
-        loop {
-            let mut read = 0u32;
-            if WinHttpReadData(request.0, buf.as_mut_ptr() as *mut _, buf.len() as u32, &mut read) == 0 {
-                return Err(err("downloading"));
-            }
-            if read == 0 {
-                break;
-            }
-            body.extend_from_slice(&buf[..read as usize]);
-            if body.len() as u64 > max {
-                return Err("the answer is too large".into());
-            }
-            progress(body.len() as u64, total);
-        }
-        Ok((status as u16, body))
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -586,7 +491,7 @@ mod tests {
 
     #[test]
     fn hashes_like_sha256() {
-        assert_eq!(sha256_hex(b"abc").unwrap(), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+        assert_eq!(whereti_net::sha256_hex(b"abc").unwrap(), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
     }
 
     #[test]

@@ -13,6 +13,7 @@ whereti-core = { version = "0.0.14", path = "../whereti-core" }
 whereti-extract = { version = "0.0.14", path = "../whereti-extract" }
 whereti-ipc = { version = "0.0.14", path = "../whereti-ipc" }
 whereti-ntfs = { version = "0.0.14", path = "../whereti-ntfs" }
+whereti-net = { version = "0.0.14", path = "../whereti-net" }
 whereti-places = { version = "0.0.14", path = "../whereti-places" }
 whereti-query = { version = "0.0.14", path = "../whereti-query" }
 xxhash-rust = { version = "0.8.19", features = ["xxh3"] }

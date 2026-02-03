@@ -16,11 +16,13 @@ use windows::Win32::System::Registry::{
 };
 
 /// The programs the installer carries, packed at build time (see build.rs).
-pub const PAYLOAD: [(&str, &[u8]); 4] = [
+pub const PAYLOAD: [(&str, &[u8]); 5] = [
     ("whereti.exe", include_bytes!(concat!(env!("WHERETI_PAYLOAD_DIR"), "/whereti.exe"))),
     ("whereti-service.exe", include_bytes!(concat!(env!("WHERETI_PAYLOAD_DIR"), "/whereti-service.exe"))),
     ("whereti-extract.exe", include_bytes!(concat!(env!("WHERETI_PAYLOAD_DIR"), "/whereti-extract.exe"))),
     ("wt.exe", include_bytes!(concat!(env!("WHERETI_PAYLOAD_DIR"), "/wt.exe"))),
+    // ONNX Runtime, Microsoft's signed build: what is in photos (PLAN.md §55)
+    ("onnxruntime.dll", include_bytes!(concat!(env!("WHERETI_PAYLOAD_DIR"), "/onnxruntime.dll"))),
 ];
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

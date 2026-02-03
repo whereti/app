@@ -1,11 +1,12 @@
-//! The installer carries the four programs it installs. They are packed at
+//! The installer carries the four programs it installs and ONNX Runtime
+//! (for recognising what is in photos; Microsoft's signed DLL). They are packed at
 //! build time from `WHERETI_PAYLOAD` (set by scripts/package.ps1, which signs
 //! them first for a production release) or, for a local build, from
 //! target/release.
 
 use std::path::PathBuf;
 
-const FILES: [&str; 4] = ["whereti.exe", "whereti-service.exe", "whereti-extract.exe", "wt.exe"];
+const FILES: [&str; 5] = ["whereti.exe", "whereti-service.exe", "whereti-extract.exe", "wt.exe", "onnxruntime.dll"];
 
 fn main() {
     println!("cargo:rerun-if-env-changed=WHERETI_PAYLOAD");

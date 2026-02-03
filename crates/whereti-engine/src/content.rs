@@ -36,7 +36,7 @@ use parking_lot::{Condvar, Mutex, RwLock};
 use whereti_content::{key, split_key, ContentIndex, Indexed, Status};
 use whereti_core::index::{FLAG_CLOUD, FLAG_HIDDEN, FLAG_NOISE, FLAG_SYSTEM};
 use whereti_core::NameIndex;
-use whereti_extract::worker::{read_shared, Sandbox, SandboxError};
+use whereti_extract::worker::{read_shared, Sandbox, SandboxError, TagWorker};
 use whereti_extract::{ExtractError, Kind};
 use whereti_ipc::{Caller, ContentReply, ContentStatus, Row, ScanReply};
 use whereti_query::{fold, Clause, Query, Term};
@@ -94,8 +94,32 @@ pub struct Content {
     /// The users' Pictures folders, as of the last round (photos there are
     /// read for where they were taken).
     pictures: RwLock<Vec<String>>,
+    /// Objects and animals in photos: wanted by the user (photo-tags.txt).
+    tags_on: AtomicBool,
+    /// "off", "on", "downloading:<bytes>/<total>", "error: …".
+    tags_state: Mutex<String>,
     /// Where the content index lives (for the one-time OCR pass marker).
     dir: PathBuf,
+}
+
+/// The photo model (PLAN.md §55): CLIP ViT-B/32's image half, int8, from
+/// Hugging Face at a fixed revision; downloaded only once the user turns
+/// recognition on, and used only if its size and SHA-256 match.
+const MODEL_FILE: &str = "clip-vit-b32-vision-int8.onnx";
+const MODEL_URL: &str = "https://huggingface.co/Xenova/clip-vit-base-patch32/resolve/d15189d7028b43f1d3e65039190477f6af591c2a/onnx/vision_model_quantized.onnx";
+const MODEL_SHA256: &str = "583fd1110a514667812fee7d684952aaf82a99b959760c8d7dca7e0ab9839299";
+const MODEL_SIZE: u64 = 89_117_001;
+/// Photos larger than this are not read for what is in them.
+const MAX_TAGGED: u64 = 64 << 20;
+
+/// Where the model lives: only the service (SYSTEM) can write there, so no
+/// other program can swap it.
+fn model_path() -> PathBuf {
+    system::data_dir().join("models").join(MODEL_FILE)
+}
+
+fn model_ready() -> bool {
+    std::fs::metadata(model_path()).is_ok_and(|m| m.len() == MODEL_SIZE)
 }
 
 impl Content {
@@ -120,6 +144,8 @@ impl Content {
             exts: whereti_extract::extensions().into_iter().collect(),
             hint: Mutex::new(None),
             hashes: Mutex::new(HashMap::new()),
+            tags_on: AtomicBool::new(std::fs::read_to_string(dir.join("photo-tags.txt")).is_ok_and(|s| s.trim() == "on")),
+            tags_state: Mutex::new("off".into()),
             pictures: RwLock::new(picture_folders()),
             dir: dir.to_path_buf(),
         })
@@ -198,7 +224,79 @@ impl Content {
     }
 
     pub fn status(&self) -> ContentStatus {
-        self.status.lock().clone()
+        let mut s = self.status.lock().clone();
+        s.tags = self.tags_state.lock().clone();
+        s
+    }
+
+    /// Turns recognising objects and animals in photos on or off. On, the
+    /// model is downloaded the first time (in the background); the photos
+    /// are then read again, with their tags, and off, without.
+    pub fn set_photo_tags(self: &Arc<Self>, on: bool) -> Result<(), String> {
+        std::fs::write(self.dir.join("photo-tags.txt"), if on { "on\n" } else { "off\n" })
+            .map_err(|e| format!("cannot save the setting: {e}"))?;
+        self.tags_on.store(on, Ordering::SeqCst);
+        if on {
+            self.ensure_model();
+        } else {
+            *self.tags_state.lock() = "off".into();
+        }
+        self.dirty.store(true, Ordering::Relaxed);
+        self.poke();
+        Ok(())
+    }
+
+    /// Recognition is wanted and the model is there.
+    fn tags_ready(&self) -> bool {
+        self.tags_on.load(Ordering::SeqCst) && model_ready()
+    }
+
+    /// Downloads the model if it is missing (once, in the background).
+    fn ensure_model(self: &Arc<Self>) {
+        if model_ready() {
+            *self.tags_state.lock() = "on".into();
+            return;
+        }
+        {
+            let mut st = self.tags_state.lock();
+            if st.starts_with("downloading") {
+                return;
+            }
+            *st = format!("downloading:0/{MODEL_SIZE}");
+        }
+        let me = self.clone();
+        let _ = std::thread::Builder::new().name("photo-model".into()).spawn(move || {
+            let _bg = Background::begin();
+            let result = (|| -> Result<(), String> {
+                let agent = format!("whereti/{}", env!("CARGO_PKG_VERSION"));
+                let mut last = 0u64;
+                let (status, bytes) = whereti_net::http_get(MODEL_URL, &agent, MODEL_SIZE + 1, &mut |done, _| {
+                    if done - last >= 1 << 20 || done == MODEL_SIZE {
+                        last = done;
+                        *me.tags_state.lock() = format!("downloading:{done}/{MODEL_SIZE}");
+                    }
+                })?;
+                if status != 200 {
+                    return Err(format!("the server answered {status}"));
+                }
+                if bytes.len() as u64 != MODEL_SIZE || whereti_net::sha256_hex(&bytes)? != MODEL_SHA256 {
+                    return Err("the model did not arrive whole".into());
+                }
+                let path = model_path();
+                let dir = path.parent().expect("models dir");
+                std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+                let part = path.with_extension("part");
+                std::fs::write(&part, &bytes).map_err(|e| e.to_string())?;
+                std::fs::rename(&part, &path).map_err(|e| e.to_string())?;
+                Ok(())
+            })();
+            *me.tags_state.lock() = match result {
+                Ok(()) => "on".into(),
+                Err(e) => format!("error: {e}"),
+            };
+            me.dirty.store(true, Ordering::Relaxed);
+            me.poke();
+        });
     }
 
     pub fn folders(&self) -> Vec<String> {
@@ -259,6 +357,9 @@ impl Content {
         }
         // Once, when places arrive: photos indexed before are read again,
         // now with where they were taken.
+        if self.tags_on.load(Ordering::SeqCst) {
+            self.ensure_model();
+        }
         let places_marker = self.dir.join("places-2"); // 2: again, with the tolerant EXIF reader (0.0.12)
         let places_pass = !places_marker.exists();
         if places_pass {
@@ -332,6 +433,21 @@ impl Content {
             let Some(idx) = guard.as_ref() else { return Ok(()) };
             files_in(idx, &folders, &pictures)
         };
+        // recognition turned on (model ready) or off: the photos again
+        let tags_now = if self.tags_ready() { "on" } else { "off" };
+        let tags_marker = self.dir.join("tags-indexed");
+        let tags_before = std::fs::read_to_string(&tags_marker).map(|s| s.trim().to_string()).unwrap_or_else(|_| "off".into());
+        if tags_before != tags_now {
+            let photos: HashSet<u64> = {
+                let guard = shared.index.read();
+                guard.as_ref().map(photo_keys).unwrap_or_default()
+            };
+            let before = known.len();
+            known.retain(|k, _| !photos.contains(k));
+            shared.log.log(format!("content: {} photos are read again ({tags_now} recognition)", before - known.len()));
+            let _ = std::fs::write(&tags_marker, format!("{tags_now}\n"));
+        }
+        let mut tagger = if tags_now == "on" { TagWorker::beside_current_exe(&model_path()) } else { None };
         let removed: Vec<u64> = known.keys().filter(|k| !wanted.contains_key(k)).copied().collect();
         for k in &removed {
             index.remove(*k);
@@ -410,7 +526,7 @@ impl Content {
                 }
             }
             let started = Instant::now();
-            if let Some((what, text)) = extract(&c, sandbox) {
+            if let Some((what, text)) = extract(&c, sandbox, tagger.as_mut()) {
                 index.put(c.key, what, &text).map_err(|e| e.to_string())?;
                 known.insert(c.key, what);
                 since_commit += 1;
@@ -666,7 +782,7 @@ impl Content {
             for (c, ok) in chunk.iter().zip(allowed) {
                 i += 1;
                 if ok {
-                    if let Some((_, text)) = extract(c, sandbox.as_ref()) {
+                    if let Some((_, text)) = extract(c, sandbox.as_ref(), None) {
                         let folded = fold(&text);
                         if plan.needles.iter().all(|w| folded.contains(w.as_str())) {
                             rows.push(Row { path: c.path.clone(), is_dir: false, size: c.size, modified: c.modified, flags: 0 });
@@ -874,18 +990,36 @@ fn is_picture(path: &str) -> bool {
 
 /// Reads one file. `None` when it could not be opened right now (gone,
 /// locked, no access): it is tried again in a later round.
-fn extract(c: &Candidate, sandbox: Option<&Sandbox>) -> Option<(Indexed, String)> {
+/// What is in a photo, as words for the index ("dog Hund perro chien
+/// cane pies cachorro câine"); `None` without tags.
+fn photo_tags(path: &Path, tagger: &mut TagWorker) -> Option<String> {
+    let bytes = read_shared(path, MAX_TAGGED).ok()?;
+    let tags = tagger.tags(&bytes).ok()?;
+    (!tags.is_empty()).then(|| whereti_extract::tags::index_text(&tags))
+}
+
+/// Reads one file. `tagger`: recognise what is in photos (when on).
+fn extract(c: &Candidate, sandbox: Option<&Sandbox>, tagger: Option<&mut TagWorker>) -> Option<(Indexed, String)> {
     let what = |status| Indexed { size: c.size, modified: c.modified, status };
     let path = Path::new(&c.path);
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
     let kind = whereti_extract::kind_of(&ext)?;
+    // a photo: where it was taken and what is in it
+    let place = if kind == Kind::Image {
+        let tags = tagger.and_then(|t| photo_tags(path, t));
+        match (place_text(path, &ext), tags) {
+            (Some(p), Some(t)) => Some(format!("{p}\n{t}")),
+            (p, t) => p.or(t),
+        }
+    } else {
+        None
+    };
     if c.photo_only {
-        return Some(match place_text(path, &ext) {
+        return Some(match place {
             Some(text) => (what(Status::Ok), text),
             None => (what(Status::Empty), String::new()),
         });
     }
-    let place = if kind == Kind::Image { place_text(path, &ext) } else { None };
     let result = if kind == Kind::Text {
         // Plain text needs no parser: read the head in-process.
         read_head(path, TEXT_HEAD).and_then(|b| whereti_extract::extract(&ext, &b, MAX_CHARS).map_err(SandboxError::Extract))

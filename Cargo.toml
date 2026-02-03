@@ -12,6 +12,7 @@ default-members = [
     "crates/whereti-extract",
     "crates/whereti-i18n",
     "crates/whereti-ipc",
+    "crates/whereti-net",
     "crates/whereti-ntfs",
     "crates/whereti-places",
     "crates/whereti-query",

@@ -39,6 +39,9 @@ pub struct SettingsState {
     pub updates: bool,
     /// Rank the files the user opens often or lately higher (usage.rs).
     pub learn: bool,
+    /// The welcome page asked about recognising objects and animals in
+    /// photos (asked once; the switch stays in Settings > Search).
+    pub photo_tags_asked: bool,
     /// The chosen language; `None` = the Windows display language.
     pub lang: Option<Lang>,
     config: Option<ConfigReply>,
@@ -70,6 +73,7 @@ impl SettingsState {
             lang: None,
             updates: true,
             learn: true,
+            photo_tags_asked: false,
             config: None,
             exclusions: Vec::new(),
             section: Section::General,
@@ -91,6 +95,7 @@ impl SettingsState {
                     Some(("welcomed", "yes")) => s.welcomed = true,
                     Some(("updates", "off")) => s.updates = false,
                     Some(("learn", "off")) => s.learn = false,
+                    Some(("photo_tags_asked", "yes")) => s.photo_tags_asked = true,
                     _ => {}
                 }
             }
@@ -124,6 +129,9 @@ impl SettingsState {
         }
         if !self.learn {
             text.push_str("learn=off\n");
+        }
+        if self.photo_tags_asked {
+            text.push_str("photo_tags_asked=yes\n");
         }
         let path = settings_file();
         if let Some(dir) = path.parent() {
@@ -383,6 +391,26 @@ fn search(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
                 }
             },
         );
+    });
+    ui.add_space(14.0);
+
+    // ---- objects and animals in photos
+    let tags = photo_tags_state(app);
+    card(ui, p, |ui| {
+        row(ui, p, tr("Recognize objects and animals in photos"), photo_tags_text(), |ui| {
+            let mut on = tags != "off";
+            if toggle(ui, p, &mut on, tr("Recognize objects and animals in photos")).clicked() {
+                app.searcher.set_photo_tags(on);
+                if !app.settings.photo_tags_asked {
+                    app.settings.photo_tags_asked = true;
+                    app.settings.save();
+                }
+            }
+        });
+        if let Some(line) = photo_tags_line(&tags) {
+            ui.label(egui::RichText::new(line).size(12.5).color(if tags.starts_with("error") { p.error } else { p.text2 }));
+            ui.add_space(12.0);
+        }
     });
     ui.add_space(14.0);
 
@@ -901,6 +929,31 @@ fn card(ui: &mut egui::Ui, p: &Palette, body: impl FnOnce(&mut egui::Ui)) {
         });
 }
 
+/// Recognition of objects and animals in photos, as the service reports it:
+/// "off", "on", "downloading:<bytes>/<total>" or "error: …".
+pub(crate) fn photo_tags_state(app: &WheretiApp) -> String {
+    app.status.as_ref().map(|s| s.content.tags.clone()).filter(|t| !t.is_empty()).unwrap_or_else(|| "off".into())
+}
+
+/// What recognising photos does and costs, said the same way everywhere.
+pub(crate) fn photo_tags_text() -> &'static str {
+    tr("whereti can also find photos by what they show: a dog, the beach, a car. It downloads a model once (84 MB, from Hugging Face); your photos are read on your PC and never leave it.")
+}
+
+/// A line under the switch: the download, a failure, or that it works.
+pub(crate) fn photo_tags_line(state: &str) -> Option<String> {
+    if let Some(rest) = state.strip_prefix("downloading:") {
+        let (done, total) = rest.split_once('/')?;
+        let (done, total) = (done.parse::<u64>().ok()?, total.parse::<u64>().ok()?.max(1));
+        let percent = done * 100 / total;
+        return Some(crate::trf!("Downloading the model: {percent}%", percent));
+    }
+    if let Some(e) = state.strip_prefix("error:") {
+        return Some(crate::trf!("Could not download the model: {e}", e = e.trim()));
+    }
+    (state == "on").then(|| tr("On. Photos are read in the background, like documents.").to_string())
+}
+
 /// Title and description on the left, the control on the right.
 fn row(ui: &mut egui::Ui, p: &Palette, title: &str, desc: &str, control: impl FnOnce(&mut egui::Ui)) {
     ui.add_space(12.0);
@@ -1018,7 +1071,7 @@ fn path_list(ui: &mut egui::Ui, p: &Palette, paths: &[String], icons: &mut crate
 }
 
 /// A pill button; `primary` = solid accent.
-fn button(ui: &mut egui::Ui, p: &Palette, text: &str, primary: bool) -> egui::Response {
+pub(crate) fn button(ui: &mut egui::Ui, p: &Palette, text: &str, primary: bool) -> egui::Response {
     let color = if primary { p.on_accent } else { p.text };
     let galley = ui.painter().layout_no_wrap(text.to_string(), FontId::new(13.5, semibold()), color);
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(galley.size().x + 30.0, 34.0), Sense::click());

@@ -58,12 +58,43 @@ if ($Release) {
 Write-Host "`n== Programs ==" -ForegroundColor Cyan
 Invoke-Native "building the programs" { cargo build --release --locked -p whereti-app -p whereti-service -p whereti-extract -p whereti-cli }
 
+# ONNX Runtime for recognising what is in photos (PLAN.md §55): Microsoft's
+# own build, from its GitHub release, used only if the DLL's SHA-256 and its
+# Microsoft signature match. Fetched once, kept in target\onnxruntime.
+$ortVersion = "1.31.0"
+$ortSha256 = "0C42DC4E278F0968FDF9EBF1B1E54A74C657A9942E70803E453C91993451CF4C"
+$ortDir = Join-Path $repoRoot "target\onnxruntime-$ortVersion"
+$ortDll = Join-Path $ortDir "onnxruntime.dll"
+if (-not (Test-Path $ortDll)) {
+    Write-Host "`n== ONNX Runtime $ortVersion ==" -ForegroundColor Cyan
+    New-Item -ItemType Directory -Force $ortDir | Out-Null
+    $zip = Join-Path $ortDir "onnxruntime.zip"
+    Invoke-WebRequest -UseBasicParsing -Uri "https://github.com/microsoft/onnxruntime/releases/download/v$ortVersion/onnxruntime-win-x64-$ortVersion.zip" -OutFile $zip
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $archive = [System.IO.Compression.ZipFile]::OpenRead($zip)
+    try {
+        $entry = $archive.Entries | Where-Object { $_.FullName -like "*/lib/onnxruntime.dll" } | Select-Object -First 1
+        if (-not $entry) { throw "onnxruntime.dll is not in the ONNX Runtime archive" }
+        [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $ortDll, $true)
+    } finally {
+        $archive.Dispose()
+    }
+    Remove-Item $zip
+}
+if ((Get-FileHash $ortDll -Algorithm SHA256).Hash -ne $ortSha256) { Remove-Item $ortDll; throw "onnxruntime.dll does not have the expected SHA-256" }
+$ortSig = Get-AuthenticodeSignature $ortDll
+if ($ortSig.Status -ne "Valid" -or $ortSig.SignerCertificate.Subject -notmatch "^CN=Microsoft Corporation,") { throw "onnxruntime.dll is not signed by Microsoft" }
+# beside the programs for local runs too (whereti-extract loads it from there)
+Copy-Item $ortDll (Join-Path $repoRoot "target\release\onnxruntime.dll") -Force
+
 # emptied rather than deleted: an Explorer window open on dist keeps the folder itself busy
 if (Test-Path $dist) { Get-ChildItem $dist -Force | Remove-Item -Recurse -Force }
 New-Item -ItemType Directory -Force $payload | Out-Null
 foreach ($p in $programs) {
     Copy-Item (Join-Path $repoRoot "target\release\$p") (Join-Path $payload $p)
 }
+# signed by Microsoft already: copied, never re-signed
+Copy-Item $ortDll (Join-Path $payload "onnxruntime.dll")
 
 if ($Release) {
     Write-Host "`n== Signing the programs ==" -ForegroundColor Cyan

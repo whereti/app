@@ -28,7 +28,7 @@ use windows_sys::Win32::System::Pipes::{
 };
 
 pub const PIPE_NAME: &str = r"\\.\pipe\whereti";
-pub const PROTOCOL_VERSION: u32 = 7;
+pub const PROTOCOL_VERSION: u32 = 8;
 const MAX_MESSAGE: usize = 64 << 20;
 
 /// The account that created the pipe (OW), SYSTEM and Administrators: full
@@ -73,6 +73,9 @@ pub enum Request {
     ContentSearch(SearchRequest),
     /// Folders whose documents are indexed by content.
     SetContentFolders { paths: Vec<String> },
+    /// Recognise objects and animals in photos (downloads the model the
+    /// first time it is turned on).
+    SetPhotoTags { on: bool },
     /// What the user is doing, as seen from their session: `busy` = a
     /// full-screen game or video, or a presentation; `away` = screen locked
     /// or screen saver. Background work pauses or speeds up accordingly.
@@ -163,6 +166,9 @@ pub struct ContentStatus {
     /// Could not be read (damaged, protected, too large).
     pub failed: u64,
     pub disk_bytes: u64,
+    /// Objects and animals in photos (PLAN.md §55): "off", "on",
+    /// "downloading:<bytes>/<total>" (the model) or "error: …".
+    pub tags: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

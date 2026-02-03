@@ -1,0 +1,211 @@
+# What whereti recognizes in photos (PLAN.md §55), and its name in the 8 languages.
+# en	de	es	fr	it	pl	pt_BR	ro
+dog	Hund	perro	chien	cane	pies	cachorro	câine
+cat	Katze	gato	chat	gatto	kot	gato	pisică
+horse	Pferd	caballo	cheval	cavallo	koń	cavalo	cal
+cow	Kuh	vaca	vache	mucca	krowa	vaca	vacă
+sheep	Schaf	oveja	mouton	pecora	owca	ovelha	oaie
+goat	Ziege	cabra	chèvre	capra	koza	cabra	capră
+pig	Schwein	cerdo	cochon	maiale	świnia	porco	porc
+chicken	Huhn	gallina	poule	gallina	kura	galinha	găină
+duck	Ente	pato	canard	anatra	kaczka	pato	rață
+swan	Schwan	cisne	cygne	cigno	łabędź	cisne	lebădă
+bird	Vogel	pájaro	oiseau	uccello	ptak	pássaro	pasăre
+parrot	Papagei	loro	perroquet	pappagallo	papuga	papagaio	papagal
+pigeon	Taube	paloma	pigeon	piccione	gołąb	pombo	porumbel
+seagull	Möwe	gaviota	mouette	gabbiano	mewa	gaivota	pescăruș
+owl	Eule	búho	hibou	gufo	sowa	coruja	bufniță
+eagle	Adler	águila	aigle	aquila	orzeł	águia	vultur
+fish	Fisch	pez	poisson	pesce	ryba	peixe	pește
+aquarium	Aquarium	acuario	aquarium	acquario	akwarium	aquário	acvariu
+rabbit	Kaninchen	conejo	lapin	coniglio	królik	coelho	iepure
+hamster	Hamster	hámster	hamster	criceto	chomik	hamster	hamster
+turtle	Schildkröte	tortuga	tortue	tartaruga	żółw	tartaruga	broască țestoasă
+snake	Schlange	serpiente	serpent	serpente	wąż	cobra	șarpe
+lizard	Eidechse	lagarto	lézard	lucertola	jaszczurka	lagarto	șopârlă
+frog	Frosch	rana	grenouille	rana	żaba	sapo	broască
+bear	Bär	oso	ours	orso	niedźwiedź	urso	urs
+lion	Löwe	león	lion	leone	lew	leão	leu
+tiger	Tiger	tigre	tigre	tigre	tygrys	tigre	tigru
+elephant	Elefant	elefante	éléphant	elefante	słoń	elefante	elefant
+giraffe	Giraffe	jirafa	girafe	giraffa	żyrafa	girafa	girafă
+zebra	Zebra	cebra	zèbre	zebra	zebra	zebra	zebră
+monkey	Affe	mono	singe	scimmia	małpa	macaco	maimuță
+deer	Hirsch	ciervo	cerf	cervo	jeleń	cervo	cerb
+fox	Fuchs	zorro	renard	volpe	lis	raposa	vulpe
+wolf	Wolf	lobo	loup	lupo	wilk	lobo	lup
+squirrel	Eichhörnchen	ardilla	écureuil	scoiattolo	wiewiórka	esquilo	veveriță
+butterfly	Schmetterling	mariposa	papillon	farfalla	motyl	borboleta	fluture
+bee	Biene	abeja	abeille	ape	pszczoła	abelha	albină
+spider	Spinne	araña	araignée	ragno	pająk	aranha	păianjen
+insect	Insekt	insecto	insecte	insetto	owad	inseto	insectă
+dolphin	Delfin	delfín	dauphin	delfino	delfin	golfinho	delfin
+camel	Kamel	camello	chameau	cammello	wielbłąd	camelo	cămilă
+penguin	Pinguin	pingüino	manchot	pinguino	pingwin	pinguim	pinguin
+car	Auto	coche	voiture	auto	samochód	carro	mașină
+sports car	Sportwagen	coche deportivo	voiture de sport	auto sportiva	samochód sportowy	carro esportivo	mașină sport
+truck	Lastwagen	camión	camion	camion	ciężarówka	caminhão	camion
+van	Transporter	furgoneta	camionnette	furgone	furgonetka	van	dubă
+bus	Bus	autobús	bus	autobus	autobus	ônibus	autobuz
+motorcycle	Motorrad	moto	moto	moto	motocykl	moto	motocicletă
+bicycle	Fahrrad	bicicleta	vélo	bicicletta	rower	bicicleta	bicicletă
+scooter	Roller	patinete	trottinette	monopattino	hulajnoga	patinete	trotinetă
+train	Zug	tren	train	treno	pociąg	trem	tren
+tram	Straßenbahn	tranvía	tramway	tram	tramwaj	bonde	tramvai
+airplane	Flugzeug	avión	avion	aereo	samolot	avião	avion
+helicopter	Hubschrauber	helicóptero	hélicoptère	elicottero	helikopter	helicóptero	elicopter
+boat	Boot	barco	bateau	barca	łódź	barco	barcă
+ship	Schiff	barco	navire	nave	statek	navio	vapor
+sailboat	Segelboot	velero	voilier	barca a vela	żaglówka	veleiro	velier
+yacht	Jacht	yate	yacht	yacht	jacht	iate	iaht
+tractor	Traktor	tractor	tracteur	trattore	traktor	trator	tractor
+beach	Strand	playa	plage	spiaggia	plaża	praia	plajă
+sea	Meer	mar	mer	mare	morze	mar	mare
+lake	See	lago	lac	lago	jezioro	lago	lac
+river	Fluss	río	rivière	fiume	rzeka	rio	râu
+waterfall	Wasserfall	cascada	cascade	cascata	wodospad	cachoeira	cascadă
+mountain	Berg	montaña	montagne	montagna	góra	montanha	munte
+hill	Hügel	colina	colline	collina	wzgórze	colina	deal
+snow	Schnee	nieve	neige	neve	śnieg	neve	zăpadă
+forest	Wald	bosque	forêt	foresta	las	floresta	pădure
+tree	Baum	árbol	arbre	albero	drzewo	árvore	copac
+flower	Blume	flor	fleur	fiore	kwiat	flor	floare
+garden	Garten	jardín	jardin	giardino	ogród	jardim	grădină
+park	Park	parque	parc	parco	park	parque	parc
+field	Feld	campo	champ	campo	pole	campo	câmp
+desert	Wüste	desierto	désert	deserto	pustynia	deserto	deșert
+sunset	Sonnenuntergang	atardecer	coucher de soleil	tramonto	zachód słońca	pôr do sol	apus
+sunrise	Sonnenaufgang	amanecer	lever de soleil	alba	wschód słońca	nascer do sol	răsărit
+sky	Himmel	cielo	ciel	cielo	niebo	céu	cer
+clouds	Wolken	nubes	nuages	nuvole	chmury	nuvens	nori
+rainbow	Regenbogen	arcoíris	arc-en-ciel	arcobaleno	tęcza	arco-íris	curcubeu
+island	Insel	isla	île	isola	wyspa	ilha	insulă
+cave	Höhle	cueva	grotte	grotta	jaskinia	caverna	peșteră
+city	Stadt	ciudad	ville	città	miasto	cidade	oraș
+street	Straße	calle	rue	strada	ulica	rua	stradă
+building	Gebäude	edificio	bâtiment	edificio	budynek	prédio	clădire
+house	Haus	casa	maison	casa	dom	casa	casă
+church	Kirche	iglesia	église	chiesa	kościół	igreja	biserică
+castle	Burg	castillo	château	castello	zamek	castelo	castel
+bridge	Brücke	puente	pont	ponte	most	ponte	pod
+tower	Turm	torre	tour	torre	wieża	torre	turn
+skyscraper	Wolkenkratzer	rascacielos	gratte-ciel	grattacielo	wieżowiec	arranha-céu	zgârie-nori
+monument	Denkmal	monumento	monument	monumento	pomnik	monumento	monument
+statue	Statue	estatua	statue	statua	posąg	estátua	statuie
+fountain	Brunnen	fuente	fontaine	fontana	fontanna	fonte	fântână
+road	Straße	carretera	route	strada	droga	estrada	drum
+harbor	Hafen	puerto	port	porto	port	porto	port
+village	Dorf	pueblo	village	villaggio	wieś	aldeia	sat
+ruins	Ruinen	ruinas	ruines	rovine	ruiny	ruínas	ruine
+museum	Museum	museo	musée	museo	muzeum	museu	muzeu
+night	Nacht	noche	nuit	notte	noc	noite	noapte
+pizza	Pizza	pizza	pizza	pizza	pizza	pizza	pizza
+cake	Kuchen	tarta	gâteau	torta	ciasto	bolo	tort
+bread	Brot	pan	pain	pane	chleb	pão	pâine
+fruit	Obst	fruta	fruits	frutta	owoce	frutas	fructe
+vegetables	Gemüse	verduras	légumes	verdure	warzywa	legumes	legume
+salad	Salat	ensalada	salade	insalata	sałatka	salada	salată
+burger	Burger	hamburguesa	burger	hamburger	burger	hambúrguer	burger
+pasta	Nudeln	pasta	pâtes	pasta	makaron	macarrão	paste
+soup	Suppe	sopa	soupe	zuppa	zupa	sopa	supă
+coffee	Kaffee	café	café	caffè	kawa	café	cafea
+tea	Tee	té	thé	tè	herbata	chá	ceai
+wine	Wein	vino	vin	vino	wino	vinho	vin
+beer	Bier	cerveza	bière	birra	piwo	cerveja	bere
+cocktail	Cocktail	cóctel	cocktail	cocktail	koktajl	coquetel	cocktail
+dessert	Nachtisch	postre	dessert	dolce	deser	sobremesa	desert
+ice cream	Eis	helado	glace	gelato	lody	sorvete	înghețată
+sushi	Sushi	sushi	sushi	sushi	sushi	sushi	sushi
+meat	Fleisch	carne	viande	carne	mięso	carne	carne
+barbecue	Grillen	barbacoa	barbecue	grigliata	grill	churrasco	grătar
+breakfast	Frühstück	desayuno	petit-déjeuner	colazione	śniadanie	café da manhã	mic dejun
+person	Person	persona	personne	persona	osoba	pessoa	persoană
+people	Menschen	gente	gens	persone	ludzie	pessoas	oameni
+man	Mann	hombre	homme	uomo	mężczyzna	homem	bărbat
+woman	Frau	mujer	femme	donna	kobieta	mulher	femeie
+child	Kind	niño	enfant	bambino	dziecko	criança	copil
+baby	Baby	bebé	bébé	neonato	niemowlę	bebê	bebeluș
+family	Familie	familia	famille	famiglia	rodzina	família	familie
+group of friends	Freunde	amigos	amis	amici	przyjaciele	amigos	prieteni
+wedding	Hochzeit	boda	mariage	matrimonio	ślub	casamento	nuntă
+party	Party	fiesta	fête	festa	impreza	festa	petrecere
+concert	Konzert	concierto	concert	concerto	koncert	show	concert
+crowd	Menschenmenge	multitud	foule	folla	tłum	multidão	mulțime
+selfie	Selfie	selfie	selfie	selfie	selfie	selfie	selfie
+portrait	Porträt	retrato	portrait	ritratto	portret	retrato	portret
+kitchen	Küche	cocina	cuisine	cucina	kuchnia	cozinha	bucătărie
+living room	Wohnzimmer	salón	salon	soggiorno	salon	sala de estar	sufragerie
+bedroom	Schlafzimmer	dormitorio	chambre	camera da letto	sypialnia	quarto	dormitor
+bathroom	Badezimmer	baño	salle de bain	bagno	łazienka	banheiro	baie
+office	Büro	oficina	bureau	ufficio	biuro	escritório	birou
+classroom	Klassenzimmer	aula	salle de classe	aula	klasa	sala de aula	sală de clasă
+shop	Geschäft	tienda	magasin	negozio	sklep	loja	magazin
+restaurant	Restaurant	restaurante	restaurant	ristorante	restauracja	restaurante	restaurant
+hotel room	Hotelzimmer	habitación de hotel	chambre d'hôtel	camera d'albergo	pokój hotelowy	quarto de hotel	cameră de hotel
+swimming pool	Schwimmbad	piscina	piscine	piscina	basen	piscina	piscină
+stadium	Stadion	estadio	stade	stadio	stadion	estádio	stadion
+airport	Flughafen	aeropuerto	aéroport	aeroporto	lotnisko	aeroporto	aeroport
+train station	Bahnhof	estación de tren	gare	stazione	dworzec	estação de trem	gară
+playground	Spielplatz	parque infantil	aire de jeux	parco giochi	plac zabaw	parquinho	loc de joacă
+gym	Fitnessstudio	gimnasio	salle de sport	palestra	siłownia	academia	sală de sport
+hospital	Krankenhaus	hospital	hôpital	ospedale	szpital	hospital	spital
+laboratory	Labor	laboratorio	laboratoire	laboratorio	laboratorium	laboratório	laborator
+construction site	Baustelle	obra	chantier	cantiere	plac budowy	obra	șantier
+laptop	Laptop	portátil	ordinateur portable	portatile	laptop	notebook	laptop
+computer	Computer	ordenador	ordinateur	computer	komputer	computador	calculator
+phone	Handy	teléfono	téléphone	telefono	telefon	celular	telefon
+sim card	SIM-Karte	tarjeta SIM	carte SIM	scheda SIM	karta SIM	chip	cartelă SIM
+television	Fernseher	televisión	télévision	televisore	telewizor	televisão	televizor
+camera	Kamera	cámara	appareil photo	fotocamera	aparat	câmera	aparat foto
+keyboard	Tastatur	teclado	clavier	tastiera	klawiatura	teclado	tastatură
+book	Buch	libro	livre	libro	książka	livro	carte
+newspaper	Zeitung	periódico	journal	giornale	gazeta	jornal	ziar
+glasses	Brille	gafas	lunettes	occhiali	okulary	óculos	ochelari
+watch	Uhr	reloj	montre	orologio	zegarek	relógio	ceas
+shoes	Schuhe	zapatos	chaussures	scarpe	buty	sapatos	pantofi
+clothes	Kleidung	ropa	vêtements	vestiti	ubrania	roupas	haine
+dress	Kleid	vestido	robe	vestito	sukienka	vestido	rochie
+bag	Tasche	bolso	sac	borsa	torba	bolsa	geantă
+toy	Spielzeug	juguete	jouet	giocattolo	zabawka	brinquedo	jucărie
+ball	Ball	pelota	ballon	palla	piłka	bola	minge
+guitar	Gitarre	guitarra	guitare	chitarra	gitara	violão	chitară
+piano	Klavier	piano	piano	pianoforte	pianino	piano	pian
+furniture	Möbel	muebles	meubles	mobili	meble	móveis	mobilă
+sofa	Sofa	sofá	canapé	divano	kanapa	sofá	canapea
+bed	Bett	cama	lit	letto	łóżko	cama	pat
+table	Tisch	mesa	table	tavolo	stół	mesa	masă
+chair	Stuhl	silla	chaise	sedia	krzesło	cadeira	scaun
+plant	Pflanze	planta	plante	pianta	roślina	planta	plantă
+money	Geld	dinero	argent	soldi	pieniądze	dinheiro	bani
+key	Schlüssel	llave	clé	chiave	klucz	chave	cheie
+tools	Werkzeug	herramientas	outils	attrezzi	narzędzia	ferramentas	unelte
+document	Dokument	documento	document	documento	dokument	documento	document
+receipt	Kassenbon	recibo	ticket de caisse	scontrino	paragon	recibo	bon
+invoice	Rechnung	factura	facture	fattura	faktura	fatura	factură
+id card	Ausweis	documento de identidad	carte d'identité	carta d'identità	dowód osobisty	carteira de identidade	buletin
+passport	Reisepass	pasaporte	passeport	passaporto	paszport	passaporte	pașaport
+ticket	Ticket	billete	billet	biglietto	bilet	ingresso	bilet
+screenshot	Bildschirmfoto	captura de pantalla	capture d'écran	screenshot	zrzut ekranu	captura de tela	captură de ecran
+chart	Diagramm	gráfico	graphique	grafico	wykres	gráfico	grafic
+map	Karte	mapa	carte	mappa	mapa	mapa	hartă
+drawing	Zeichnung	dibujo	dessin	disegno	rysunek	desenho	desen
+painting	Gemälde	pintura	peinture	dipinto	obraz	pintura	pictură
+poster	Plakat	póster	affiche	poster	plakat	pôster	afiș
+sign	Schild	letrero	panneau	cartello	znak	placa	indicator
+whiteboard	Whiteboard	pizarra	tableau blanc	lavagna	tablica	quadro branco	tablă
+handwriting	Handschrift	escritura a mano	écriture manuscrite	scrittura a mano	pismo odręczne	letra à mão	scris de mână
+christmas tree	Weihnachtsbaum	árbol de navidad	sapin de noël	albero di natale	choinka	árvore de natal	brad de crăciun
+fireworks	Feuerwerk	fuegos artificiales	feu d'artifice	fuochi d'artificio	fajerwerki	fogos de artifício	artificii
+birthday	Geburtstag	cumpleaños	anniversaire	compleanno	urodziny	aniversário	zi de naștere
+candles	Kerzen	velas	bougies	candele	świeczki	velas	lumânări
+bouquet	Blumenstrauß	ramo	bouquet	mazzo di fiori	bukiet	buquê	buchet
+football	Fußball	fútbol	football	calcio	piłka nożna	futebol	fotbal
+basketball	Basketball	baloncesto	basket	pallacanestro	koszykówka	basquete	baschet
+tennis	Tennis	tenis	tennis	tennis	tenis	tênis	tenis
+skiing	Skifahren	esquí	ski	sci	narty	esqui	schi
+swimming	Schwimmen	natación	natation	nuoto	pływanie	natação	înot
+running	Laufen	correr	course	corsa	bieganie	corrida	alergare
+hiking	Wandern	senderismo	randonnée	escursionismo	wędrówka	trilha	drumeție
+camping	Camping	acampada	camping	campeggio	biwak	acampamento	camping
+cartoon	Zeichentrick	dibujos animados	dessin animé	cartone animato	kreskówka	desenho animado	desen animat
+emoji	Emoji	emoji	emoji	emoji	emoji	emoji	emoji

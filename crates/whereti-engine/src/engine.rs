@@ -262,6 +262,13 @@ impl Engine {
                 self.content.hint(busy, away);
                 Response::Ok
             }
+            Request::SetPhotoTags { on } => {
+                self.log(format!("photo recognition turned {} by a client", if on { "on" } else { "off" }));
+                match self.content.set_photo_tags(on) {
+                    Ok(()) => Response::Ok,
+                    Err(e) => Response::Error(e),
+                }
+            }
             Request::SetContentFolders { paths } => match self.content.set_folders(&paths) {
                 Ok(()) => {
                     self.log(format!("content folders changed by a client: {}", self.content.folders().join(" · ")));

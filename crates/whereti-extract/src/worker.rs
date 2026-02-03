@@ -26,6 +26,9 @@ const EXIT_DAMAGED: i32 = 4;
 pub fn serve_stdio() -> i32 {
     let args: Vec<String> = std::env::args().collect();
     let arg = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
+    if let Some(model) = arg("--tags") {
+        return serve_tags(Path::new(&model));
+    }
     let ext = arg("--ext").unwrap_or_default();
     let max = arg("--max").and_then(|m| m.parse().ok()).unwrap_or(1_000_000);
 
@@ -48,6 +51,44 @@ pub fn serve_stdio() -> i32 {
         Err(ExtractError::Damaged(msg)) => {
             eprint!("{msg}");
             EXIT_DAMAGED
+        }
+    }
+}
+
+/// Worker side of `TagWorker`: photos in, tags out, until a zero length.
+/// Request: u32 little-endian length, then the photo's bytes. Answer: one
+/// line, `ok<TAB>label:share,label:share` or `err<TAB>message`. The model is
+/// loaded on the first photo, once the process is inside its job.
+fn serve_tags(model: &Path) -> i32 {
+    let dll = std::env::current_exe().map(|e| e.with_file_name("onnxruntime.dll")).unwrap_or_default();
+    let mut tagger: Option<crate::tags::Tagger> = None;
+    let (mut input, mut out) = (std::io::stdin().lock(), std::io::stdout().lock());
+    loop {
+        let mut len = [0u8; 4];
+        if input.read_exact(&mut len).is_err() {
+            return 0;
+        }
+        let len = u32::from_le_bytes(len) as usize;
+        if len == 0 {
+            return 0;
+        }
+        let mut bytes = vec![0u8; len];
+        if input.read_exact(&mut bytes).is_err() {
+            return EXIT_DAMAGED;
+        }
+        let answer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if tagger.is_none() {
+                tagger = Some(crate::tags::Tagger::new(&dll, model)?);
+            }
+            tagger.as_mut().map_or(Err("no model".to_string()), |t| t.tags(&bytes))
+        }))
+        .unwrap_or_else(|_| Err("the model failed".into()));
+        let line = match answer {
+            Ok(tags) => format!("ok\t{}\n", tags.iter().map(|(i, s)| format!("{i}:{s:.3}")).collect::<Vec<_>>().join(",")),
+            Err(e) => format!("err\t{}\n", e.replace(['\n', '\r', '\t'], " ")),
+        };
+        if out.write_all(line.as_bytes()).and_then(|_| out.flush()).is_err() {
+            return 0;
         }
     }
 }
@@ -167,6 +208,123 @@ impl Sandbox {
                 code.map_or("?".into(), |c| format!("{c:#x}")),
                 if out.is_empty() && err.contains("memory") { " - out of memory" } else { "" }
             ))),
+        }
+    }
+}
+
+/// Broker side of the photo tags: one worker process that keeps the model
+/// loaded and takes photos one by one (loading 84 MB per photo would cost
+/// more than tagging it). Same limits as `Sandbox`: a Job Object with the
+/// memory cap, below-normal priority, no window; a photo that takes longer
+/// than the timeout kills the worker, and the next photo starts a new one.
+pub struct TagWorker {
+    exe: PathBuf,
+    model: PathBuf,
+    memory_limit: usize,
+    pub timeout: Duration,
+    running: Option<RunningTagger>,
+}
+
+struct RunningTagger {
+    _job: Job,
+    child: std::process::Child,
+    stdin: std::process::ChildStdin,
+    lines: std::sync::mpsc::Receiver<String>,
+}
+
+impl Drop for RunningTagger {
+    fn drop(&mut self) {
+        let _ = self.stdin.write_all(&0u32.to_le_bytes());
+        let _ = self.stdin.flush();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl TagWorker {
+    /// The worker next to the running executable, with `model`; `None` when
+    /// the worker or ONNX Runtime is missing.
+    pub fn beside_current_exe(model: &Path) -> Option<TagWorker> {
+        let exe = std::env::current_exe().ok()?.with_file_name("whereti-extract.exe");
+        let dll = exe.with_file_name("onnxruntime.dll");
+        (exe.is_file() && dll.is_file() && model.is_file()).then(|| TagWorker {
+            exe,
+            model: model.to_path_buf(),
+            memory_limit: 768 << 20,
+            timeout: Duration::from_secs(20),
+            running: None,
+        })
+    }
+
+    /// A given worker executable (tests); onnxruntime.dll must be beside it.
+    pub fn with_exe(exe: PathBuf, model: &Path) -> TagWorker {
+        TagWorker { exe, model: model.to_path_buf(), memory_limit: 768 << 20, timeout: Duration::from_secs(20), running: None }
+    }
+
+    fn start(&self) -> Result<RunningTagger, String> {
+        use std::os::windows::io::AsRawHandle;
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
+        let job = Job::new(self.memory_limit).map_err(|e| format!("job object: {e}"))?;
+        let mut child = Command::new(&self.exe)
+            .arg("--tags")
+            .arg(&self.model)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS)
+            .spawn()
+            .map_err(|e| format!("cannot start the extractor: {e}"))?;
+        // it waits for the first photo before loading anything
+        if let Err(e) = job.assign(child.as_raw_handle()) {
+            let _ = child.kill();
+            return Err(format!("job object: {e}"));
+        }
+        let stdin = child.stdin.take().ok_or("no stdin")?;
+        let stdout = child.stdout.take().ok_or("no stdout")?;
+        let (tx, lines) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use std::io::BufRead;
+            for line in std::io::BufReader::new(stdout).lines() {
+                let Ok(line) = line else { return };
+                if tx.send(line).is_err() {
+                    return;
+                }
+            }
+        });
+        Ok(RunningTagger { _job: job, child, stdin, lines })
+    }
+
+    /// The tags of one photo: `(label, share)`, best first.
+    pub fn tags(&mut self, bytes: &[u8]) -> Result<Vec<(usize, f32)>, String> {
+        if self.running.is_none() {
+            self.running = Some(self.start()?);
+        }
+        let run = self.running.as_mut().expect("started");
+        let sent = run.stdin.write_all(&(bytes.len() as u32).to_le_bytes()).and_then(|_| run.stdin.write_all(bytes)).and_then(|_| run.stdin.flush());
+        if let Err(e) = sent {
+            self.running = None;
+            return Err(format!("the tagger stopped: {e}"));
+        }
+        let line = match run.lines.recv_timeout(self.timeout) {
+            Ok(line) => line,
+            Err(_) => {
+                // too slow, out of memory or crashed: a new one next time
+                self.running = None;
+                return Err(format!("no answer in {} s", self.timeout.as_secs()));
+            }
+        };
+        match line.split_once('\t') {
+            Some(("ok", list)) => Ok(list
+                .split(',')
+                .filter_map(|t| {
+                    let (i, s) = t.split_once(':')?;
+                    Some((i.parse().ok()?, s.parse().ok()?))
+                })
+                .collect()),
+            Some(("err", e)) => Err(e.to_string()),
+            _ => Err(format!("unexpected answer: {line}")),
         }
     }
 }
