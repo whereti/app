@@ -5097,7 +5097,7 @@ checksum = "a28ac98ddc8b9274cb41bb4d9d4d5c425b6020c50c46f25559911905610b4a88"
 
 [[package]]
 name = "whereti-app"
-version = "0.0.14"
+version = "0.0.15"
 dependencies = [
  "base64",
  "ed25519-dalek",
@@ -5120,7 +5120,7 @@ dependencies = [
 
 [[package]]
 name = "whereti-cli"
-version = "0.0.14"
+version = "0.0.15"
 dependencies = [
  "clap",
  "whereti-core",
@@ -5134,7 +5134,7 @@ dependencies = [
 
 [[package]]
 name = "whereti-content"
-version = "0.0.14"
+version = "0.0.15"
 dependencies = [
  "parking_lot 0.13.0",
  "tantivy",
@@ -5144,7 +5144,7 @@ dependencies = [
 
 [[package]]
 name = "whereti-core"
-version = "0.0.14"
+version = "0.0.15"
 dependencies = [
  "aho-corasick",
  "bytemuck",
@@ -5158,7 +5158,7 @@ dependencies = [
 
 [[package]]
 name = "whereti-engine"
-version = "0.0.14"
+version = "0.0.15"
 dependencies = [
  "parking_lot 0.13.0",
  "rayon",
@@ -5176,7 +5176,7 @@ dependencies = [
 
 [[package]]
 name = "whereti-extract"
-version = "0.0.14"
+version = "0.0.15"
 dependencies = [
  "calamine",
  "cfb",
@@ -5193,14 +5193,14 @@ dependencies = [
 
 [[package]]
 name = "whereti-i18n"
-version = "0.0.14"
+version = "0.0.15"
 dependencies = [
  "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "whereti-ipc"
-version = "0.0.14"
+version = "0.0.15"
 dependencies = [
  "postcard",
  "serde",
@@ -5209,14 +5209,14 @@ dependencies = [
 
 [[package]]
 name = "whereti-net"
-version = "0.0.14"
+version = "0.0.15"
 dependencies = [
  "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "whereti-ntfs"
-version = "0.0.14"
+version = "0.0.15"
 dependencies = [
  "crossbeam-channel",
  "windows-sys 0.61.2",
@@ -5224,7 +5224,7 @@ dependencies = [
 
 [[package]]
 name = "whereti-places"
-version = "0.0.14"
+version = "0.0.15"
 dependencies = [
  "flate2",
  "kamadak-exif",
@@ -5232,14 +5232,14 @@ dependencies = [
 
 [[package]]
 name = "whereti-query"
-version = "0.0.14"
+version = "0.0.15"
 dependencies = [
  "unicode-normalization",
 ]
 
 [[package]]
 name = "whereti-service"
-version = "0.0.14"
+version = "0.0.15"
 dependencies = [
  "whereti-engine",
  "whereti-ipc",
@@ -5249,7 +5249,7 @@ dependencies = [
 
 [[package]]
 name = "whereti-setup"
-version = "0.0.14"
+version = "0.0.15"
 dependencies = [
  "eframe",
  "whereti-i18n",
