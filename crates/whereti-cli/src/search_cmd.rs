@@ -268,6 +268,7 @@ pub fn status(args: StatusArgs) -> Result<(), String> {
         num(c.failed),
         bytes(c.disk_bytes)
     );
+    println!("photos         {}", if c.tags.is_empty() { "off" } else { c.tags.as_str() });
     if args.log {
         println!();
         for line in &s.recent_log {
@@ -353,7 +354,8 @@ pub fn exclusions(args: ExclusionsArgs) -> Result<(), String> {
 
 #[derive(Args)]
 pub struct ContentArgs {
-    /// list (default), add, remove or reset (back to Desktop, Documents, Downloads)
+    /// list (default), add, remove, reset (back to Desktop, Documents,
+    /// Downloads), or photos on|off (recognise objects and animals in photos)
     #[arg(default_value = "list")]
     action: String,
     /// Folder to add or remove, e.g. D:\Acte
@@ -374,6 +376,21 @@ pub fn content(args: ContentArgs) -> Result<(), String> {
         other => return Err(format!("unexpected reply: {other:?}")),
     };
     let mut paths = cfg.content_folders.clone();
+    if args.action == "photos" {
+        let on = match args.path.as_deref() {
+            Some("on") => true,
+            Some("off") => false,
+            _ => return Err("wt content photos on|off".into()),
+        };
+        return match client.call(&Request::SetPhotoTags { on }).map_err(|e| e.to_string())? {
+            Response::Ok => {
+                println!("recognising objects and animals in photos: {}", if on { "on (the model downloads first)" } else { "off" });
+                Ok(())
+            }
+            Response::Error(e) => Err(e),
+            other => Err(format!("unexpected reply: {other:?}")),
+        };
+    }
     match (args.action.as_str(), args.path) {
         ("list", _) => {
             for p in &paths {
