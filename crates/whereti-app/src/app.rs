@@ -605,6 +605,8 @@ impl WheretiApp {
                     let help = icon_button(ui, p, IconKind::Help, self.help_open).on_hover_text(tr("Search commands (F1)"));
                     if help.clicked() {
                         self.help_open = !self.help_open;
+                        // the commands are for searching: show them over the results
+                        self.page = Page::Search;
                     }
                 });
             });
@@ -1602,6 +1604,10 @@ impl WheretiApp {
     /// The "?" panel under the search field: what can be typed, in three
     /// groups, each with an example that is typed and searched on a click.
     fn help_panel(&mut self, ctx: &egui::Context, p: &Palette) {
+        // only over the search page: leaving it (Settings) closes the panel
+        if self.page != Page::Search {
+            self.help_open = false;
+        }
         if !self.help_open || self.search_rect == Rect::NOTHING {
             return;
         }
@@ -1622,6 +1628,7 @@ impl WheretiApp {
                 vec![
                     ("ext:pdf;docx".to_string(), tr("Only these file types")),
                     ("dm:today".to_string(), tr("Changed on a day: also yesterday, thisweek, lastmonth, 2025, 2025-03")),
+                    ("dm:2025-03-01..2025-06-30".to_string(), tr("Changed between two dates")),
                     ("size:>10mb".to_string(), tr("By size: also large, huge, 1mb..5mb")),
                     (tr("folder:projects").to_string(), tr("Only folders (file: only files)")),
                     (r"path:C:\Users".to_string(), tr("Only inside a folder")),

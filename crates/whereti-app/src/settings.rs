@@ -354,18 +354,19 @@ fn search(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
                 ui.painter().circle_filled(r.center(), 4.0, dot);
             }
         });
+        // The progress, or the same space left empty: the switches below
+        // must not move while documents are read, or a click meant for one
+        // lands beside it.
+        let (area, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 38.0), Sense::hover());
         if let Some(c) = c.filter(crate::app::content_active) {
-            ui.add_space(2.0);
             let all = (c.done + c.queued).max(1);
-            let (r, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 6.0), Sense::hover());
+            let r = egui::Rect::from_min_size(area.min + Vec2::new(0.0, 2.0), Vec2::new(area.width(), 6.0));
             ui.painter().rect_filled(r, 3.0, p.line);
             let mut done = r;
             done.set_width((r.width() * c.done as f32 / all as f32).max(6.0));
             ui.painter().rect_filled(done, 3.0, p.accent);
-            ui.add_space(6.0);
             let text = crate::app::content_progress(&c, app.content_eta(&c));
-            ui.label(egui::RichText::new(text).size(12.0).color(p.text2));
-            ui.add_space(8.0);
+            ui.painter().text(area.min + Vec2::new(0.0, 15.0), egui::Align2::LEFT_TOP, text, FontId::proportional(12.0), p.text2);
         }
     });
     ui.add_space(14.0);

@@ -1139,4 +1139,15 @@ pub const ENTRIES: &[Entry] = &[
         pt_br: "Uma expressão regular, para especialistas",
         ro: "O expresie regulată, pentru experți",
     },
+    Entry {
+        en: "Changed between two dates",
+        note: "Search box > the '?' panel of search commands, what the example 'dm:2025-03-01..2025-06-30' does.",
+        de: "Zwischen zwei Daten geändert",
+        es: "Modificado entre dos fechas",
+        fr: "Modifié entre deux dates",
+        it: "Modificato tra due date",
+        pl: "Zmienione między dwiema datami",
+        pt_br: "Alterado entre duas datas",
+        ro: "Modificat între două date",
+    },
 ];
