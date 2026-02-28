@@ -395,6 +395,30 @@ fn search(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
     });
     ui.add_space(14.0);
 
+    // ---- where the user works
+    let work = app.status.as_ref().and_then(|s| s.work_folders.clone());
+    card(ui, p, |ui| {
+        row(
+            ui,
+            p,
+            tr("Learn where you work"),
+            tr("Files in the folders where you create and change files lately come first. whereti sees this in the disk's own change log; it stays on your PC, and turning it off forgets it."),
+            |ui| {
+                let mut on = work.is_some() || app.status.is_none();
+                if toggle(ui, p, &mut on, tr("Learn where you work")).clicked() {
+                    app.searcher.set_work_folders(on);
+                }
+            },
+        );
+        // what it learnt, so it is never a secret
+        if let Some(folders) = work.filter(|f| !f.is_empty()) {
+            let text = crate::trf!("Lately: {folders}", folders = folders.join(" · "));
+            ui.add(egui::Label::new(egui::RichText::new(text).size(12.5).color(p.text2)).wrap());
+            ui.add_space(12.0);
+        }
+    });
+    ui.add_space(14.0);
+
     // ---- objects and animals in photos
     let tags = photo_tags_state(app);
     card(ui, p, |ui| {

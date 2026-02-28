@@ -389,3 +389,36 @@ fn importance_orders_results_inside_a_match_level() {
         [r"C:\Users\ana\Documents\README.md", r"C:\Users\ana\Documents\README notes.txt", r"C:\Python313\README"]
     );
 }
+
+#[test]
+fn where_the_user_works_lately_counts() {
+    let c = scan(vec![
+        d(5, 5, "."),
+        d(30, 5, "proiecte"),
+        d(31, 30, "casa"),
+        d(32, 31, "acte"),
+        f(40, 31, "cerere.docx"),
+        f(41, 32, "cerere vechi.docx"),
+        d(33, 5, "altele"),
+        f(42, 33, "cerere.docx"),
+    ]);
+    let vols = vec![VolumeScan { letter: 'C', serial: 1, journal_id: 10, next_usn: 100, scan: c }];
+    let idx = build(vols, &Exclusions::default()).0;
+    let at = |path: &str| (0..idx.len() as u32).find(|&i| idx.full_path(i) == path).unwrap();
+    let (casa, here, below, other) =
+        (at(r"C:\proiecte\casa"), at(r"C:\proiecte\casa\cerere.docx"), at(r"C:\proiecte\casa\acte\cerere vechi.docx"), at(r"C:\altele\cerere.docx"));
+    let mut active = vec![0u8; idx.len()];
+    active[casa as usize] = 8;
+    let w = idx.weigher();
+    let wa = idx.weigher_with(std::sync::Arc::new(active.clone()));
+    assert!(idx.is_work_file(here) && !idx.is_work_file(casa));
+    // in the folder: much more important; one level down: half; elsewhere: the same
+    assert_eq!(idx.importance(here, &w) - idx.importance(here, &wa), 8);
+    assert_eq!(idx.importance(below, &w) - idx.importance(below, &wa), 4);
+    assert_eq!(idx.importance(other, &w), idx.importance(other, &wa));
+    // the same name: the one where the user works comes first
+    let q = parse("cerere.docx", &ctx());
+    let opts = SearchOptions { limit: 10, sort: SortBy::Relevance };
+    let r = idx.search_ranked(&q, &opts, &[], std::sync::Arc::new(active));
+    assert_eq!(idx.full_path(r.hits[0]), r"C:\proiecte\casa\cerere.docx");
+}

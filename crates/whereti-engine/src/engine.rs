@@ -105,6 +105,8 @@ pub(crate) struct Shared {
     pub(crate) log: Logger,
     /// Told about changes, so it re-plans only when documents changed.
     pub(crate) content: std::sync::OnceLock<Arc<Content>>,
+    /// Where the user works lately (PLAN.md §56).
+    pub(crate) activity: crate::activity::Activity,
 }
 
 impl Shared {
@@ -132,6 +134,8 @@ impl Engine {
             open_files: AtomicU64::new(0),
             log,
             content: std::sync::OnceLock::new(),
+            // beside the index (ProgramData\whereti for the service)
+            activity: crate::activity::Activity::open(cfg.index_path.parent().unwrap_or(std::path::Path::new("."))),
         });
         let content_dir = if cfg.index_path == system::default_index_path() {
             let _ = system::ensure_data_dir();
@@ -163,6 +167,7 @@ impl Engine {
 
     /// Saves (if needed) and stops the worker and the content indexer.
     pub fn stop(&self) {
+        self.shared.activity.save();
         self.content.stop();
         let _ = self.tx.send(Msg::Stop);
         if let Some(h) = self.worker.lock().take() {
@@ -206,7 +211,7 @@ impl Engine {
                         Sort::Modified => SortBy::Modified,
                     },
                 };
-                let res = idx.search_with_usage(&query, &opts, &r.usage);
+                let res = idx.search_ranked(&query, &opts, &r.usage, self.shared.activity.ranking(idx));
                 let rows = res
                     .hits
                     .iter()
@@ -245,7 +250,8 @@ impl Engine {
                     return Response::Content(Default::default());
                 };
                 let query = whereti_query::parse(&r.query, &system::date_ctx());
-                Response::Content(self.content.search(idx, &query, r.limit.min(MAX_LIMIT) as usize, &r.usage, caller))
+                let active = self.shared.activity.ranking(idx);
+                Response::Content(self.content.search(idx, &query, r.limit.min(MAX_LIMIT) as usize, &r.usage, active, caller))
             }
             Request::ScanUnindexed(r) => {
                 let query = whereti_query::parse(&r.query, &system::date_ctx());
@@ -261,6 +267,13 @@ impl Engine {
             Request::Hint { busy, away } => {
                 self.content.hint(busy, away);
                 Response::Ok
+            }
+            Request::SetWorkFolders { on } => {
+                self.log(format!("learning where the user works turned {} by a client", if on { "on" } else { "off" }));
+                match self.shared.activity.set_on(on) {
+                    Ok(()) => Response::Ok,
+                    Err(e) => Response::Error(e),
+                }
             }
             Request::SetPhotoTags { on } => {
                 self.log(format!("photo recognition turned {} by a client", if on { "on" } else { "off" }));
@@ -305,6 +318,7 @@ impl Engine {
                     open_files: self.shared.open_files.load(Ordering::Relaxed),
                     recent_log: self.shared.log.recent(),
                     content: self.content.status(),
+                    work_folders: self.shared.activity.is_on().then(|| self.shared.activity.top(4)),
                 })
             }
         }
@@ -549,8 +563,11 @@ impl Worker {
             }
             stats
         };
-        if let (Some(c), Some(idx)) = (self.shared.content.get(), self.shared.index.read().as_ref()) {
-            c.note_changes(idx, v, &records);
+        if let Some(idx) = self.shared.index.read().as_ref() {
+            if let Some(c) = self.shared.content.get() {
+                c.note_changes(idx, v, &records);
+            }
+            self.shared.activity.note(idx, v, &records);
         }
         if stats.records > 0 {
             self.dirty = true;
@@ -681,6 +698,7 @@ impl Worker {
             snapshot::save(guard.as_ref().expect("index"), &self.cfg.index_path)
                 .map_err(|e| format!("cannot save {}: {e}", self.cfg.index_path.display()))?
         };
+        self.shared.activity.save();
         self.dirty = false;
         self.last_save = Instant::now();
         self.saved_usn = self.shared.index.read().as_ref().expect("index").volumes().iter().map(|v| v.next_usn).collect();

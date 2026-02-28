@@ -584,6 +584,7 @@ impl Content {
         query: &Query,
         limit: usize,
         usage: &[(String, u8)],
+        active: Arc<Vec<u8>>,
         caller: &dyn Caller,
     ) -> ContentReply {
         let t = Instant::now();
@@ -610,7 +611,7 @@ impl Content {
         let entries = idx.filter(&filters, &entries);
         let paths: Vec<String> = entries.iter().map(|&e| idx.full_path(e)).collect();
         let allowed = caller.can_read(&paths);
-        let w = idx.weigher();
+        let w = idx.weigher_with(active);
         let mut found: Vec<(f32, u32, String)> = entries
             .iter()
             .zip(paths)

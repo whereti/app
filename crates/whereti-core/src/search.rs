@@ -11,6 +11,8 @@ use memchr::memmem::Finder;
 use rayon::prelude::*;
 use whereti_query::{fold, glob_match, longest_literal, Query, Term};
 
+use std::sync::Arc;
+
 use crate::index::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -86,6 +88,13 @@ impl NameIndex {
     /// hits rank as if they were more important, and are never sent down
     /// as noise.
     pub fn search_with_usage(&self, query: &Query, opts: &SearchOptions, usage: &[(String, u8)]) -> SearchResults {
+        self.search_ranked(query, opts, usage, Arc::new(Vec::new()))
+    }
+
+    /// Like `search_with_usage`, and `active`: per entry, how much the user
+    /// works in that folder lately (0-8, indexed by folder entry; see
+    /// `importance`). Empty: no such signal.
+    pub fn search_ranked(&self, query: &Query, opts: &SearchOptions, usage: &[(String, u8)], active: Arc<Vec<u8>>) -> SearchResults {
         let t0 = std::time::Instant::now();
         let mut warnings = Vec::new();
         let hits = self.matching_entries(query, &mut warnings);
@@ -96,7 +105,7 @@ impl NameIndex {
         });
         let total = hits.len();
         let used = if opts.sort == SortBy::Relevance { self.usage_positions(&hits, usage) } else { Vec::new() };
-        let hits = self.top(hits, opts, rank_needle.as_deref(), &used);
+        let hits = self.top(hits, opts, rank_needle.as_deref(), &used, active);
         if trace_enabled() {
             let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
             eprintln!("[trace] match {:.2} ms · rank {:.2} ms · {} hits", ms(t_eval), ms(t0.elapsed() - t_eval), total);
@@ -400,7 +409,7 @@ impl NameIndex {
 
     /// `used`: positions in `hits` of files the user opens often or lately,
     /// with their weight (Relevance only).
-    fn top(&self, hits: Vec<u32>, opts: &SearchOptions, needle: Option<&str>, used: &[(usize, u8)]) -> Vec<u32> {
+    fn top(&self, hits: Vec<u32>, opts: &SearchOptions, needle: Option<&str>, used: &[(usize, u8)], active: Arc<Vec<u8>>) -> Vec<u32> {
         let limit = opts.limit.min(hits.len());
         if limit == 0 {
             return Vec::new();
@@ -415,7 +424,7 @@ impl NameIndex {
                 // thousands, not millions.
                 let needle = needle.map(str::as_bytes);
                 let relevance = opts.sort == SortBy::Relevance;
-                let weigh = relevance.then(|| self.weigher());
+                let weigh = relevance.then(|| self.weigher_with(active));
                 let shift = (32 - (self.len().max(1) as u32).leading_zeros()).saturating_sub(7);
                 let bucket = |i: u32| -> u16 {
                     let key = match &weigh {
@@ -502,7 +511,26 @@ impl NameIndex {
             .unwrap_or(0)
             .min(u32::MAX as u64) as u32;
         let ext = self.exts.iter().map(|e| crate::build::ext_weight(e)).collect();
-        Weigher { now, ext }
+        Weigher { now, ext, active: Arc::new(Vec::new()) }
+    }
+
+    /// `weigher`, with where the user works lately (see `search_ranked`).
+    pub fn weigher_with(&self, active: Arc<Vec<u8>>) -> Weigher {
+        Weigher { active, ..self.weigher() }
+    }
+
+    /// A file of the user's own kind, where they work: not a folder, not
+    /// hidden, system, cloud-only, gone or in a tool folder, and of a type a
+    /// person makes (documents, pictures, code…), not one a program keeps
+    /// for itself (logs, caches, temporary files) or without an extension.
+    pub fn is_work_file(&self, i: u32) -> bool {
+        let iu = i as usize;
+        let skip = FLAG_DIR | FLAG_HIDDEN | FLAG_SYSTEM | FLAG_CLOUD | FLAG_NOISE | FLAG_GONE | FLAG_ROOT;
+        if iu >= self.len() || self.flags[iu] & skip != 0 {
+            return false;
+        }
+        let e = self.ext[iu] as usize;
+        e != 0 && self.exts.get(e).is_some_and(|x| crate::build::ext_weight(x) <= 0)
     }
 
     /// 0 (most) to 31 (least): how much an entry likely matters to the
@@ -522,6 +550,15 @@ impl NameIndex {
         } else {
             let e = self.ext[iu] as usize;
             score += if e == 0 { 3 } else { w.ext.get(e).copied().unwrap_or(0) as i32 };
+        }
+        // where the user works lately: the folder itself, what is in it,
+        // and (half as much) one level further down
+        if !w.active.is_empty() {
+            let at = |e: u32| w.active.get(e as usize).copied().unwrap_or(0);
+            let parent = self.parent(i);
+            let here = at(i).max(parent.map_or(0, at));
+            let above = parent.and_then(|p| self.parent(p)).map_or(0, at) / 2;
+            score -= here.max(above) as i32;
         }
         const DAY: u32 = 24 * 60;
         score -= match w.now.saturating_sub(self.mtime[iu]) {
@@ -578,6 +615,8 @@ pub struct Weigher {
     now: u32,
     /// `ext_weight` of every extension id.
     ext: Vec<i8>,
+    /// Per folder entry: how much the user works there lately (0-8).
+    active: Arc<Vec<u8>>,
 }
 
 /// Set `WT_TRACE=1` to print how long each search phase takes.
@@ -835,7 +874,7 @@ mod tests {
                 for limit in [1, 2, 3, 7, 50, 100_000] {
                     let want: Vec<u32> = all.iter().take(limit).map(|k| k.2).collect();
                     let opts = SearchOptions { limit, sort: SortBy::Relevance };
-                    assert_eq!(idx.top(hits.clone(), &opts, Some(needle), &[]), want, "seed {seed}, {needle:?}, limit {limit}");
+                    assert_eq!(idx.top(hits.clone(), &opts, Some(needle), &[], Arc::new(Vec::new())), want, "seed {seed}, {needle:?}, limit {limit}");
                 }
             }
             // no word to rank by (e.g. a path or ext: query), and alphabetical order
@@ -863,7 +902,7 @@ mod tests {
                 for limit in [1, 5, 33, 100_000] {
                     let want: Vec<u32> = all.iter().take(limit).map(|k| k.2).collect();
                     let opts = SearchOptions { limit, sort };
-                    assert_eq!(idx.top(hits.clone(), &opts, needle, &[]), want, "seed {seed}, {sort:?}, limit {limit}");
+                    assert_eq!(idx.top(hits.clone(), &opts, needle, &[], Arc::new(Vec::new())), want, "seed {seed}, {sort:?}, limit {limit}");
                 }
             }
         }

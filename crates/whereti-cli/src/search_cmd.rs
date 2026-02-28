@@ -269,6 +269,11 @@ pub fn status(args: StatusArgs) -> Result<(), String> {
         bytes(c.disk_bytes)
     );
     println!("photos         {}", if c.tags.is_empty() { "off" } else { c.tags.as_str() });
+    match &s.work_folders {
+        Some(f) if !f.is_empty() => println!("works in       {}", f.join(" · ")),
+        Some(_) => println!("works in       (nothing learnt yet)"),
+        None => println!("works in       off"),
+    }
     if args.log {
         println!();
         for line in &s.recent_log {

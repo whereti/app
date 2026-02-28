@@ -28,7 +28,7 @@ use windows_sys::Win32::System::Pipes::{
 };
 
 pub const PIPE_NAME: &str = r"\\.\pipe\whereti";
-pub const PROTOCOL_VERSION: u32 = 8;
+pub const PROTOCOL_VERSION: u32 = 9;
 const MAX_MESSAGE: usize = 64 << 20;
 
 /// The account that created the pipe (OW), SYSTEM and Administrators: full
@@ -76,6 +76,9 @@ pub enum Request {
     /// Recognise objects and animals in photos (downloads the model the
     /// first time it is turned on).
     SetPhotoTags { on: bool },
+    /// Learn where the user works (the folders where their files change)
+    /// and rank those first; off forgets what was learnt.
+    SetWorkFolders { on: bool },
     /// What the user is doing, as seen from their session: `busy` = a
     /// full-screen game or video, or a presentation; `away` = screen locked
     /// or screen saver. Background work pauses or speeds up accordingly.
@@ -190,6 +193,9 @@ pub struct StatusReply {
     pub open_files: u64,
     pub recent_log: Vec<String>,
     pub content: ContentStatus,
+    /// Where the user works lately, hottest first (a few folders); `None`
+    /// when learning it is off.
+    pub work_folders: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

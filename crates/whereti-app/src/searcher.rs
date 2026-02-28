@@ -51,6 +51,7 @@ enum Msg {
     Config,
     SetExclusions(Vec<String>),
     SetPhotoTags(bool),
+    SetWorkFolders(bool),
 }
 
 pub struct Searcher {
@@ -96,6 +97,11 @@ impl Searcher {
         let _ = self.tx.send(Msg::SetPhotoTags(on));
     }
 
+    /// Learning where the user works on or off (off forgets it).
+    pub fn set_work_folders(&self, on: bool) {
+        let _ = self.tx.send(Msg::SetWorkFolders(on));
+    }
+
 
     pub fn updates(&self) -> impl Iterator<Item = Update> + '_ {
         std::iter::from_fn(|| self.rx.try_recv().ok())
@@ -110,6 +116,7 @@ struct Pending {
     config: bool,
     exclusions: Option<Vec<String>>,
     photo_tags: Option<bool>,
+    work_folders: Option<bool>,
 }
 
 fn worker(jobs: Receiver<Msg>, out: Sender<Update>, wake: impl Fn()) {
@@ -129,6 +136,10 @@ fn worker(jobs: Receiver<Msg>, out: Sender<Update>, wake: impl Fn()) {
             }
             Msg::SetPhotoTags(on) => {
                 p.photo_tags = Some(on);
+                p.status = true;
+            }
+            Msg::SetWorkFolders(on) => {
+                p.work_folders = Some(on);
                 p.status = true;
             }
         };
@@ -157,6 +168,11 @@ fn worker(jobs: Receiver<Msg>, out: Sender<Update>, wake: impl Fn()) {
         }
         let c = client.as_mut().expect("connected");
         let result = (|| -> std::io::Result<()> {
+            if let Some(on) = p.work_folders {
+                if let Response::Error(e) = c.call(&Request::SetWorkFolders { on })? {
+                    let _ = out.send(Update::Done(e));
+                }
+            }
             if let Some(on) = p.photo_tags {
                 if let Response::Error(e) = c.call(&Request::SetPhotoTags { on })? {
                     let _ = out.send(Update::Done(e));

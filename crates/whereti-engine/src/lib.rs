@@ -4,6 +4,7 @@
 
 #![cfg(windows)]
 
+pub mod activity;
 pub mod content;
 pub mod engine;
 pub mod log;
