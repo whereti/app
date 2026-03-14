@@ -422,3 +422,24 @@ fn where_the_user_works_lately_counts() {
     let r = idx.search_ranked(&q, &opts, &[], std::sync::Arc::new(active));
     assert_eq!(idx.full_path(r.hits[0]), r"C:\proiecte\casa\cerere.docx");
 }
+
+#[test]
+fn files_a_program_makes_are_not_work() {
+    use crate::build::looks_generated;
+    assert!(looks_generated("945d0bda-b0c0-4d90-99ee-d6bb23acfd51.sslo"));
+    assert!(looks_generated("00000000000000000348-770a40e9.op"));
+    assert!(!looks_generated("Screenshot 2026-10-24 234004.png"));
+    assert!(!looks_generated("Factura SOF0001-EXEMPLU.pdf"));
+    let c = scan(vec![
+        d(5, 5, "."),
+        d(30, 5, "Silo"),
+        f(40, 30, "945d0bda-b0c0-4d90-99ee-d6bb23acfd51.sslo"),
+        f(41, 30, "notes.op"),
+        f(42, 30, "Plan.docx"),
+        f(43, 30, "main.rs"),
+    ]);
+    let vols = vec![VolumeScan { letter: 'C', serial: 1, journal_id: 10, next_usn: 100, scan: c }];
+    let idx = build(vols, &Exclusions::default()).0;
+    let work: Vec<&str> = (0..idx.len() as u32).filter(|&i| idx.is_work_file(i)).map(|i| idx.name(i)).collect();
+    assert_eq!(work, ["Plan.docx", "main.rs"]);
+}

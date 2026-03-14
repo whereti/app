@@ -555,6 +555,35 @@ pub(crate) fn mark_noise(idx: &mut NameIndex) {
     }
 }
 
+/// Text and code a person writes, on top of the types `ext_weight` favours
+/// (for "where you work": an unknown extension is a program's own file).
+pub(crate) fn is_written_by_hand(ext: &str) -> bool {
+    matches!(
+        ext,
+        "txt" | "md" | "csv" | "tsv" | "json" | "xml" | "html" | "htm" | "css" | "scss" | "js" | "mjs" | "ts" | "tsx"
+            | "jsx" | "vue" | "svelte" | "astro" | "py" | "rs" | "go" | "java" | "kt" | "c" | "h" | "cpp" | "hpp"
+            | "cc" | "cs" | "php" | "rb" | "swift" | "dart" | "lua" | "sql" | "sh" | "ps1" | "bat" | "yaml" | "yml"
+            | "toml" | "ini" | "tex" | "rtf"
+    )
+}
+
+/// A name a program made up: a UUID or a long run of hex digits
+/// ("945d0bda-b0c0-4d90-99ee-d6bb23acfd51.sslo", "3f9a…e1.tmp").
+pub(crate) fn looks_generated(name: &str) -> bool {
+    let mut run = 0;
+    for c in name.chars() {
+        if c.is_ascii_hexdigit() {
+            run += 1;
+            if run >= 16 {
+                return true;
+            }
+        } else if c != '-' {
+            run = 0;
+        }
+    }
+    false
+}
+
 /// How much a file type matters to a person (negative = more), by folded
 /// extension: their documents, pictures, music, videos and programs first,
 /// the files programs keep for themselves last.

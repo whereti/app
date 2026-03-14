@@ -520,9 +520,10 @@ impl NameIndex {
     }
 
     /// A file of the user's own kind, where they work: not a folder, not
-    /// hidden, system, cloud-only, gone or in a tool folder, and of a type a
-    /// person makes (documents, pictures, code…), not one a program keeps
-    /// for itself (logs, caches, temporary files) or without an extension.
+    /// hidden, system, cloud-only, gone or in a tool folder; of a type a
+    /// person makes (documents, pictures, music, video, archives, text and
+    /// code), never an unknown extension (a program's own data, like a
+    /// vault's ".sslo" blocks); and not with a made-up name (a UUID).
     pub fn is_work_file(&self, i: u32) -> bool {
         let iu = i as usize;
         let skip = FLAG_DIR | FLAG_HIDDEN | FLAG_SYSTEM | FLAG_CLOUD | FLAG_NOISE | FLAG_GONE | FLAG_ROOT;
@@ -530,7 +531,9 @@ impl NameIndex {
             return false;
         }
         let e = self.ext[iu] as usize;
-        e != 0 && self.exts.get(e).is_some_and(|x| crate::build::ext_weight(x) <= 0)
+        let known = e != 0
+            && self.exts.get(e).is_some_and(|x| crate::build::ext_weight(x) < 0 || crate::build::is_written_by_hand(x));
+        known && !crate::build::looks_generated(self.name(i))
     }
 
     /// 0 (most) to 31 (least): how much an entry likely matters to the

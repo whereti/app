@@ -75,7 +75,10 @@ fn weight(points: f64) -> u8 {
 impl Activity {
     /// Kept in `dir` (the folder of the index).
     pub fn open(dir: &Path) -> Activity {
-        let file = dir.join("activity.txt");
+        // 2: only known kinds of files count (0.0.18); what 0.0.17 learnt
+        // from a program's own data is dropped
+        let file = dir.join("activity-2.txt");
+        let _ = std::fs::remove_file(dir.join("activity.txt"));
         let off_marker = dir.join("activity-off");
         let on = !off_marker.exists();
         let mut folders = HashMap::new();

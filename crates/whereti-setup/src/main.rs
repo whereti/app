@@ -104,8 +104,12 @@ fn elevated_or_not(args: &str, direct: Step) -> Result<(), String> {
 }
 
 fn silent_install() -> Result<(), String> {
+    // an update keeps the user's choice about starting with Windows
+    let fresh = ops::installed_version().is_none();
     elevated_or_not("--do-install", ops::install)?;
-    ops::set_autostart(true);
+    if fresh {
+        ops::set_autostart(true);
+    }
     Ok(())
 }
 
@@ -149,7 +153,12 @@ impl Setup {
                 ops::set_autostart(false);
                 elevated_or_not("--do-uninstall", ops::uninstall).map(|()| ops::remove_user_settings())
             } else {
-                elevated_or_not("--do-install", ops::install).map(|()| ops::set_autostart(autostart))
+                // an update keeps the user's choice about starting with Windows
+                elevated_or_not("--do-install", ops::install).map(|()| {
+                    if !updated {
+                        ops::set_autostart(autostart);
+                    }
+                })
             };
             *state.lock().unwrap() = match (result, uninstall) {
                 (Ok(()), false) => State::Installed { updated },
@@ -431,7 +440,8 @@ impl eframe::App for Setup {
                     });
                     ui.add_space(14.0);
                     let fresh = !matches!(installed, Some(std::cmp::Ordering::Equal | std::cmp::Ordering::Greater));
-                    if fresh {
+                    // asked only the first time: an update keeps the choice made then
+                    if installed.is_none() {
                         ui.vertical_centered(|ui| {
                             let label = egui::RichText::new(tr("Start whereti with Windows")).size(13.0).color(l.text);
                             ui.checkbox(&mut self.autostart, label);
