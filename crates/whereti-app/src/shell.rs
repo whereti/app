@@ -41,7 +41,9 @@ pub enum Instance {
     AlreadyRunning,
 }
 
-pub fn claim_instance() -> Instance {
+/// `show`: ask a whereti that already runs to show its window (not for a
+/// launch that should stay hidden).
+pub fn claim_instance(show: bool) -> Instance {
     let (mutex_name, event_name) = (wide("Local\\whereti-app"), wide("Local\\whereti-app-show"));
     // SAFETY: plain object creation; handles live for the whole process.
     unsafe {
@@ -51,10 +53,23 @@ pub fn claim_instance() -> Instance {
         if first {
             Instance::First { show_requests: event }
         } else {
-            SetEvent(event);
+            if show {
+                SetEvent(event);
+            }
             Instance::AlreadyRunning
         }
     }
+}
+
+/// Windows 11 can reopen apps that were running when the PC restarted; it
+/// would start whereti without `--hidden` and bring up its window. This
+/// tells Windows to reopen it with `--hidden` (after an update or a restart,
+/// not after a crash or hang).
+pub fn register_restart_hidden() {
+    use windows_sys::Win32::System::Recovery::{RegisterApplicationRestart, RESTART_NO_CRASH, RESTART_NO_HANG};
+    let args = wide("--hidden");
+    // SAFETY: a NUL-terminated string that Windows copies.
+    unsafe { RegisterApplicationRestart(args.as_ptr(), RESTART_NO_CRASH | RESTART_NO_HANG) };
 }
 
 /// Calls `on_show` each time another launch asks this instance to show itself.

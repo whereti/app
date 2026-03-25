@@ -33,12 +33,16 @@ pub(crate) use whereti_i18n::{trf, trn};
 use eframe::egui::{self, FontData, FontDefinitions, FontFamily};
 
 fn main() -> eframe::Result<()> {
-    let show_requests = match shell::claim_instance() {
+    // --hidden: started with Windows (or restored by it after a restart):
+    // wait in the tray, and never bring up a whereti that already runs
+    let visible = !std::env::args().any(|a| a == "--hidden");
+    let show_requests = match shell::claim_instance(visible) {
         shell::Instance::First { show_requests } => show_requests,
-        // Another whereti is running: it has been asked to show its window.
+        // Another whereti is running (asked to show its window unless --hidden).
         shell::Instance::AlreadyRunning => return Ok(()),
     };
-    let visible = !std::env::args().any(|a| a == "--hidden");
+    // if Windows reopens whereti after a restart, it must come back hidden too
+    shell::register_restart_hidden();
     tray::set_supporter(license::load().is_some());
     let icon = egui::IconData { rgba: tray::logo_rgba_64(), width: 64, height: 64 };
     let options = eframe::NativeOptions {
