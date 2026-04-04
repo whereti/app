@@ -1,5 +1,7 @@
 //! The installer carries the four programs it installs and ONNX Runtime
-//! (for recognising what is in photos; Microsoft's signed DLL). They are packed at
+//! (for recognising what is in photos; Microsoft's signed DLL), each
+//! compressed with zstd at its highest level (the installer is less than
+//! half the size; unpacking takes a fraction of a second). They are packed at
 //! build time from `WHERETI_PAYLOAD` (set by scripts/package.ps1, which signs
 //! them first for a production release) or, for a local build, from
 //! target/release.
@@ -26,7 +28,22 @@ fn main() {
         }
         println!("cargo:rerun-if-changed={}", path.display());
     }
-    println!("cargo:rustc-env=WHERETI_PAYLOAD_DIR={}", dir.display());
+    let out = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR"));
+    let mut installed = 0u64;
+    for f in FILES {
+        let raw = std::fs::read(dir.join(f)).expect("reading a program to pack");
+        installed += raw.len() as u64;
+        let mut enc = zstd::stream::Encoder::new(Vec::new(), 22).expect("zstd");
+        enc.long_distance_matching(true).expect("zstd");
+        enc.window_log(27).expect("zstd");
+        let _ = enc.multithread(std::thread::available_parallelism().map_or(1, |n| n.get() as u32));
+        std::io::Write::write_all(&mut enc, &raw).expect("compressing");
+        let packed = enc.finish().expect("compressing");
+        std::fs::write(out.join(format!("{f}.zst")), packed).expect("writing the packed program");
+    }
+    println!("cargo:rustc-env=WHERETI_PAYLOAD_DIR={}", out.display());
+    // what the programs take once unpacked (Settings > Apps shows it)
+    println!("cargo:rustc-env=WHERETI_INSTALLED_KB={}", installed / 1024);
 
     // the whereti icon and file details on the installer itself
     let ico = concat!(env!("CARGO_MANIFEST_DIR"), "/../../media/icons/whereti.ico");

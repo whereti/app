@@ -90,7 +90,7 @@ impl Snippets {
                             t
                         }
                     };
-                    let snippet = text.and_then(|t| make(&t, &needles)).or_else(|| place_line(&path, &needles));
+                    let snippet = text.and_then(|t| make(&t, &needles)).or_else(|| photo_line(&path, &needles));
                     if tx.send((needles, path, snippet)).is_err() {
                         return;
                     }
@@ -144,33 +144,59 @@ impl Snippets {
 
 /// The excerpt around the first match: the whole phrase if the text has it,
 /// else the first (long enough) word. Whitespace is collapsed.
-/// A photo found by where it was taken: "Rome, Lazio, Italy", plus the
-/// name that matched when it is another one ("· Roma").
-fn place_line(path: &str, needles: &[String]) -> Option<Snippet> {
+/// A photo found by where it was taken or by what it shows: "câine ·
+/// Rome, Lazio, Italy". The tags live only in the service's index, so the
+/// app names the label the typed word matched (its photo's own text did not
+/// have it), next to the place read from the photo.
+fn photo_line(path: &str, needles: &[String]) -> Option<Snippet> {
     let ext = path.rsplit_once('.')?.1.to_ascii_lowercase();
     let head = match ext.as_str() {
         "heic" | "heif" => 64 << 20,
-        "jpg" | "jpeg" | "jpe" | "jfif" | "tif" | "tiff" | "png" | "webp" => 512 << 10,
+        "jpg" | "jpeg" | "jpe" | "jfif" | "tif" | "tiff" | "png" | "webp" | "bmp" | "gif" => 512 << 10,
         _ => return None,
     };
-    use std::io::Read;
-    let mut bytes = Vec::new();
-    std::fs::File::open(path).ok()?.take(head).read_to_end(&mut bytes).ok()?;
-    let (lat, lon) = whereti_places::gps(&bytes)?;
-    let place = whereti_places::place_of(lat, lon)?;
-    let label = place.label();
-    if let Some(s) = make(&label, needles) {
-        return Some(s);
-    }
-    let names = place.city.iter().chain(place.region.iter()).chain(place.country.iter());
-    let matched: Vec<&String> =
-        names.filter(|n| needles.iter().any(|w| whereti_query::fold(n).contains(w.as_str()))).take(2).collect();
-    let text = if matched.is_empty() {
-        label
-    } else {
-        format!("{label} · {}", matched.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "))
+    let tag = matched_label(needles);
+    let place = {
+        use std::io::Read;
+        let mut bytes = Vec::new();
+        std::fs::File::open(path).ok().and_then(|f| f.take(head).read_to_end(&mut bytes).ok());
+        whereti_places::gps(&bytes).and_then(|(lat, lon)| whereti_places::place_of(lat, lon))
+    };
+    let place_text = place.as_ref().map(|place| {
+        let label = place.label();
+        if make(&label, needles).is_some() {
+            return label;
+        }
+        // the place matched by another of its names ("roma" for Rome)
+        let names = place.city.iter().chain(place.region.iter()).chain(place.country.iter());
+        let matched: Vec<&String> =
+            names.filter(|n| needles.iter().any(|w| whereti_query::fold(n).contains(w.as_str()))).take(2).collect();
+        if matched.is_empty() {
+            label
+        } else {
+            format!("{label} · {}", matched.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "))
+        }
+    });
+    let text = match (tag, place_text) {
+        (Some(t), Some(p)) => format!("{t} · {p}"),
+        (Some(t), None) => t.to_string(),
+        (None, Some(p)) => p,
+        (None, None) => return None,
     };
     make(&text, needles).or(Some(Snippet { marks: vec![false; text.chars().count()], text }))
+}
+
+/// The label of the photo model that a typed word names, in the language
+/// the word was typed in ("câine", "Hund", "dog").
+fn matched_label(needles: &[String]) -> Option<&'static str> {
+    for w in needles.iter().filter(|w| w.chars().count() >= 3) {
+        for names in whereti_extract::tags::labels() {
+            if let Some(name) = names.iter().find(|n| whereti_query::fold(n) == *w) {
+                return Some(name);
+            }
+        }
+    }
+    None
 }
 
 pub fn make(text: &str, needles: &[String]) -> Option<Snippet> {

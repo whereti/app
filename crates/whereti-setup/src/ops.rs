@@ -15,14 +15,14 @@ use windows::Win32::System::Registry::{
     REG_SZ, RRF_RT_REG_SZ,
 };
 
-/// The programs the installer carries, packed at build time (see build.rs).
+/// The programs the installer carries, compressed at build time (see build.rs).
 pub const PAYLOAD: [(&str, &[u8]); 5] = [
-    ("whereti.exe", include_bytes!(concat!(env!("WHERETI_PAYLOAD_DIR"), "/whereti.exe"))),
-    ("whereti-service.exe", include_bytes!(concat!(env!("WHERETI_PAYLOAD_DIR"), "/whereti-service.exe"))),
-    ("whereti-extract.exe", include_bytes!(concat!(env!("WHERETI_PAYLOAD_DIR"), "/whereti-extract.exe"))),
-    ("wt.exe", include_bytes!(concat!(env!("WHERETI_PAYLOAD_DIR"), "/wt.exe"))),
+    ("whereti.exe", include_bytes!(concat!(env!("WHERETI_PAYLOAD_DIR"), "/whereti.exe.zst"))),
+    ("whereti-service.exe", include_bytes!(concat!(env!("WHERETI_PAYLOAD_DIR"), "/whereti-service.exe.zst"))),
+    ("whereti-extract.exe", include_bytes!(concat!(env!("WHERETI_PAYLOAD_DIR"), "/whereti-extract.exe.zst"))),
+    ("wt.exe", include_bytes!(concat!(env!("WHERETI_PAYLOAD_DIR"), "/wt.exe.zst"))),
     // ONNX Runtime, Microsoft's signed build: what is in photos (PLAN.md §55)
-    ("onnxruntime.dll", include_bytes!(concat!(env!("WHERETI_PAYLOAD_DIR"), "/onnxruntime.dll"))),
+    ("onnxruntime.dll", include_bytes!(concat!(env!("WHERETI_PAYLOAD_DIR"), "/onnxruntime.dll.zst"))),
 ];
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -79,8 +79,9 @@ pub fn install(log: &mut dyn FnMut(&str)) -> Result<(), String> {
 
     log("Copying the files…");
     std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
-    for (name, bytes) in PAYLOAD {
-        write_file(&dir.join(name), bytes)?;
+    for (name, packed) in PAYLOAD {
+        let bytes = unpack(packed).map_err(|e| format!("the installer is damaged ({name}: {e})"))?;
+        write_file(&dir.join(name), &bytes)?;
     }
     let me = std::env::current_exe().map_err(|e| e.to_string())?;
     let uninstaller = dir.join("uninstall.exe");
@@ -100,6 +101,15 @@ pub fn install(log: &mut dyn FnMut(&str)) -> Result<(), String> {
     shortcut(&start_menu_link(), &dir.join("whereti.exe"))?;
     register_uninstall(&dir)?;
     Ok(())
+}
+
+/// A program from the installer (zstd, see build.rs).
+fn unpack(packed: &[u8]) -> std::io::Result<Vec<u8>> {
+    let mut dec = zstd::stream::Decoder::new(packed)?;
+    dec.window_log_max(27)?;
+    let mut out = Vec::new();
+    std::io::Read::read_to_end(&mut dec, &mut out)?;
+    Ok(out)
 }
 
 /// Writes next to the target, then renames: a half-written program is never
@@ -256,7 +266,9 @@ fn shortcut(link: &Path, target: &Path) -> Result<(), String> {
 
 /// The entry in Settings → Apps (and Control Panel → Programs).
 fn register_uninstall(dir: &Path) -> Result<(), String> {
-    let size_kb: u32 = PAYLOAD.iter().map(|(_, b)| b.len() as u32).sum::<u32>() / 1024;
+    // the programs unpacked, plus the uninstaller (this installer)
+    let me = std::env::current_exe().ok().and_then(|p| std::fs::metadata(p).ok()).map_or(0, |m| m.len() / 1024);
+    let size_kb = (env!("WHERETI_INSTALLED_KB").parse::<u64>().unwrap_or(0) + me).min(u32::MAX as u64) as u32;
     let uninstall = format!("\"{}\" /uninstall", dir.join("uninstall.exe").display());
     let strings = [
         ("DisplayName", "whereti".to_string()),
@@ -434,5 +446,20 @@ pub fn run_elevated(args: &str) -> Result<(), String> {
 pub fn remove_user_settings() {
     if let Some(appdata) = std::env::var_os("APPDATA") {
         let _ = std::fs::remove_dir_all(PathBuf::from(appdata).join("whereti"));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn every_packed_program_unpacks_whole() {
+        let mut total = 0u64;
+        for (name, packed) in super::PAYLOAD {
+            let bytes = super::unpack(packed).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(&bytes[..2], b"MZ", "{name} is not a Windows program");
+            assert!(bytes.len() > packed.len(), "{name} was not compressed");
+            total += bytes.len() as u64;
+        }
+        assert_eq!(total / 1024, env!("WHERETI_INSTALLED_KB").parse::<u64>().unwrap());
     }
 }
