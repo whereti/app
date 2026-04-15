@@ -636,11 +636,12 @@ impl WheretiApp {
             ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
                 ui.add_space(6.0);
                 // a supporter: quiet grey text, only the heart in amber
-                let (text, color, heart) = match &self.settings.license {
-                    Some(l) => (trf!("Supporter: {name}", name = l.name), p.text3, supporter_gold(p)),
-                    None => (tr("Support whereti").to_string(), p.accent, p.accent),
+                let (text, color, heart, beat) = match &self.settings.license {
+                    Some(l) => (trf!("Supporter: {name}", name = l.name), p.text3, supporter_gold(p), 1.0),
+                    // not a supporter yet: a red heart that beats now and then
+                    None => (tr("Support whereti").to_string(), p.accent, heart_red(p), self.heartbeat(ui.ctx())),
                 };
-                if support_link(ui, p, &text, color, heart).clicked() {
+                if support_link(ui, p, &text, color, heart, beat).clicked() {
                     self.settings.section = crate::settings::Section::Support;
                     self.page = Page::Settings;
                 }
@@ -1571,7 +1572,31 @@ pub(crate) fn supporter_gold(p: &Palette) -> Color32 {
     }
 }
 
-fn support_link(ui: &mut egui::Ui, p: &Palette, text: &str, color: Color32, heart_color: Color32) -> egui::Response {
+/// The heart of "Support whereti": red, a little lighter on dark themes.
+fn heart_red(p: &Palette) -> Color32 {
+    if p.dark {
+        Color32::from_rgb(255, 107, 107)
+    } else {
+        Color32::from_rgb(226, 52, 61)
+    }
+}
+
+/// How large the heart is during a heartbeat: two quick beats ("lub-dub")
+/// every `BEAT_EVERY`, the heart growing ~20%, then at rest.
+fn heart_scale(t: f32) -> f32 {
+    let bump = |start: f32, len: f32, height: f32| {
+        if (start..start + len).contains(&t) {
+            height * (std::f32::consts::PI * (t - start) / len).sin()
+        } else {
+            0.0
+        }
+    };
+    1.0 + bump(0.0, 0.22, 0.22) + bump(0.30, 0.26, 0.14)
+}
+
+const BEAT_EVERY: f32 = 6.0;
+
+fn support_link(ui: &mut egui::Ui, p: &Palette, text: &str, color: Color32, heart_color: Color32, beat: f32) -> egui::Response {
     let font = FontId::new(13.0, medium());
     let g = ui.painter().layout_no_wrap(text.to_string(), font, color);
     let size = Vec2::new(g.size().x + 22.0, g.size().y.max(18.0) + 8.0);
@@ -1580,13 +1605,31 @@ fn support_link(ui: &mut egui::Ui, p: &Palette, text: &str, color: Color32, hear
     if resp.hovered() {
         ui.painter().rect_filled(rect.expand(2.0), 8.0, p.hover);
     }
-    let heart = Rect::from_center_size(Pos2::new(rect.left() + 8.0, rect.center().y), Vec2::splat(13.0));
+    let heart = Rect::from_center_size(Pos2::new(rect.left() + 8.0, rect.center().y), Vec2::splat(13.0 * beat));
     crate::icons::paint(ui.painter(), heart, Icon::Heart, heart_color);
     ui.painter().galley(Pos2::new(rect.left() + 22.0, rect.center().y - g.size().y / 2.0), g, color);
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 impl WheretiApp {
+    /// The heart's size now, and the next repaint it needs. Still when
+    /// Windows' animations are off; asks for frames only while the window
+    /// is shown (hidden, the app must not wake up for it).
+    fn heartbeat(&self, ctx: &egui::Context) -> f32 {
+        static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+        static ANIMATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ANIMATE.get_or_init(animations_on) || !self.visible {
+            return 1.0;
+        }
+        let t = START.get_or_init(Instant::now).elapsed().as_secs_f32() % BEAT_EVERY;
+        if t < 0.6 {
+            ctx.request_repaint();
+        } else {
+            ctx.request_repaint_after(std::time::Duration::from_secs_f32(BEAT_EVERY - t));
+        }
+        heart_scale(t)
+    }
+
     /// After a license is activated or removed: the logo everywhere, and a
     /// little confetti for a new supporter.
     pub(crate) fn supporter_changed(&mut self, ctx: &egui::Context, celebrate: bool) {

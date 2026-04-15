@@ -172,6 +172,40 @@ fn pixels(bytes: &[u8]) -> windows::core::Result<Vec<f32>> {
     Ok(out)
 }
 
+/// A picture to show (the preview): decoded by Windows (JPEG, PNG, HEIC,
+/// WebP, TIFF, BMP, GIF), turned by EXIF, at most `max_side` pixels on its
+/// longer side. `(width, height, RGBA)`.
+pub fn picture(bytes: &[u8], max_side: u32) -> Result<(u32, u32, Vec<u8>), String> {
+    let run = || -> windows::core::Result<(u32, u32, Vec<u8>)> {
+        let stream = crate::ocr::memory_stream(bytes)?;
+        let decoder = BitmapDecoder::CreateAsync(&stream)?.join()?;
+        let (ow, oh) = (decoder.OrientedPixelWidth()?, decoder.OrientedPixelHeight()?);
+        let scale = (max_side as f64 / ow.max(oh).max(1) as f64).min(1.0);
+        let (sw, sh) = (decoder.PixelWidth()?, decoder.PixelHeight()?);
+        let transform = BitmapTransform::new()?;
+        transform.SetScaledWidth(((sw as f64 * scale).round() as u32).max(1))?;
+        transform.SetScaledHeight(((sh as f64 * scale).round() as u32).max(1))?;
+        transform.SetInterpolationMode(BitmapInterpolationMode::Fant)?;
+        let bitmap = decoder
+            .GetSoftwareBitmapTransformedAsync(
+                BitmapPixelFormat::Rgba8,
+                BitmapAlphaMode::Straight,
+                &transform,
+                ExifOrientationMode::RespectExifOrientation,
+                ColorManagementMode::ColorManageToSRgb,
+            )?
+            .join()?;
+        let (w, h) = (bitmap.PixelWidth()? as u32, bitmap.PixelHeight()? as u32);
+        let buffer = Buffer::Create(w * h * 4)?;
+        bitmap.CopyToBuffer(&buffer)?;
+        let reader = DataReader::FromBuffer(&buffer)?;
+        let mut rgba = vec![0u8; buffer.Length()? as usize];
+        reader.ReadBytes(&mut rgba)?;
+        Ok((w, h, rgba))
+    };
+    run().map_err(|e| e.message().to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

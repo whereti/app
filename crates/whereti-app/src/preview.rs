@@ -33,6 +33,9 @@ pub enum Content {
     /// A folder: its first entries (folders first), and how many there are.
     Folder { entries: Vec<(String, bool)>, folders: usize, files: usize },
     Text { text: String, truncated: bool, mono: bool },
+    /// A photo: the picture itself (RGBA, already scaled down), where it was
+    /// taken, and the words read in it (OCR), if any.
+    Picture { width: u32, height: u32, rgba: std::sync::Arc<Vec<u8>>, place: Option<String>, text: String },
     /// Nothing to show for this type (images, video, archives…).
     NoPreview,
     Failed(String),
@@ -64,6 +67,8 @@ pub struct Preview {
     /// Highlighted text, rebuilt when the document or the query changes.
     job: Option<Highlighted>,
     scroll_to_match: bool,
+    /// The shown photo, as a texture (made on the UI thread).
+    picture: Option<(String, egui::TextureHandle)>,
 }
 
 impl Preview {
@@ -74,7 +79,7 @@ impl Preview {
             .name("preview".into())
             .spawn(move || worker(jobs, out, wake))
             .expect("preview thread");
-        Preview { open, tx, rx, current: None, cache: VecDeque::new(), job: None, scroll_to_match: false }
+        Preview { open, tx, rx, current: None, cache: VecDeque::new(), job: None, scroll_to_match: false, picture: None }
     }
 
     /// Call every frame with the selected row; starts loading when it changed.
@@ -249,6 +254,31 @@ impl Preview {
                 let (text, truncated, mono) = (text.clone(), *truncated, *mono);
                 self.text_view(ui, p, &text, truncated, mono, needles, took);
             }
+            Content::Picture { width, height, rgba, place, text } => {
+                let (w, h, rgba, place, text) = (*width, *height, rgba.clone(), place.clone(), text.clone());
+                let path = self.current.clone().unwrap_or_default();
+                if self.picture.as_ref().is_none_or(|(p, _)| p != &path) {
+                    let image = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba);
+                    let texture = ui.ctx().load_texture("preview-picture", image, egui::TextureOptions::LINEAR);
+                    self.picture = Some((path, texture));
+                }
+                if let Some((_, texture)) = &self.picture {
+                    // the whole picture, as large as the pane allows
+                    let max_w = ui.available_width();
+                    let max_h = (ui.available_height() * 0.62).max(160.0);
+                    let scale = (max_w / w as f32).min(max_h / h as f32).min(1.0);
+                    let size = Vec2::new(w as f32 * scale, h as f32 * scale);
+                    ui.add(egui::Image::new((texture.id(), size)).corner_radius(10.0));
+                }
+                if let Some(place) = place {
+                    ui.add_space(6.0);
+                    ui.label(egui::RichText::new(place).size(12.5).color(p.text2));
+                }
+                if !text.trim().is_empty() {
+                    ui.add_space(8.0);
+                    self.text_view(ui, p, &text, false, false, needles, took);
+                }
+            }
         }
     }
 
@@ -399,7 +429,28 @@ fn worker(jobs: Receiver<String>, out: Sender<Loaded>, wake: impl Fn()) {
 const FOLDER_ENTRIES: usize = 60;
 
 fn load(path: &str, sandbox: Option<&Sandbox>) -> Content {
-    load_with(path, sandbox, SHOW_CHARS)
+    picture(path, sandbox).unwrap_or_else(|| load_with(path, sandbox, SHOW_CHARS))
+}
+
+/// Longer side of the picture shown in the preview.
+const PICTURE_SIDE: u32 = 900;
+
+/// A photo for the preview: the picture (decoded by Windows, like Explorer's
+/// thumbnails), where it was taken, and its words (OCR, in the sandbox).
+/// `None` when it is not a picture Windows can decode.
+fn picture(path: &str, sandbox: Option<&Sandbox>) -> Option<Content> {
+    let ext = Path::new(path).extension().and_then(|e| e.to_str())?.to_ascii_lowercase();
+    if whereti_extract::kind_of(&ext) != Some(Kind::Image) {
+        return None;
+    }
+    let bytes = whereti_extract::worker::read_shared(Path::new(path), 64 << 20).ok()?;
+    let (width, height, rgba) = whereti_extract::tags::picture(&bytes, PICTURE_SIDE).ok()?;
+    let place = whereti_places::gps(&bytes).and_then(|(lat, lon)| whereti_places::place_of(lat, lon)).map(|p| p.label());
+    let text = match load_with(path, sandbox, SHOW_CHARS) {
+        Content::Text { text, .. } => text,
+        _ => String::new(),
+    };
+    Some(Content::Picture { width, height, rgba: std::sync::Arc::new(rgba), place, text })
 }
 
 /// The file's text (or what it is instead), at most `max_chars`.
