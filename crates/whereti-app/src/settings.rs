@@ -701,10 +701,16 @@ fn support(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
         ui.label(egui::RichText::new(tr("Paste it from the e-mail. No internet is needed to activate it.")).size(12.5).color(p.text2));
         ui.add_space(10.0);
         ui.horizontal(|ui| {
+            // the field takes everything up to the button, at the button's
+            // height, so both end flush with the card
+            let gap = ui.spacing().item_spacing.x;
+            let width = (ui.available_width() - button_width(ui, tr("Activate")) - gap).max(160.0);
             let field = egui::TextEdit::singleline(&mut app.settings.license_input)
                 .hint_text("WHERETI-…")
-                .desired_width((ui.available_width() - 130.0).max(160.0))
-                .font(FontId::monospace(12.5));
+                .font(FontId::monospace(12.5))
+                .align(egui::Align2::LEFT_CENTER)
+                .min_size(Vec2::new(width, BUTTON_HEIGHT))
+                .desired_width(width);
             ui.add(field);
             if button(ui, p, tr("Activate"), true).clicked() {
                 match crate::license::parse(&app.settings.license_input) {
@@ -1096,10 +1102,18 @@ fn path_list(ui: &mut egui::Ui, p: &Palette, paths: &[String], icons: &mut crate
 }
 
 /// A pill button; `primary` = solid accent.
+const BUTTON_HEIGHT: f32 = 34.0;
+const BUTTON_PADDING: f32 = 30.0;
+
+/// How wide `button` draws `text` (to lay out what is beside it).
+pub(crate) fn button_width(ui: &egui::Ui, text: &str) -> f32 {
+    ui.painter().layout_no_wrap(text.to_string(), FontId::new(13.5, semibold()), Color32::WHITE).size().x + BUTTON_PADDING
+}
+
 pub(crate) fn button(ui: &mut egui::Ui, p: &Palette, text: &str, primary: bool) -> egui::Response {
     let color = if primary { p.on_accent } else { p.text };
     let galley = ui.painter().layout_no_wrap(text.to_string(), FontId::new(13.5, semibold()), color);
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(galley.size().x + 30.0, 34.0), Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(galley.size().x + BUTTON_PADDING, BUTTON_HEIGHT), Sense::click());
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, text));
     let fill = match (primary, resp.hovered()) {
         (true, false) => p.accent,
