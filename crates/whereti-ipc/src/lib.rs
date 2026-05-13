@@ -28,7 +28,7 @@ use windows_sys::Win32::System::Pipes::{
 };
 
 pub const PIPE_NAME: &str = r"\\.\pipe\whereti";
-pub const PROTOCOL_VERSION: u32 = 9;
+pub const PROTOCOL_VERSION: u32 = 10;
 const MAX_MESSAGE: usize = 64 << 20;
 
 /// The account that created the pipe (OW), SYSTEM and Administrators: full
@@ -119,6 +119,9 @@ pub struct SearchReply {
     pub warnings: Vec<String>,
     /// Time spent searching inside the service.
     pub micros: u64,
+    /// The last `close` rows are close matches (a word one letter off),
+    /// not counted in `total`.
+    pub close: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -598,6 +601,7 @@ mod tests {
             rows: vec![Row { path: r"C:\Users\ana\Mașină.docx".into(), is_dir: false, size: 10, modified: 5, flags: 0 }],
             warnings: vec![],
             micros: 1200,
+            close: 0,
         });
         let mut buf = Vec::new();
         write_message(&mut buf, &resp).unwrap();

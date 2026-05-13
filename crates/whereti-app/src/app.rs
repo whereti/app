@@ -91,6 +91,9 @@ pub struct WheretiApp {
     total: u64,
     /// `rows[content_start..]` were found in file contents (not by name).
     content_start: Option<usize>,
+    /// `rows[close_start..]` (up to `content_start`) are close matches: a
+    /// word of the query one letter off.
+    close_start: Option<usize>,
     /// Content result -> the other files with exactly the same content.
     copies: std::collections::HashMap<String, Vec<String>>,
     /// A content search for the current query is on its way.
@@ -165,6 +168,7 @@ impl WheretiApp {
             rows: Vec::new(),
             total: 0,
             content_start: None,
+            close_start: None,
             copies: Default::default(),
             content_pending: false,
             round_trip: Duration::ZERO,
@@ -308,7 +312,9 @@ impl WheretiApp {
                         .iter()
                         .map(|it| Row { path: it.target.clone(), is_dir: false, size: 0, modified: 0, flags: 0 })
                         .collect();
+                    let close = reply.close as usize;
                     rows.extend(reply.rows);
+                    self.close_start = (close > 0).then(|| rows.len() - close.min(rows.len()));
                     self.launch_items = launch;
                     self.rows = rows;
                     self.total = reply.total;
@@ -717,6 +723,8 @@ impl WheretiApp {
             tr("RECENT").to_string()
         } else if launch_n > 0 {
             tr("APPS AND SETTINGS").to_string()
+        } else if self.close_start == Some(0) {
+            tr("CLOSE MATCHES").to_string()
         } else if self.content_start == Some(0) {
             tr("NO NAME MATCHES").to_string()
         } else {
@@ -740,14 +748,19 @@ impl WheretiApp {
         // Items: apps and settings, then the files' header, the files, then
         // "found in contents" and those files.
         let content_start = self.content_start;
+        let close_start = self.close_start;
         let section = self.content_section_label();
         let mut labels: Vec<String> = Vec::new();
         let mut list: Vec<Item> = Vec::with_capacity(self.rows.len() + 2);
         let mut item_of_row = Vec::with_capacity(self.rows.len());
         for i in 0..self.rows.len() {
-            if launch_n > 0 && i == launch_n && content_start != Some(i) {
+            if launch_n > 0 && i == launch_n && content_start != Some(i) && close_start != Some(i) {
                 let files = if self.total == 0 { tr("FILES").to_string() } else { trn!("{n} RESULT|{n} RESULTS", self.total) };
                 labels.push(files);
+                list.push(Item::Section(labels.len() - 1));
+            }
+            if close_start == Some(i) && i > 0 {
+                labels.push(tr("CLOSE MATCHES").to_string());
                 list.push(Item::Section(labels.len() - 1));
             }
             if content_start == Some(i) {

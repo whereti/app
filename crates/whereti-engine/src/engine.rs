@@ -228,6 +228,7 @@ impl Engine {
                     rows,
                     warnings: res.warnings,
                     micros: t.elapsed().as_micros() as u64,
+                    close: res.close as u64,
                 })
             }
             Request::GetConfig => {

@@ -76,7 +76,11 @@ fn run_via_service(mut client: Client, args: &SearchArgs) -> Result<(), String> 
     for w in &reply.warnings {
         println!("note: {w}");
     }
-    for r in &reply.rows {
+    let first_close = reply.rows.len() - (reply.close as usize).min(reply.rows.len());
+    for (k, r) in reply.rows.iter().enumerate() {
+        if k == first_close {
+            println!("close matches (one letter off):");
+        }
         print_row(r, tz);
     }
     println!();
@@ -174,7 +178,11 @@ fn run_local(args: &SearchArgs) -> Result<(), String> {
     for w in &results.warnings {
         println!("note: {w}");
     }
-    for &i in &results.hits {
+    let first_close = results.hits.len() - results.close;
+    for (k, &i) in results.hits.iter().enumerate() {
+        if k == first_close {
+            println!("close matches (one letter off):");
+        }
         let row = Row {
             path: index.full_path(i),
             is_dir: index.is_dir(i),

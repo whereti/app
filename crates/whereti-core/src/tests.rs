@@ -106,8 +106,46 @@ fn find(idx: &NameIndex, q: &str) -> Vec<String> {
 
 fn find_sorted(idx: &NameIndex, q: &str, sort: SortBy) -> Vec<String> {
     let r = idx.search(&parse(q, &ctx()), &SearchOptions { limit: 100, sort });
-    assert_eq!(r.total, r.hits.len());
-    r.hits.iter().map(|&i| idx.full_path(i)).collect()
+    assert_eq!(r.total, r.hits.len() - r.close);
+    r.hits[..r.total].iter().map(|&i| idx.full_path(i)).collect()
+}
+
+/// The close matches of `q` (see `SearchResults::close`).
+fn close(idx: &NameIndex, q: &str) -> Vec<String> {
+    let r = idx.search(&parse(q, &ctx()), &SearchOptions::default());
+    r.hits[r.hits.len() - r.close..].iter().map(|&i| idx.full_path(i)).collect()
+}
+
+#[test]
+fn a_word_one_letter_off_finds_close_matches_after_the_exact_ones() {
+    let idx = index();
+    // swapped, missing, extra and wrong letters
+    for typo in ["facutra", "factra", "facttura", "fectura"] {
+        assert!(find(&idx, typo).is_empty(), "{typo}");
+        assert_eq!(close(&idx, typo), vec![r"C:\Users\ana\Documents\factura_enel.PDF"], "{typo}");
+    }
+    // the other conditions still hold
+    assert!(close(&idx, "facutra ext:docx").is_empty());
+    assert_eq!(close(&idx, "contarct ext:pdf"), vec![r"D:\Acte\contract.pdf"]);
+    // 3 letters are not corrected, 4 are
+    assert!(close(&idx, "pln").is_empty());
+    assert_eq!(close(&idx, "plna").len(), 2);
+    // enough exact hits: no close ones
+    assert!(close(&idx, "txt").is_empty());
+    // close matches come after the exact ones and never repeat them
+    let r = idx.search(&parse("raport", &ctx()), &SearchOptions::default());
+    assert_eq!(r.hits.len(), r.total + r.close);
+    let exact = &r.hits[..r.total];
+    assert!(r.hits[r.total..].iter().all(|h| !exact.contains(h)));
+}
+
+#[test]
+fn near_words_are_one_letter_off() {
+    let v = search::near_words("abcd");
+    assert!(v.contains(&"bacd".to_string()) && v.contains(&"abxcd".to_string()) && v.contains(&"abcx".to_string()));
+    assert!(!v.contains(&"abcd".to_string()));
+    assert!(!v.contains(&"abc".to_string()), "a missing letter only from 5 letters up");
+    assert!(search::near_words("abcde").contains(&"abde".to_string()));
 }
 
 fn names(idx: &NameIndex) -> Vec<&str> {

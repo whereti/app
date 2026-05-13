@@ -264,7 +264,8 @@ const REFRESHED: usize = 60;
 /// when it is closed. So the first rows, the ones on screen, take their size
 /// and date from the disk itself, and files deleted a moment ago are dropped.
 fn refresh_rows(reply: &mut SearchReply) {
-    let mut gone = 0u64;
+    let (mut gone, mut gone_close) = (0u64, 0u64);
+    let first_close = reply.rows.len().saturating_sub(reply.close as usize);
     let mut k = 0;
     reply.rows.retain_mut(|row| {
         k += 1;
@@ -282,11 +283,16 @@ fn refresh_rows(reply: &mut SearchReply) {
                 true
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                gone += 1;
+                if k > first_close {
+                    gone_close += 1;
+                } else {
+                    gone += 1;
+                }
                 false
             }
             Err(_) => true,
         }
     });
     reply.total = reply.total.saturating_sub(gone);
+    reply.close = reply.close.saturating_sub(gone_close);
 }

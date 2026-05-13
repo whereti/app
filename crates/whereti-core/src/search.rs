@@ -49,7 +49,17 @@ pub struct SearchResults {
     pub hits: Vec<u32>,
     /// Parts of the query that could not be applied.
     pub warnings: Vec<String>,
+    /// The last `close` of `hits` are close matches: when a word found
+    /// (almost) nothing, names with that word one letter off ("facutra"
+    /// finds "factura"). Not counted in `total`.
+    pub close: usize,
 }
+
+/// A word finds "almost nothing" below this many hits: then close matches
+/// are looked for too.
+const FEW_HITS: usize = 3;
+/// Words shorter than this are not corrected (too many near words).
+const MIN_CLOSE_LEN: usize = 4;
 
 enum Matcher {
     Text(Box<Finder<'static>>),
@@ -105,12 +115,61 @@ impl NameIndex {
         });
         let total = hits.len();
         let used = if opts.sort == SortBy::Relevance { self.usage_positions(&hits, usage) } else { Vec::new() };
-        let hits = self.top(hits, opts, rank_needle.as_deref(), &used, active);
+        let exact = hits.clone();
+        let mut hits = self.top(hits, opts, rank_needle.as_deref(), &used, active.clone());
+        let mut close = 0;
+        if total < FEW_HITS && hits.len() < opts.limit {
+            let near = self.close_entries(query, &exact);
+            if !near.is_empty() {
+                let rest = SearchOptions { limit: opts.limit - hits.len(), ..*opts };
+                let used = if opts.sort == SortBy::Relevance { self.usage_positions(&near, usage) } else { Vec::new() };
+                let near = self.top(near, &rest, None, &used, active);
+                close = near.len();
+                hits.extend(near);
+            }
+        }
         if trace_enabled() {
             let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
-            eprintln!("[trace] match {:.2} ms · rank {:.2} ms · {} hits", ms(t_eval), ms(t0.elapsed() - t_eval), total);
+            eprintln!("[trace] match {:.2} ms · rank {:.2} ms · {} hits, {} close", ms(t_eval), ms(t0.elapsed() - t_eval), total, close);
         }
-        SearchResults { total, hits, warnings }
+        SearchResults { total, hits, warnings, close }
+    }
+
+    /// Close matches of `query`: its longest plain word (4+ letters) one
+    /// letter off (one letter swapped with the next, missing, extra or
+    /// wrong), every other condition as typed. In index order, without the
+    /// entries of `exact` (sorted).
+    fn close_entries(&self, query: &Query, exact: &[u32]) -> Vec<u32> {
+        let word = query
+            .clauses
+            .iter()
+            .enumerate()
+            .filter_map(|(ci, c)| match (c.negated, c.any_of.as_slice()) {
+                (false, [Term::Text(t)]) if t.chars().count() >= MIN_CLOSE_LEN => Some((ci, t.as_str())),
+                _ => None,
+            })
+            .max_by_key(|(_, t)| t.len());
+        let Some((ci, word)) = word else { return Vec::new() };
+        let variants = near_words(word);
+        if variants.is_empty() || self.is_empty() {
+            return Vec::new();
+        }
+        let mut warnings = Vec::new();
+        let mut clauses = self.compile_clauses(query, &mut warnings);
+        clauses.remove(ci);
+        let refs: Vec<&str> = variants.iter().map(String::as_str).collect();
+        self.scan_names_any(&refs)
+            .par_chunks(8192)
+            .map(|chunk| {
+                let mut s = Scratch::default();
+                chunk
+                    .iter()
+                    .copied()
+                    .filter(|i| exact.binary_search(i).is_err() && (clauses.is_empty() || self.eval(&clauses, *i, &mut s)))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>()
+            .concat()
     }
 
     /// Every live entry matching `query`, unranked, in index order.
@@ -283,6 +342,12 @@ impl NameIndex {
 
     /// Every entry whose folded name contains `needle`, in index order.
     fn scan_names(&self, needle: &str) -> Vec<u32> {
+        self.scan_names_any(&[needle])
+    }
+
+    /// Every entry whose folded name contains any of `needles` (folded,
+    /// none empty), in index order. One pass, however many needles.
+    fn scan_names_any(&self, needles: &[&str]) -> Vec<u32> {
         // Entries added by live updates have no base name; they are in the tail.
         let n = self.name_off.len() - 1;
         const SKIP_BASE: u16 = FLAG_NON_ASCII | FLAG_TAIL | HIDDEN_FROM_SEARCH;
@@ -292,11 +357,13 @@ impl NameIndex {
         let ranges: Vec<(usize, usize)> = (0..n).step_by(per).map(|a| (a, (a + per).min(n))).collect();
 
         let mut primary: Vec<u32> = Vec::new();
-        if needle.is_ascii() {
+        // ASCII names can hold only the ASCII needles
+        let ascii: Vec<&str> = needles.iter().copied().filter(|n| n.is_ascii()).collect();
+        if !ascii.is_empty() {
             let ac = AhoCorasick::builder()
                 .ascii_case_insensitive(true)
-                .build([needle])
-                .expect("a single literal always builds");
+                .build(&ascii)
+                .expect("plain literals always build");
             primary = ranges
                 .par_iter()
                 .map(|&(a, b)| {
@@ -321,7 +388,7 @@ impl NameIndex {
         }
 
         // Non-ASCII names: search their folded copies.
-        let finder = Finder::new(needle.as_bytes());
+        let finder = AhoCorasick::new(needles).expect("plain literals always build");
         let alt: Vec<u32> = if self.alt_entry.is_empty() {
             Vec::new()
         } else {
@@ -338,8 +405,8 @@ impl NameIndex {
                     let mut pos = self.alt_off[a] as usize;
                     let mut k = a;
                     while pos < end {
-                        let Some(off) = finder.find(&self.alt_names[pos..end]) else { break };
-                        let at = pos + off;
+                        let Some(m) = finder.find(Input::new(&self.alt_names).range(pos..end)) else { break };
+                        let at = m.start();
                         while self.alt_off[k + 1] as usize <= at {
                             k += 1;
                         }
@@ -368,7 +435,7 @@ impl NameIndex {
                 }
                 folded.clear();
                 whereti_query::fold_into(&self.tail_names[k], &mut folded);
-                if finder.find(folded.as_bytes()).is_some() {
+                if finder.is_match(folded.as_bytes()) {
                     extra.push(e);
                 }
             }
@@ -777,6 +844,54 @@ fn merge_sorted(a: Vec<u32>, b: Vec<u32>) -> Vec<u32> {
     }
     out.extend_from_slice(&a[i..]);
     out.extend_from_slice(&b[j..]);
+    out.dedup();
+    out
+}
+
+/// Every word one letter off `word` (folded): two neighbouring letters
+/// swapped, a letter missing, an extra letter, a wrong letter (a-z, 0-9).
+/// Without `word` itself; a missing letter only from 5 letters up, so the
+/// variant still has 4.
+pub fn near_words(word: &str) -> Vec<String> {
+    const LETTERS: &str = "abcdefghijklmnopqrstuvwxyz0123456789";
+    let chars: Vec<char> = word.chars().collect();
+    let n = chars.len();
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |v: Vec<char>| {
+        let v: String = v.into_iter().collect();
+        if v != word {
+            out.push(v);
+        }
+    };
+    for i in 0..n.saturating_sub(1) {
+        if chars[i] != chars[i + 1] {
+            let mut v = chars.clone();
+            v.swap(i, i + 1);
+            push(v);
+        }
+    }
+    if n > MIN_CLOSE_LEN {
+        for i in 0..n {
+            let mut v = chars.clone();
+            v.remove(i);
+            push(v);
+        }
+    }
+    for i in 0..=n {
+        for c in LETTERS.chars() {
+            let mut v = chars.clone();
+            v.insert(i, c);
+            push(v);
+        }
+    }
+    for i in 0..n {
+        for c in LETTERS.chars().filter(|&c| c != chars[i]) {
+            let mut v = chars.clone();
+            v[i] = c;
+            push(v);
+        }
+    }
+    out.sort_unstable();
     out.dedup();
     out
 }

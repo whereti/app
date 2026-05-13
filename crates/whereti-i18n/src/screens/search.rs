@@ -304,6 +304,17 @@ pub const ENTRIES: &[Entry] = &[
         ro: "APLICAȚII ȘI SETĂRI",
     },
     Entry {
+        en: "CLOSE MATCHES",
+        note: "Small uppercase section header in the search window: file names that match the query with one letter different (a typo corrected); keep it uppercase.",
+        de: "ÄHNLICHE TREFFER",
+        es: "COINCIDENCIAS PARECIDAS",
+        fr: "RÉSULTATS PROCHES",
+        it: "RISULTATI SIMILI",
+        pl: "PODOBNE WYNIKI",
+        pt_br: "RESULTADOS PARECIDOS",
+        ro: "REZULTATE APROAPE",
+    },
+    Entry {
         en: "NO NAME MATCHES",
         note: "Small uppercase section header in the search window: no file name matched, only text inside documents; keep it uppercase.",
         de: "KEINE TREFFER IM NAMEN",
