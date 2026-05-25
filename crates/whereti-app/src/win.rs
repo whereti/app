@@ -169,3 +169,55 @@ pub fn pick_folder(owner: HWND) -> Option<String> {
         path
     }
 }
+
+// ---------------------------------------------------------------- file actions
+
+use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL};
+use windows::Win32::UI::Shell::{
+    FileOperation, IFileOperation, IFileOperationProgressSink, FOFX_ADDUNDORECORD, FOFX_RECYCLEONDELETE, FOF_ALLOWUNDO,
+    FOF_WANTNUKEWARNING,
+};
+
+/// Runs one Explorer file operation (with Explorer's own dialogs, and an
+/// entry in Explorer's undo). `Ok(false)`: the user cancelled it.
+fn file_operation(hwnd: HWND, add: impl FnOnce(&IFileOperation) -> windows::core::Result<()>) -> Result<bool, String> {
+    // SAFETY: COM calls on the UI thread (COM is initialised by winit).
+    unsafe {
+        let op: IFileOperation = CoCreateInstance(&FileOperation, None, CLSCTX_ALL).map_err(|e| e.message())?;
+        op.SetOperationFlags(FOF_ALLOWUNDO | FOFX_RECYCLEONDELETE | FOFX_ADDUNDORECORD | FOF_WANTNUKEWARNING)
+            .map_err(|e| e.message())?;
+        op.SetOwnerWindow(hwnd).map_err(|e| e.message())?;
+        add(&op).map_err(|e| e.message())?;
+        op.PerformOperations().map_err(|e| e.message())?;
+        Ok(!op.GetAnyOperationsAborted().map_err(|e| e.message())?.as_bool())
+    }
+}
+
+/// Moves a file or folder to the Recycle Bin, as Delete does in Explorer
+/// (Windows asks first if the user set it so, and warns when the item is
+/// too large for the Bin or on a drive without one).
+pub fn recycle(hwnd: HWND, path: &str) -> Result<bool, String> {
+    let item = shell_item(path)?;
+    // SAFETY: a valid shell item; no progress sink.
+    file_operation(hwnd, |op| unsafe { op.DeleteItem(&item, None::<&IFileOperationProgressSink>) })
+}
+
+/// Renames a file or folder in place (`name`: the new name only).
+pub fn rename(hwnd: HWND, path: &str, name: &str) -> Result<bool, String> {
+    let item = shell_item(path)?;
+    // SAFETY: a valid shell item and name; no progress sink.
+    file_operation(hwnd, |op| unsafe { op.RenameItem(&item, &HSTRING::from(name), None::<&IFileOperationProgressSink>) })
+}
+
+/// Puts the file itself on the clipboard, as Ctrl+C does in Explorer:
+/// pasting in a folder, a mail or a chat pastes the file.
+pub fn copy_file(path: &str) -> Result<(), String> {
+    let item = shell_item(path)?;
+    // SAFETY: COM calls on the UI thread; flushing keeps the data after whereti quits.
+    unsafe {
+        let data: IDataObject = item.BindToHandler(None::<&IBindCtx>, &BHID_DataObject).map_err(|e| e.message())?;
+        windows::Win32::System::Ole::OleSetClipboard(&data).map_err(|e| e.message())?;
+        let _ = windows::Win32::System::Ole::OleFlushClipboard();
+    }
+    Ok(())
+}

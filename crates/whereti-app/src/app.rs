@@ -94,6 +94,8 @@ pub struct WheretiApp {
     /// `rows[close_start..]` (up to `content_start`) are close matches: a
     /// word of the query one letter off.
     close_start: Option<usize>,
+    /// The rename box (F2), while it is open.
+    renaming: Option<Renaming>,
     /// Content result -> the other files with exactly the same content.
     copies: std::collections::HashMap<String, Vec<String>>,
     /// A content search for the current query is on its way.
@@ -169,6 +171,7 @@ impl WheretiApp {
             total: 0,
             content_start: None,
             close_start: None,
+            renaming: None,
             copies: Default::default(),
             content_pending: false,
             round_trip: Duration::ZERO,
@@ -432,6 +435,10 @@ impl WheretiApp {
             }
             crate::settings::stop_recording(self);
         }
+        // the rename box takes the keys while it is open
+        if self.renaming.is_some() {
+            return;
+        }
         let page = ((self.view_height / ROW_HEIGHT) as usize).max(1);
         let search_page = self.page == Page::Search;
         let f1 = ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::F1));
@@ -477,6 +484,7 @@ impl WheretiApp {
         if tab {
             self.toggle_preview();
         }
+        self.file_keys(ctx);
         let last = self.rows.len().saturating_sub(1);
         let before = self.selected;
         if down {
@@ -521,6 +529,190 @@ impl WheretiApp {
                 // egui drops focus on Esc; keep typing in the search field
                 self.focus_search = true;
             }
+        }
+    }
+
+    /// F2 renames the selected file, Delete moves it to the Recycle Bin,
+    /// Ctrl+C copies the file itself, as in Explorer. The search field keeps
+    /// its own: Ctrl+C with text selected copies the text, Delete inside
+    /// the text deletes a letter.
+    fn file_keys(&mut self, ctx: &egui::Context) {
+        let on_file = self.rows.get(self.selected).is_some() && !self.is_launch(self.selected);
+        if !on_file {
+            return;
+        }
+        let range = self.search_id.and_then(|id| egui::text_edit::TextEditState::load(ctx, id)).and_then(|s| s.cursor.char_range());
+        let selected_text = range.is_some_and(|r| !r.is_empty());
+        let at_end = range.is_none_or(|r| r.primary.index.0 >= self.query.chars().count());
+        let (rename, delete, copy) = ctx.input_mut(|i| {
+            let copy = !selected_text && i.events.iter().any(|e| matches!(e, egui::Event::Copy));
+            if copy {
+                i.events.retain(|e| !matches!(e, egui::Event::Copy));
+            }
+            (
+                i.consume_key(Modifiers::NONE, Key::F2),
+                !selected_text && at_end && i.consume_key(Modifiers::NONE, Key::Delete),
+                copy,
+            )
+        });
+        let path = self.rows[self.selected].path.clone();
+        if copy {
+            match crate::win::copy_file(&path) {
+                Ok(()) => self.flash(tr("Copied: paste it in a folder, an e-mail or a chat")),
+                Err(e) => self.flash(e),
+            }
+        }
+        if rename {
+            let name = path.rsplit('\\').next().unwrap_or("").to_string();
+            if !name.is_empty() && !name.ends_with(':') {
+                self.renaming = Some(Renaming { path, name, fresh: true, error: None });
+            }
+        } else if delete {
+            let Some(hwnd) = self.hwnd else { return };
+            match crate::win::recycle(hwnd, &path) {
+                Ok(true) => {
+                    if let Some(i) = self.rows.iter().position(|r| r.path == path) {
+                        self.remove_row(i);
+                    }
+                    self.flash(tr("Moved to the Recycle Bin"));
+                }
+                Ok(false) => {}
+                Err(e) => self.flash(e),
+            }
+            self.focus_search = true;
+        }
+    }
+
+    /// Takes row `i` off the list (a file just deleted), keeping the
+    /// sections and the count right.
+    fn remove_row(&mut self, i: usize) {
+        let named_end = self.close_start.or(self.content_start).unwrap_or(self.rows.len());
+        if i >= self.launch_items.len() && i < named_end {
+            self.total = self.total.saturating_sub(1);
+        }
+        self.rows.remove(i);
+        for s in [&mut self.close_start, &mut self.content_start].into_iter().flatten() {
+            if *s > i {
+                *s -= 1;
+            }
+        }
+        // a section left empty goes away with its header
+        if self.content_start == Some(self.rows.len()) {
+            self.content_start = None;
+        }
+        if self.close_start.is_some() && self.close_start == Some(self.content_start.unwrap_or(self.rows.len())) {
+            self.close_start = None;
+        }
+        self.selected = self.selected.min(self.rows.len().saturating_sub(1));
+    }
+
+    /// The rename box (F2): the name, with the part before the extension
+    /// selected, as in Explorer. Enter renames, Esc or a click outside cancels.
+    fn rename_box(&mut self, ctx: &egui::Context, p: &Palette) {
+        let Some(r) = self.renaming.as_mut() else { return };
+        let id = egui::Id::unique("rename-field");
+        if r.fresh {
+            r.fresh = false;
+            let is_dir = std::path::Path::new(&r.path).is_dir();
+            let chars = r.name.chars().count();
+            let stem = match r.name.rfind('.') {
+                Some(dot) if dot > 0 && !is_dir => r.name[..dot].chars().count(),
+                _ => chars,
+            };
+            let mut state = egui::text_edit::TextEditState::load(ctx, id).unwrap_or_default();
+            state.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+                egui::text::CCursor::new(0),
+                egui::text::CCursor::new(stem),
+            )));
+            state.store(ctx, id);
+            ctx.memory_mut(|m| m.request_focus(id));
+        }
+        let (mut apply, mut cancel) = (false, false);
+        let modal = egui::Modal::new(egui::Id::unique("rename"))
+            .frame(
+                Frame::NONE
+                    .fill(p.surface)
+                    .stroke(Stroke::new(1.0, p.border))
+                    .corner_radius(CornerRadius::same(12))
+                    .inner_margin(Margin::same(18)),
+            )
+            .show(ctx, |ui| {
+                ui.set_width(420.0);
+                ui.label(egui::RichText::new(tr("Rename")).size(15.0).family(semibold()).color(p.text));
+                ui.add_space(10.0);
+                let field = egui::TextEdit::singleline(&mut r.name)
+                    .id(id)
+                    .desired_width(f32::INFINITY)
+                    .font(FontId::proportional(14.0))
+                    .margin(Margin::symmetric(8, 6));
+                let resp = ui.add(field);
+                if resp.changed() {
+                    r.error = None;
+                }
+                if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                    apply = true;
+                }
+                if let Some(e) = &r.error {
+                    ui.add_space(6.0);
+                    ui.label(egui::RichText::new(e).size(12.5).color(p.warn));
+                }
+                ui.add_space(14.0);
+                ui.horizontal(|ui| {
+                    if crate::settings::button(ui, p, tr("Rename"), true).clicked() {
+                        apply = true;
+                    }
+                    if crate::settings::button(ui, p, tr("Cancel"), false).clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if modal.should_close() {
+            cancel = true;
+        }
+        if apply {
+            self.apply_rename();
+        } else if cancel {
+            self.renaming = None;
+            self.focus_search = true;
+        }
+    }
+
+    fn apply_rename(&mut self) {
+        let Some(r) = self.renaming.as_mut() else { return };
+        let name = r.name.trim().to_string();
+        let old = r.path.rsplit('\\').next().unwrap_or("");
+        if name.is_empty() || name == old {
+            self.renaming = None;
+            self.focus_search = true;
+            return;
+        }
+        if name.contains(['\\', '/', ':', '*', '?', '"', '<', '>', '|']) {
+            r.error = Some(tr("A name cannot contain \\ / : * ? \" < > or a vertical bar").to_string());
+            return;
+        }
+        let parent = r.path.rsplit_once('\\').map_or("", |(p, _)| p);
+        let new_path = format!("{parent}\\{name}");
+        // same name in other letters (raport -> Raport) is a rename, not a clash
+        if !name.eq_ignore_ascii_case(old) && std::path::Path::new(&new_path).exists() {
+            r.error = Some(tr("There is already a file or folder with this name here.").to_string());
+            return;
+        }
+        let Some(hwnd) = self.hwnd else { return };
+        let path = r.path.clone();
+        match crate::win::rename(hwnd, &path, &name) {
+            Ok(true) => {
+                self.renaming = None;
+                if let Some(row) = self.rows.iter_mut().find(|row| row.path == path) {
+                    row.path = new_path;
+                }
+                self.flash(tr("Renamed"));
+                self.focus_search = true;
+            }
+            Ok(false) => {
+                self.renaming = None;
+                self.focus_search = true;
+            }
+            Err(e) => r.error = Some(e),
         }
     }
 
@@ -1254,6 +1446,7 @@ impl eframe::App for WheretiApp {
             }
         }
         self.handle_keys(&ctx);
+        self.rename_box(&ctx, &p);
         self.file_icons.begin_frame();
 
         egui::Panel::bottom("status")
@@ -1745,6 +1938,16 @@ impl WheretiApp {
                                 }
                             });
                         }
+                        ui.add_space(12.0);
+                        ui.label(egui::RichText::new(tr("Keys").to_uppercase()).size(11.5).family(semibold()).color(p.text3));
+                        ui.add_space(2.0);
+                        ui.label(
+                            egui::RichText::new(tr(
+                                "Enter opens · Ctrl+Enter shows in Explorer · F2 renames · Delete moves to the Recycle Bin · Ctrl+C copies the file · Ctrl+Shift+C copies its path",
+                            ))
+                            .size(13.0)
+                            .color(p.text2),
+                        );
                         });
                     });
             });
@@ -2225,6 +2428,16 @@ pub(crate) fn relative_time(minutes_utc: u32, tz: i32, now_utc: i64) -> String {
         _ if y == ty => trf!("{month} {day}", month = months[(m - 1) as usize], day = d),
         _ => trf!("{month} {day}, {year}", month = months[(m - 1) as usize], day = d, year = y),
     }
+}
+
+/// The rename box of a file (F2).
+struct Renaming {
+    path: String,
+    /// The name being typed.
+    name: String,
+    /// Just opened: select the name before the extension.
+    fresh: bool,
+    error: Option<String>,
 }
 
 #[cfg(test)]
