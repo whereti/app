@@ -119,12 +119,25 @@ impl NameIndex {
         let mut hits = self.top(hits, opts, rank_needle.as_deref(), &used, active.clone());
         let mut close = 0;
         if total < FEW_HITS && hits.len() < opts.limit {
-            let near = self.close_entries(query, &exact);
-            if !near.is_empty() {
+            let (starts, inside) = self.close_entries(query, &exact);
+            // by relevance, names where the near word starts a word come
+            // first ("raprot": "raport_audit" before "cameraprofile")
+            let groups = if opts.sort == SortBy::Relevance {
+                vec![starts, inside]
+            } else {
+                let mut all = starts;
+                all.extend(inside);
+                all.sort_unstable();
+                vec![all]
+            };
+            for near in groups.into_iter().filter(|g| !g.is_empty()) {
+                if hits.len() >= opts.limit {
+                    break;
+                }
                 let rest = SearchOptions { limit: opts.limit - hits.len(), ..*opts };
                 let used = if opts.sort == SortBy::Relevance { self.usage_positions(&near, usage) } else { Vec::new() };
-                let near = self.top(near, &rest, None, &used, active);
-                close = near.len();
+                let near = self.top(near, &rest, None, &used, active.clone());
+                close += near.len();
                 hits.extend(near);
             }
         }
@@ -138,8 +151,9 @@ impl NameIndex {
     /// Close matches of `query`: its longest plain word (4+ letters) one
     /// letter off (one letter swapped with the next, missing, extra or
     /// wrong), every other condition as typed. In index order, without the
-    /// entries of `exact` (sorted).
-    fn close_entries(&self, query: &Query, exact: &[u32]) -> Vec<u32> {
+    /// entries of `exact` (sorted): those where the near word starts a word
+    /// of the name, then the others.
+    fn close_entries(&self, query: &Query, exact: &[u32]) -> (Vec<u32>, Vec<u32>) {
         let word = query
             .clauses
             .iter()
@@ -149,27 +163,36 @@ impl NameIndex {
                 _ => None,
             })
             .max_by_key(|(_, t)| t.len());
-        let Some((ci, word)) = word else { return Vec::new() };
+        let Some((ci, word)) = word else { return Default::default() };
         let variants = near_words(word);
         if variants.is_empty() || self.is_empty() {
-            return Vec::new();
+            return Default::default();
         }
         let mut warnings = Vec::new();
         let mut clauses = self.compile_clauses(query, &mut warnings);
         clauses.remove(ci);
         let refs: Vec<&str> = variants.iter().map(String::as_str).collect();
-        self.scan_names_any(&refs)
+        let near = AhoCorasick::new(&refs).expect("plain literals always build");
+        let (starts, inside): (Vec<Vec<u32>>, Vec<Vec<u32>>) = self
+            .scan_names_any(&refs)
             .par_chunks(8192)
             .map(|chunk| {
                 let mut s = Scratch::default();
-                chunk
-                    .iter()
-                    .copied()
-                    .filter(|i| exact.binary_search(i).is_err() && (clauses.is_empty() || self.eval(&clauses, *i, &mut s)))
-                    .collect::<Vec<_>>()
+                let (mut starts, mut inside) = (Vec::new(), Vec::new());
+                for &i in chunk {
+                    if exact.binary_search(&i).is_ok() || !(clauses.is_empty() || self.eval(&clauses, i, &mut s)) {
+                        continue;
+                    }
+                    let name = self.folded_name(i, &mut s.name);
+                    let at_start = near
+                        .find_overlapping_iter(name)
+                        .any(|m| m.start() == 0 || !name[m.start() - 1].is_ascii_alphanumeric());
+                    if at_start { starts.push(i) } else { inside.push(i) }
+                }
+                (starts, inside)
             })
-            .collect::<Vec<_>>()
-            .concat()
+            .unzip();
+        (starts.concat(), inside.concat())
     }
 
     /// Every live entry matching `query`, unranked, in index order.

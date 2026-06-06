@@ -96,6 +96,9 @@ pub struct WheretiApp {
     close_start: Option<usize>,
     /// The rename box (F2), while it is open.
     renaming: Option<Renaming>,
+    /// The rename box just closed: focus the search field next frame (while
+    /// the box is still drawn, egui keeps focus inside it).
+    refocus_after_rename: bool,
     /// Content result -> the other files with exactly the same content.
     copies: std::collections::HashMap<String, Vec<String>>,
     /// A content search for the current query is on its way.
@@ -172,6 +175,7 @@ impl WheretiApp {
             content_start: None,
             close_start: None,
             renaming: None,
+            refocus_after_rename: false,
             copies: Default::default(),
             content_pending: false,
             round_trip: Duration::ZERO,
@@ -609,24 +613,13 @@ impl WheretiApp {
     /// The rename box (F2): the name, with the part before the extension
     /// selected, as in Explorer. Enter renames, Esc or a click outside cancels.
     fn rename_box(&mut self, ctx: &egui::Context, p: &Palette) {
-        let Some(r) = self.renaming.as_mut() else { return };
+        let Some(r) = self.renaming.as_mut() else {
+            if std::mem::take(&mut self.refocus_after_rename) {
+                self.focus_search = true;
+            }
+            return;
+        };
         let id = egui::Id::unique("rename-field");
-        if r.fresh {
-            r.fresh = false;
-            let is_dir = std::path::Path::new(&r.path).is_dir();
-            let chars = r.name.chars().count();
-            let stem = match r.name.rfind('.') {
-                Some(dot) if dot > 0 && !is_dir => r.name[..dot].chars().count(),
-                _ => chars,
-            };
-            let mut state = egui::text_edit::TextEditState::load(ctx, id).unwrap_or_default();
-            state.cursor.set_char_range(Some(egui::text::CCursorRange::two(
-                egui::text::CCursor::new(0),
-                egui::text::CCursor::new(stem),
-            )));
-            state.store(ctx, id);
-            ctx.memory_mut(|m| m.request_focus(id));
-        }
         let (mut apply, mut cancel) = (false, false);
         let modal = egui::Modal::new(egui::Id::unique("rename"))
             .frame(
@@ -646,6 +639,28 @@ impl WheretiApp {
                     .font(FontId::proportional(14.0))
                     .margin(Margin::symmetric(8, 6));
                 let resp = ui.add(field);
+                // Just opened: focus the field with the name before the
+                // extension selected. The modal's first frame only measures
+                // it (focus is dropped there), so ask until it holds.
+                if r.fresh {
+                    if resp.has_focus() {
+                        r.fresh = false;
+                    } else {
+                        resp.request_focus();
+                        let is_dir = std::path::Path::new(&r.path).is_dir();
+                        let stem = match r.name.rfind('.') {
+                            Some(dot) if dot > 0 && !is_dir => r.name[..dot].chars().count(),
+                            _ => r.name.chars().count(),
+                        };
+                        let mut state = egui::text_edit::TextEditState::load(ui.ctx(), id).unwrap_or_default();
+                        state.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+                            egui::text::CCursor::new(0),
+                            egui::text::CCursor::new(stem),
+                        )));
+                        state.store(ui.ctx(), id);
+                        ui.ctx().request_repaint();
+                    }
+                }
                 if resp.changed() {
                     r.error = None;
                 }
@@ -673,7 +688,10 @@ impl WheretiApp {
             self.apply_rename();
         } else if cancel {
             self.renaming = None;
-            self.focus_search = true;
+        }
+        if self.renaming.is_none() {
+            self.refocus_after_rename = true;
+            ctx.request_repaint();
         }
     }
 
@@ -683,7 +701,6 @@ impl WheretiApp {
         let old = r.path.rsplit('\\').next().unwrap_or("");
         if name.is_empty() || name == old {
             self.renaming = None;
-            self.focus_search = true;
             return;
         }
         if name.contains(['\\', '/', ':', '*', '?', '"', '<', '>', '|']) {
@@ -706,12 +723,8 @@ impl WheretiApp {
                     row.path = new_path;
                 }
                 self.flash(tr("Renamed"));
-                self.focus_search = true;
             }
-            Ok(false) => {
-                self.renaming = None;
-                self.focus_search = true;
-            }
+            Ok(false) => self.renaming = None,
             Err(e) => r.error = Some(e),
         }
     }
