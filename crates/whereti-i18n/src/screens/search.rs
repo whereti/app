@@ -205,6 +205,17 @@ pub const ENTRIES: &[Entry] = &[
         ro: "Enter deschide · Ctrl+Enter arată în Explorer · F2 redenumește · Delete mută în Coș · Ctrl+C copiază fișierul · Ctrl+Shift+C copiază calea",
     },
     Entry {
+        en: "SEARCHES",
+        note: "Small uppercase section header on the empty search page, above buttons that repeat the user's last searches; keep it uppercase.",
+        de: "SUCHEN",
+        es: "BÚSQUEDAS",
+        fr: "RECHERCHES",
+        it: "RICERCHE",
+        pl: "WYSZUKIWANIA",
+        pt_br: "PESQUISAS",
+        ro: "CĂUTĂRI",
+    },
+    Entry {
         en: "Path copied",
         note: "Brief notice (toast) in the search window after the user copies a file's path to the clipboard.",
         de: "Pfad kopiert",

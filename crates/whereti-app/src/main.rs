@@ -7,6 +7,7 @@
 
 mod app;
 mod file_icons;
+mod history;
 mod i18n;
 mod icons;
 mod launch;

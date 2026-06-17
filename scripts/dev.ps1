@@ -19,15 +19,15 @@ $root = Split-Path $PSScriptRoot -Parent
 $target = Join-Path $root "target\release"
 $installed = "C:\Program Files\whereti"
 
+# the app holds target\release\whereti.exe (and the installed one): close it first
+Get-Process whereti -ErrorAction SilentlyContinue | Stop-Process -Force
+Start-Sleep -Milliseconds 300
+
 Push-Location $root
 try {
     cargo build --release -p whereti-app -p whereti-service -p whereti-extract -p whereti-cli
     if ($LASTEXITCODE -ne 0) { throw "the build failed (exit $LASTEXITCODE)" }
 } finally { Pop-Location }
-
-# the app first: it holds target\release\whereti.exe and the installed one
-Get-Process whereti -ErrorAction SilentlyContinue | Stop-Process -Force
-Start-Sleep -Milliseconds 300
 
 function Same([string]$name) {
     $a = Join-Path $target $name; $b = Join-Path $installed $name

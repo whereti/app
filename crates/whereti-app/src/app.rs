@@ -96,6 +96,8 @@ pub struct WheretiApp {
     close_start: Option<usize>,
     /// The rename box (F2), while it is open.
     renaming: Option<Renaming>,
+    /// The Up arrow brought back this past search (index in history::list).
+    history_pos: Option<usize>,
     /// The rename box just closed: focus the search field next frame (while
     /// the box is still drawn, egui keeps focus inside it).
     refocus_after_rename: bool,
@@ -175,6 +177,7 @@ impl WheretiApp {
             content_start: None,
             close_start: None,
             renaming: None,
+            history_pos: None,
             refocus_after_rename: false,
             copies: Default::default(),
             content_pending: false,
@@ -296,7 +299,71 @@ impl WheretiApp {
         self.run_search(); // fresh results every time the window appears
     }
 
+    /// Over the recent files: the last searches, one click each. `true`
+    /// when one was clicked (it is searched; the list is drawn next frame).
+    fn past_searches(&mut self, ui: &mut egui::Ui, p: &Palette) -> bool {
+        let past = crate::history::list();
+        if past.is_empty() {
+            return false;
+        }
+        ui.horizontal(|ui| {
+            ui.add_space(12.0);
+            ui.label(egui::RichText::new(tr("SEARCHES")).size(11.0).color(p.text3).family(semibold()));
+        });
+        ui.add_space(6.0);
+        let mut picked = None;
+        ui.horizontal(|ui| {
+            ui.add_space(8.0);
+            ui.spacing_mut().item_spacing.x = 6.0;
+            for q in past.iter().take(8) {
+                let shown: String = if q.chars().count() > 32 { q.chars().take(31).chain(['…']).collect() } else { q.clone() };
+                // only whole chips: stop where the next would not fit
+                let width = ui.painter().layout_no_wrap(shown.clone(), FontId::new(13.0, medium()), p.text2).size().x + 24.0;
+                if width > ui.available_width() {
+                    break;
+                }
+                if chip(ui, p, &shown, false).on_hover_text(q.as_str()).clicked() {
+                    picked = Some(q.clone());
+                }
+            }
+        });
+        ui.add_space(14.0);
+        let Some(q) = picked else { return false };
+        self.query = q;
+        self.history_pos = None;
+        self.run_search();
+        self.focus_search = true;
+        true
+    }
+
+    /// The search on screen was used: remember it (history.rs).
+    fn remember_search(&self) {
+        if !self.recent_mode && !self.rows.is_empty() {
+            crate::history::record(&self.query);
+        }
+    }
+
+    /// Up at the top of the list, in an empty box or on a search it brought
+    /// back: the search before.
+    fn recall_older(&mut self, ctx: &egui::Context) {
+        let past = crate::history::list();
+        let next = self.history_pos.map_or(0, |p| p + 1);
+        let Some(q) = past.get(next) else { return };
+        self.history_pos = Some(next);
+        self.query = q.clone();
+        self.run_search();
+        // the cursor at the end, ready to add a word
+        if let Some(id) = self.search_id {
+            let mut state = egui::text_edit::TextEditState::load(ctx, id).unwrap_or_default();
+            let end = egui::text::CCursor::new(self.query.chars().count());
+            state.cursor.set_char_range(Some(egui::text::CCursorRange::one(end)));
+            state.store(ctx, id);
+        }
+        self.focus_search = true;
+    }
+
     fn hide(&mut self, ctx: &egui::Context) {
+        self.remember_search();
         ctx.send_viewport_cmd(ViewportCommand::Visible(false));
         self.visible = false;
         // A focused text field blinks its cursor, which wakes the app twice a
@@ -495,7 +562,11 @@ impl WheretiApp {
             self.selected = (self.selected + 1).min(last);
         }
         if up {
-            self.selected = self.selected.saturating_sub(1);
+            if self.selected == 0 && (self.query.trim().is_empty() || self.history_pos.is_some()) {
+                self.recall_older(ctx);
+            } else {
+                self.selected = self.selected.saturating_sub(1);
+            }
         }
         if pg_down {
             self.selected = (self.selected + page).min(last);
@@ -560,6 +631,9 @@ impl WheretiApp {
             )
         });
         let path = self.rows[self.selected].path.clone();
+        if copy || rename || delete {
+            self.remember_search();
+        }
         if copy {
             match crate::win::copy_file(&path) {
                 Ok(()) => self.flash(tr("Copied: paste it in a folder, an e-mail or a chat")),
@@ -778,6 +852,7 @@ impl WheretiApp {
                     self.focus_search = false;
                 }
                 if resp.changed() {
+                    self.history_pos = None;
                     if self.page == Page::Welcome {
                         crate::welcome::finish(self);
                     }
@@ -923,6 +998,9 @@ impl WheretiApp {
             return;
         }
         ui.add_space(10.0);
+        if self.recent_mode && self.past_searches(ui, p) {
+            return;
+        }
         let launch_n = self.launch_items.len();
         let header = if self.recent_mode {
             tr("RECENT").to_string()
@@ -1106,6 +1184,7 @@ impl WheretiApp {
         if let (Some(i), Some(hwnd)) = (dragged, self.hwnd) {
             self.selected = i;
             let path = self.rows[i].path.clone();
+            self.remember_search();
             shell::trace(format!("drag start: {path}"));
             let result = crate::win::drag_file(hwnd, &path);
             shell::trace(format!("drag end: {result:?}"));

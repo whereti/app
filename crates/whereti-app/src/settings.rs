@@ -39,6 +39,8 @@ pub struct SettingsState {
     pub updates: bool,
     /// Rank the files the user opens often or lately higher (usage.rs).
     pub learn: bool,
+    /// Keep the searches made, for the Up arrow and the empty page (history.rs).
+    pub remember_searches: bool,
     /// The welcome page asked about recognising objects and animals in
     /// photos (asked once; the switch stays in Settings > Search).
     pub photo_tags_asked: bool,
@@ -73,6 +75,7 @@ impl SettingsState {
             lang: None,
             updates: true,
             learn: true,
+            remember_searches: true,
             photo_tags_asked: false,
             config: None,
             exclusions: Vec::new(),
@@ -95,12 +98,14 @@ impl SettingsState {
                     Some(("welcomed", "yes")) => s.welcomed = true,
                     Some(("updates", "off")) => s.updates = false,
                     Some(("learn", "off")) => s.learn = false,
+                    Some(("searches", "off")) => s.remember_searches = false,
                     Some(("photo_tags_asked", "yes")) => s.photo_tags_asked = true,
                     _ => {}
                 }
             }
         }
         crate::usage::set_enabled(s.learn);
+        crate::history::set_enabled(s.remember_searches);
         s
     }
 
@@ -129,6 +134,9 @@ impl SettingsState {
         }
         if !self.learn {
             text.push_str("learn=off\n");
+        }
+        if !self.remember_searches {
+            text.push_str("searches=off\n");
         }
         if self.photo_tags_asked {
             text.push_str("photo_tags_asked=yes\n");
@@ -389,6 +397,33 @@ fn search(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
                 if button(ui, p, tr("Forget"), false).clicked() {
                     crate::usage::forget();
                     app.flash(tr("whereti forgot what you opened.").to_string());
+                }
+            },
+        );
+    });
+    ui.add_space(14.0);
+
+    // ---- the searches made
+    card(ui, p, |ui| {
+        row(
+            ui,
+            p,
+            tr("Remember your searches"),
+            tr("The Up arrow in an empty search box brings back your last searches; they also show on the empty page. This stays on your PC, and turning it off forgets them."),
+            |ui| {
+                let mut on = app.settings.remember_searches;
+                if toggle(ui, p, &mut on, tr("Remember your searches")).clicked() {
+                    app.settings.remember_searches = on;
+                    crate::history::set_enabled(on);
+                    if !on {
+                        crate::history::forget();
+                    }
+                    app.settings.save();
+                }
+                ui.add_space(8.0);
+                if button(ui, p, tr("Forget"), false).clicked() {
+                    crate::history::forget();
+                    app.flash(tr("whereti forgot your searches.").to_string());
                 }
             },
         );
