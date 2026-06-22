@@ -98,6 +98,8 @@ pub struct WheretiApp {
     renaming: Option<Renaming>,
     /// The Up arrow brought back this past search (index in history::list).
     history_pos: Option<usize>,
+    /// Called from an Open/Save window: Enter moves it to the result's folder.
+    file_dialog: Option<crate::win::FileDialog>,
     /// The rename box just closed: focus the search field next frame (while
     /// the box is still drawn, egui keeps focus inside it).
     refocus_after_rename: bool,
@@ -178,6 +180,7 @@ impl WheretiApp {
             close_start: None,
             renaming: None,
             history_pos: None,
+            file_dialog: None,
             refocus_after_rename: false,
             copies: Default::default(),
             content_pending: false,
@@ -364,6 +367,7 @@ impl WheretiApp {
 
     fn hide(&mut self, ctx: &egui::Context) {
         self.remember_search();
+        self.file_dialog = None;
         ctx.send_viewport_cmd(ViewportCommand::Visible(false));
         self.visible = false;
         // A focused text field blinks its cursor, which wakes the app twice a
@@ -480,6 +484,20 @@ impl WheretiApp {
         let Some(row) = self.rows.get(self.selected) else { return };
         let path = row.path.clone();
         let launch = self.is_launch(self.selected);
+        // called from an Open/Save window: Enter takes that window to the folder
+        if !launch && !reveal && self.file_dialog.is_some() {
+            let folder = if row.is_dir { path.clone() } else { path.rsplit_once('\\').map_or(path.clone(), |(f, _)| f.to_string()) };
+            let folder = if folder.ends_with(':') { format!("{folder}\\") } else { folder };
+            let dialog = self.file_dialog.take();
+            self.hide(ctx);
+            if let Some(d) = dialog {
+                if crate::win::jump(&d, &folder).is_err() {
+                    self.show(ctx);
+                    self.flash(tr("That window did not accept the folder (an app running as administrator does not take it from whereti)."));
+                }
+            }
+            return;
+        }
         let result = if launch {
             crate::launch::open(&path)
         } else if reveal {
@@ -998,6 +1016,19 @@ impl WheretiApp {
             return;
         }
         ui.add_space(10.0);
+        if let Some(d) = &self.file_dialog {
+            let title = if d.title.trim().is_empty() { tr("Open / Save").to_string() } else { d.title.clone() };
+            let text = trf!("Enter takes “{window}” to the folder of the result.", window = title);
+            Frame::NONE
+                .fill(p.accent_soft)
+                .corner_radius(CornerRadius::same(8))
+                .inner_margin(Margin::symmetric(12, 8))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.label(egui::RichText::new(text).size(13.0).color(p.accent));
+                });
+            ui.add_space(8.0);
+        }
         if self.recent_mode && self.past_searches(ui, p) {
             return;
         }
@@ -1483,10 +1514,12 @@ impl eframe::App for WheretiApp {
             self.show(ctx);
         }
         if Requests::take(&self.requests.toggle) {
+            let from = self.requests.from.swap(0, std::sync::atomic::Ordering::SeqCst);
             if self.visible {
                 self.hide(ctx);
             } else {
                 self.show(ctx);
+                self.file_dialog = crate::win::file_dialog(from);
             }
         }
         self.apply_updates();

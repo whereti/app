@@ -221,3 +221,157 @@ pub fn copy_file(path: &str) -> Result<(), String> {
     }
     Ok(())
 }
+
+// ---------------------------------------------------------------- Open/Save windows
+//
+// whereti never presses Open or Save and never touches the File name box:
+// that could save or open the wrong file. It only uses the window's address
+// bar (Alt+D, as in Explorer), which can do nothing but change the folder.
+
+use windows::core::BOOL;
+use windows::Win32::Foundation::WPARAM as WP;
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, VIRTUAL_KEY, VK_MENU,
+    VK_RETURN,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
+    EnumChildWindows, GetAncestor, GetClassNameW, GetDlgCtrlID, GetGUIThreadInfo, GetParent, GetWindowTextW,
+    GetWindowThreadProcessId, IsWindow, PostMessageW, SendMessageTimeoutW, SetForegroundWindow as SetForeground,
+    GA_ROOT, GUITHREADINFO, SMTO_ABORTIFHUNG, WM_KEYDOWN, WM_KEYUP, WM_SETTEXT,
+};
+
+/// The address bar of Open/Save windows and Explorer (a ComboBoxEx32).
+const ADDRESS_ID: i32 = 41477;
+
+/// An Open or Save window of another app, from which whereti was called.
+pub struct FileDialog {
+    dialog: HWND,
+    /// Its title, e.g. "Save As".
+    pub title: String,
+}
+
+fn class_of(h: HWND) -> String {
+    let mut buf = [0u16; 64];
+    // SAFETY: a buffer of its stated size.
+    let n = unsafe { GetClassNameW(h, &mut buf) };
+    String::from_utf16_lossy(&buf[..n.max(0) as usize])
+}
+
+fn text_of(h: HWND) -> String {
+    let mut buf = [0u16; 512];
+    // SAFETY: a buffer of its stated size.
+    let n = unsafe { GetWindowTextW(h, &mut buf) };
+    String::from_utf16_lossy(&buf[..n.max(0) as usize])
+}
+
+/// `h` is the Edit of an address bar (inside the ComboBoxEx32 `ADDRESS_ID`).
+fn is_address_edit(h: HWND) -> bool {
+    if class_of(h) != "Edit" {
+        return false;
+    }
+    let mut w = h;
+    for _ in 0..3 {
+        // SAFETY: plain window queries.
+        w = unsafe { GetParent(w) }.unwrap_or_default();
+        if w.is_invalid() {
+            return false;
+        }
+        if class_of(w) == "ComboBoxEx32" {
+            // SAFETY: as above.
+            return unsafe { GetDlgCtrlID(w) } == ADDRESS_ID;
+        }
+    }
+    false
+}
+
+/// The window that had the keyboard when the shortcut was pressed, if it
+/// is an Open or Save window (a dialog with an address bar).
+pub fn file_dialog(foreground: isize) -> Option<FileDialog> {
+    if foreground == 0 {
+        return None;
+    }
+    // SAFETY: plain window queries; a stale handle only makes them fail.
+    unsafe {
+        let dialog = GetAncestor(HWND(foreground as *mut c_void), GA_ROOT);
+        if dialog.is_invalid() || class_of(dialog) != "#32770" {
+            return None;
+        }
+        unsafe extern "system" fn visit(h: HWND, data: LPARAM) -> BOOL {
+            // SAFETY: `data` is the bool below, alive for the whole enumeration.
+            let found = unsafe { &mut *(data.0 as *mut bool) };
+            if is_address_edit(h) {
+                *found = true;
+                return BOOL(0);
+            }
+            BOOL(1)
+        }
+        let mut found = false;
+        let _ = EnumChildWindows(Some(dialog), Some(visit), LPARAM(&mut found as *mut bool as isize));
+        found.then(|| FileDialog { dialog, title: text_of(dialog) })
+    }
+}
+
+/// The control with the keyboard in `dialog`'s thread.
+fn focused(dialog: HWND) -> Option<HWND> {
+    // SAFETY: a zeroed GUITHREADINFO with its size set, as the call requires.
+    unsafe {
+        let thread = GetWindowThreadProcessId(dialog, None);
+        let mut info = GUITHREADINFO { cbSize: std::mem::size_of::<GUITHREADINFO>() as u32, ..Default::default() };
+        GetGUIThreadInfo(thread, &mut info).ok()?;
+        (!info.hwndFocus.is_invalid()).then_some(info.hwndFocus)
+    }
+}
+
+fn key(vk: VIRTUAL_KEY, up: bool) -> INPUT {
+    INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT { wVk: vk, dwFlags: if up { KEYEVENTF_KEYUP } else { KEYBD_EVENT_FLAGS(0) }, ..Default::default() },
+        },
+    }
+}
+
+/// Takes the Open/Save window to `folder` through its address bar, and
+/// leaves it in front. Nothing is opened or saved.
+pub fn jump(d: &FileDialog, folder: &str) -> Result<(), String> {
+    let wait = |ms| std::thread::sleep(std::time::Duration::from_millis(ms));
+    // SAFETY: window calls on a handle checked to be alive.
+    unsafe {
+        if !IsWindow(Some(d.dialog)).as_bool() {
+            return Err("closed".into());
+        }
+        let _ = SetForeground(d.dialog);
+    }
+    wait(150);
+    // Alt+D puts the keyboard in the address bar, as in Explorer
+    let d_key = VIRTUAL_KEY(b'D' as u16);
+    let keys = [key(VK_MENU, false), key(d_key, false), key(d_key, true), key(VK_MENU, true)];
+    // SAFETY: four well-formed keyboard inputs.
+    unsafe { SendInput(&keys, std::mem::size_of::<INPUT>() as i32) };
+    // only once the address bar really has the keyboard
+    let edit = (0..20)
+        .find_map(|_| {
+            wait(50);
+            focused(d.dialog).filter(|&f| is_address_edit(f))
+        })
+        .ok_or("no address bar")?;
+    let wide: Vec<u16> = folder.encode_utf16().chain([0]).collect();
+    let mut result = 0usize;
+    // SAFETY: WM_SETTEXT is marshalled by Windows across processes; 2 s at most.
+    let set = unsafe {
+        SendMessageTimeoutW(edit, WM_SETTEXT, WP(0), LPARAM(wide.as_ptr() as isize), SMTO_ABORTIFHUNG, 2000, Some(&mut result))
+    };
+    if set.0 == 0 || result != 1 {
+        // an app running as administrator does not take it from ours
+        return Err("refused".into());
+    }
+    // Enter, to the address bar itself (not to whatever has the keyboard)
+    const ENTER_SCAN: isize = 0x1C << 16 | 1;
+    // SAFETY: plain key messages to a live window.
+    unsafe {
+        PostMessageW(Some(edit), WM_KEYDOWN, WP(VK_RETURN.0 as usize), LPARAM(ENTER_SCAN)).map_err(|e| e.message())?;
+        PostMessageW(Some(edit), WM_KEYUP, WP(VK_RETURN.0 as usize), LPARAM(ENTER_SCAN | 0xC000_0000u32 as isize))
+            .map_err(|e| e.message())?;
+    }
+    Ok(())
+}

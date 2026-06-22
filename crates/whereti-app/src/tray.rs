@@ -19,6 +19,9 @@ pub struct Requests {
     pub show: AtomicBool,
     pub toggle: AtomicBool,
     pub quit: AtomicBool,
+    /// The window in front when the shortcut was pressed (an Open/Save
+    /// window makes Enter jump there; see win::file_dialog).
+    pub from: std::sync::atomic::AtomicIsize,
 }
 
 impl Requests {
@@ -193,6 +196,9 @@ pub fn install(
         let (requests, wake) = (requests.clone(), wake.clone());
         GlobalHotKeyEvent::set_event_handler(Some(move |e: GlobalHotKeyEvent| {
             if e.state == HotKeyState::Pressed {
+                // SAFETY: no arguments; a handle or null.
+                let front = unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow() };
+                requests.from.store(front as isize, Ordering::SeqCst);
                 requests.toggle.store(true, Ordering::SeqCst);
                 wake();
             }
