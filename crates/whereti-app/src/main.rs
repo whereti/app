@@ -20,6 +20,7 @@ mod snippets;
 mod settings;
 mod shell;
 mod theme;
+mod thumbs;
 mod tray;
 mod update;
 mod usage;

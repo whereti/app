@@ -137,6 +137,10 @@ pub struct WheretiApp {
     preview: Preview,
     /// Explorer's own file icons, cached per type.
     pub(crate) file_icons: FileIcons,
+    /// Picture thumbnails for the Images grid.
+    thumbs: crate::thumbs::Thumbs,
+    /// Tiles per line in the Images grid, as last drawn (for the arrow keys).
+    grid_cols: usize,
     /// Text excerpts under content results.
     snippets: crate::snippets::Snippets,
     /// The CJK fonts are loaded (see `setup_fonts`).
@@ -211,6 +215,8 @@ impl WheretiApp {
             tray,
             preview,
             file_icons: FileIcons::new(),
+            thumbs: crate::thumbs::Thumbs::new(ctx.clone()),
+            grid_cols: 1,
             cjk_fonts: false,
             updater: crate::update::Updater::new(),
             launch: crate::launch::Launch::new(ctx),
@@ -276,7 +282,8 @@ impl WheretiApp {
         self.generation += 1;
         let (query, sort, recent) = self.effective_query();
         self.recent_mode = recent;
-        self.pending_launch = if recent { Vec::new() } else { self.launch.search(&self.query) };
+        self.pending_launch =
+            if recent || self.filter != Filter::All { Vec::new() } else { self.launch.search(&self.query) };
         self.scan = None; // a new search: offer it again, from the start
         let content = !recent && !highlight_needles(&self.query).is_empty();
         self.content_pending = content;
@@ -576,14 +583,32 @@ impl WheretiApp {
         self.file_keys(ctx);
         let last = self.rows.len().saturating_sub(1);
         let before = self.selected;
+        // the grid: a line is `step` tiles; Left/Right move one tile, but
+        // only where the search box has no use for them (cursor at its start
+        // or end)
+        let step = if self.grid_view() { self.grid_cols.max(1) } else { 1 };
+        if step > 1 {
+            let range = self.search_id.and_then(|id| egui::text_edit::TextEditState::load(ctx, id)).and_then(|s| s.cursor.char_range());
+            let n = self.query.chars().count();
+            let at = |pos: usize| range.is_none_or(|r| r.is_empty() && r.primary.index.0 == pos);
+            let (left, right) = ctx.input_mut(|i| {
+                (at(0) && i.consume_key(Modifiers::NONE, Key::ArrowLeft), at(n) && i.consume_key(Modifiers::NONE, Key::ArrowRight))
+            });
+            if right {
+                self.selected = (self.selected + 1).min(last);
+            }
+            if left {
+                self.selected = self.selected.saturating_sub(1);
+            }
+        }
         if down {
-            self.selected = (self.selected + 1).min(last);
+            self.selected = (self.selected + step).min(last);
         }
         if up {
-            if self.selected == 0 && (self.query.trim().is_empty() || self.history_pos.is_some()) {
+            if self.selected < step && (self.query.trim().is_empty() || self.history_pos.is_some()) {
                 self.recall_older(ctx);
-            } else {
-                self.selected = self.selected.saturating_sub(1);
+            } else if self.selected >= step {
+                self.selected -= step;
             }
         }
         if pg_down {
@@ -686,7 +711,8 @@ impl WheretiApp {
         if i >= self.launch_items.len() && i < named_end {
             self.total = self.total.saturating_sub(1);
         }
-        self.rows.remove(i);
+        let gone = self.rows.remove(i);
+        self.thumbs.forget(&gone.path);
         for s in [&mut self.close_start, &mut self.content_start].into_iter().flatten() {
             if *s > i {
                 *s -= 1;
@@ -1056,6 +1082,11 @@ impl WheretiApp {
             });
         }
 
+        if self.grid_view() {
+            self.results_grid(ui, ctx, p);
+            return;
+        }
+
         // The list: name results, the section header, content results (taller,
         // with a snippet). Heights differ, so the list is virtualised here:
         // only the items in view are laid out and painted.
@@ -1204,6 +1235,11 @@ impl WheretiApp {
         self.snippets.end_frame();
         self.scroll_offset = out.state.clamped_offset().y;
         self.view_height = out.inner_rect.height();
+        self.after_list(ctx, clicked, dragged, menu_for);
+    }
+
+    /// A click, double click, drag or right click on result `i`.
+    fn after_list(&mut self, ctx: &egui::Context, clicked: Option<(usize, bool)>, dragged: Option<usize>, menu_for: Option<usize>) {
         if let Some((i, open)) = clicked {
             self.selected = i;
             if open {
@@ -1233,6 +1269,116 @@ impl WheretiApp {
                 self.flash(e);
             }
         }
+    }
+
+    /// Pictures as a grid of thumbnails: the Images filter.
+    fn grid_view(&self) -> bool {
+        self.page == Page::Search && self.filter == Filter::Images && self.launch_items.is_empty()
+    }
+
+    /// The Images grid: square-ish tiles with Windows' thumbnail and the
+    /// name, virtualised by line like the list.
+    fn results_grid(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, p: &Palette) {
+        const MIN_TILE: f32 = 156.0;
+        const GAP: f32 = 10.0;
+        const NAME_H: f32 = 30.0;
+        self.thumbs.receive(ctx);
+        let width = (ui.available_width() - 4.0).max(MIN_TILE);
+        let cols = (((width + GAP) / (MIN_TILE + GAP)).floor() as usize).max(1);
+        let tile_w = (width - GAP * (cols - 1) as f32) / cols as f32;
+        let image_h = (tile_w * 0.75).round();
+        let line_h = image_h + NAME_H + GAP;
+        self.grid_cols = cols;
+        let lines = self.rows.len().div_ceil(cols);
+        let total = lines as f32 * line_h;
+
+        let mut area = egui::ScrollArea::vertical().auto_shrink([false, false]);
+        if self.scroll_to_selected && self.view_height > 0.0 && !self.rows.is_empty() {
+            let top = (self.selected.min(self.rows.len() - 1) / cols) as f32 * line_h;
+            let mut off = self.scroll_offset;
+            if top < off {
+                off = top;
+            } else if top + line_h > off + self.view_height {
+                off = top + line_h - self.view_height;
+            }
+            area = area.vertical_scroll_offset(off.max(0.0));
+            self.scroll_to_selected = false;
+        }
+        let (mut clicked, mut dragged, mut menu_for) = (None, None, None);
+        let rows = &self.rows;
+        let thumbs = &mut self.thumbs;
+        let file_icons = &mut self.file_icons;
+        let selected = self.selected;
+        let grid_id = ui.scope_id().with("grid");
+        let out = area.show_viewport(ui, |ui, viewport| {
+            let (whole, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), total), Sense::hover());
+            let first = (viewport.min.y / line_h).floor().max(0.0) as usize;
+            let last = ((viewport.max.y / line_h).ceil() as usize).min(lines);
+            for line in first..last {
+                for col in 0..cols {
+                    let i = line * cols + col;
+                    let Some(row) = rows.get(i) else { break };
+                    let tile = Rect::from_min_size(
+                        Pos2::new(whole.left() + col as f32 * (tile_w + GAP), whole.top() + line as f32 * line_h),
+                        Vec2::new(tile_w, image_h + NAME_H),
+                    );
+                    let resp = ui.interact(tile, grid_id.with(i), Sense::click_and_drag());
+                    let name = row.path.rsplit('\\').next().unwrap_or(&row.path);
+                    resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::ListBoxOption, true, i == selected, name));
+                    let painter = ui.painter_at(tile.expand(2.0));
+                    let is_sel = i == selected;
+                    let fill = if is_sel { p.accent_soft } else if resp.hovered() { p.hover } else { p.surface };
+                    painter.rect_filled(tile, 10.0, fill);
+                    if is_sel {
+                        painter.rect_stroke(tile, 10.0, Stroke::new(2.0, p.accent), egui::StrokeKind::Inside);
+                    }
+                    let image_rect = Rect::from_min_size(tile.min, Vec2::new(tile_w, image_h)).shrink(6.0);
+                    match thumbs.get(&row.path) {
+                        Some(tex) => {
+                            // fill the tile, cropping the middle (as Explorer's tiles)
+                            let [tw, th] = tex.size().map(|v| v as f32);
+                            let (iw, ih) = (image_rect.width(), image_rect.height());
+                            let scale = (iw / tw).max(ih / th);
+                            let (uw, uh) = ((iw / (tw * scale)).min(1.0), (ih / (th * scale)).min(1.0));
+                            let uv = Rect::from_center_size(Pos2::new(0.5, 0.5), Vec2::new(uw, uh));
+                            egui::Image::new((tex.id(), image_rect.size())).uv(uv).corner_radius(7.0).paint_at(ui, image_rect);
+                        }
+                        None => {
+                            // until it comes: the file's icon
+                            if let Some(icon) = file_icons.get(ui.ctx(), &row.path, row.is_dir) {
+                                let r = Rect::from_center_size(image_rect.center(), Vec2::splat(40.0));
+                                painter.image(icon.id(), r, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
+                            }
+                        }
+                    }
+                    let name_rect = Rect::from_min_max(
+                        Pos2::new(tile.left() + 8.0, image_rect.bottom() + 4.0),
+                        Pos2::new(tile.right() - 8.0, tile.bottom() - 4.0),
+                    );
+                    let mut job = egui::text::LayoutJob::simple_singleline(
+                        name.to_string(),
+                        FontId::proportional(12.5),
+                        if is_sel { p.text } else { p.text2 },
+                    );
+                    job.wrap = egui::text::TextWrapping::truncate_at_width(name_rect.width());
+                    let galley = ui.fonts_mut(|f| f.layout_job(job));
+                    painter.galley(Pos2::new(name_rect.left(), name_rect.center().y - galley.size().y / 2.0), galley, p.text2);
+                    let resp = resp.on_hover_text(row.path.as_str());
+                    if resp.drag_started() {
+                        dragged = Some(i);
+                    } else if resp.secondary_clicked() {
+                        menu_for = Some(i);
+                    } else if resp.double_clicked() {
+                        clicked = Some((i, true));
+                    } else if resp.clicked() {
+                        clicked = Some((i, false));
+                    }
+                }
+            }
+        });
+        self.scroll_offset = out.state.clamped_offset().y;
+        self.view_height = out.inner_rect.height();
+        self.after_list(ctx, clicked, dragged, menu_for);
     }
 
     /// While document contents are still being indexed: an offer to look in
