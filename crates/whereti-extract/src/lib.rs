@@ -7,6 +7,7 @@
 //! Every format is bounded: output is capped at `max_chars`, and no archive
 //! entry is inflated beyond `MAX_ENTRY` (zip bombs).
 
+mod archive;
 mod email;
 mod ocr;
 pub mod tags;
@@ -74,6 +75,8 @@ pub enum Kind {
     PowerPointBinary,
     /// A picture: its text is read with the OCR of Windows.
     Image,
+    /// ZIP, 7z, RAR: the names inside, and the text of the documents.
+    Archive,
 }
 
 pub fn kind_of(ext: &str) -> Option<Kind> {
@@ -91,6 +94,7 @@ pub fn kind_of(ext: &str) -> Option<Kind> {
         "doc" | "dot" => Kind::WordBinary,
         "ppt" | "pps" | "pot" => Kind::PowerPointBinary,
         e if IMAGE_EXTS.contains(&e) => Kind::Image,
+        e if archive::is_archive(e) => Kind::Archive,
         e if TEXT_EXTS.contains(&e) => Kind::Text,
         _ => return None,
     })
@@ -99,8 +103,12 @@ pub fn kind_of(ext: &str) -> Option<Kind> {
 /// Extensions with a converter, besides plain text.
 const DOC_EXTS: &[&str] = &[
     "docx", "docm", "dotx", "dotm", "pptx", "pptm", "ppsx", "potx", "xlsx", "xlsm", "xlsb", "xls", "ods", "odt", "odp",
-    "pdf", "rtf", "html", "htm", "xhtml", "eml", "msg", "doc", "dot", "ppt", "pps", "pot",
+    "pdf", "rtf", "html", "htm", "xhtml", "eml", "msg", "doc", "dot", "ppt", "pps", "pot", "zip", "7z", "rar",
 ];
+
+/// The end of a ZIP too large to send whole: `extract(ZIP_END, ...)` lists
+/// its names from there (see archive::zip_tail_names).
+pub const ZIP_END: &str = "zip-end";
 
 /// Pictures whose text is read by OCR (HEIC only where its codec is installed).
 const IMAGE_EXTS: &[&str] = &["jpg", "jpeg", "jpe", "jfif", "png", "bmp", "tif", "tiff", "gif", "webp", "heic", "heif"];
@@ -126,8 +134,12 @@ const TEXT_EXTS: &[&str] = &[
 ];
 
 pub fn extract(ext: &str, bytes: &[u8], max_chars: usize) -> Result<Extracted, ExtractError> {
-    let kind = kind_of(ext).ok_or(ExtractError::Unsupported)?;
     let mut out = Out::new(max_chars);
+    if ext == ZIP_END {
+        archive::zip_tail_names(bytes, &mut out)?;
+        return Ok(out.finish());
+    }
+    let kind = kind_of(ext).ok_or(ExtractError::Unsupported)?;
     match kind {
         Kind::Text => out.push(&decode_text(bytes)?),
         Kind::Docx => docx(bytes, &mut out)?,
@@ -163,6 +175,11 @@ pub fn extract(ext: &str, bytes: &[u8], max_chars: usize) -> Result<Extracted, E
         Kind::Outlook => ole::msg(bytes, &mut out)?,
         Kind::WordBinary => ole::doc(bytes, &mut out)?,
         Kind::PowerPointBinary => ole::ppt(bytes, &mut out)?,
+        Kind::Archive => match ext.to_ascii_lowercase().as_str() {
+            "zip" => archive::zip(bytes, &mut out)?,
+            "7z" => archive::sevenz(bytes, &mut out)?,
+            _ => archive::rar(bytes, &mut out)?,
+        },
     }
     Ok(out.finish())
 }
