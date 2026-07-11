@@ -321,23 +321,29 @@ impl WheretiApp {
             ui.label(egui::RichText::new(tr("SEARCHES")).size(11.0).color(p.text3).family(semibold()));
         });
         ui.add_space(6.0);
-        let mut picked = None;
+        let (mut picked, mut removed) = (None, None);
         ui.horizontal(|ui| {
             ui.add_space(8.0);
             ui.spacing_mut().item_spacing.x = 6.0;
             for q in past.iter().take(8) {
                 let shown: String = if q.chars().count() > 32 { q.chars().take(31).chain(['…']).collect() } else { q.clone() };
                 // only whole chips: stop where the next would not fit
-                let width = ui.painter().layout_no_wrap(shown.clone(), FontId::new(13.0, medium()), p.text2).size().x + 24.0;
+                let width = ui.painter().layout_no_wrap(shown.clone(), FontId::new(13.0, medium()), p.text2).size().x + 44.0;
                 if width > ui.available_width() {
                     break;
                 }
-                if chip(ui, p, &shown, false).on_hover_text(q.as_str()).clicked() {
-                    picked = Some(q.clone());
+                match past_chip(ui, p, &shown, q) {
+                    Some(true) => picked = Some(q.clone()),
+                    Some(false) => removed = Some(q.clone()),
+                    None => {}
                 }
             }
         });
         ui.add_space(14.0);
+        if let Some(q) = removed {
+            crate::history::remove(&q);
+            self.focus_search = true;
+        }
         let Some(q) = picked else { return false };
         self.query = q;
         self.history_pos = None;
@@ -1983,6 +1989,32 @@ pub(crate) fn chip(ui: &mut egui::Ui, p: &Palette, text: &str, selected: bool) -
     painter.rect(rect, 8.0, fill, stroke, egui::StrokeKind::Inside);
     painter.galley(rect.center() - galley.size() / 2.0, galley, color);
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// A past search: its text, and a small × that forgets it. `Some(true)`:
+/// search it again; `Some(false)`: the × was clicked.
+fn past_chip(ui: &mut egui::Ui, p: &Palette, shown: &str, query: &str) -> Option<bool> {
+    let font = FontId::new(13.0, medium());
+    let galley = ui.painter().layout_no_wrap(shown.to_string(), font, p.text2);
+    let size = Vec2::new(galley.size().x + 44.0, 30.0);
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, query));
+    let x_rect = Rect::from_center_size(Pos2::new(rect.right() - 15.0, rect.center().y), Vec2::splat(18.0));
+    let x_resp = ui.interact(x_rect, resp.id.with("x"), Sense::click());
+    let x_label = trf!("Forget “{search}”", search = query);
+    x_resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, &x_label));
+    let painter = ui.painter();
+    let (fill, color) = if resp.hovered() || x_resp.hovered() { (p.hover, p.text) } else { (p.surface, p.text2) };
+    painter.rect(rect, 8.0, fill, Stroke::new(1.0, p.border), egui::StrokeKind::Inside);
+    painter.galley(Pos2::new(rect.left() + 12.0, rect.center().y - galley.size().y / 2.0), galley, color);
+    if x_resp.hovered() {
+        painter.circle_filled(x_rect.center(), 9.0, theme::with_alpha(p.text3, 0.18));
+    }
+    icons::paint(painter, x_rect.shrink(4.0), Icon::Close, if x_resp.hovered() { p.text } else { p.text3 });
+    if x_resp.on_hover_text(&x_label).clicked() {
+        return Some(false);
+    }
+    resp.on_hover_text(query).on_hover_cursor(egui::CursorIcon::PointingHand).clicked().then_some(true)
 }
 
 /// "Ctrl+Shift+Space" drawn as small key caps with a hairline.

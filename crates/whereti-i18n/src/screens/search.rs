@@ -238,6 +238,17 @@ pub const ENTRIES: &[Entry] = &[
         ro: "Fereastra nu a acceptat folderul (o aplicație pornită ca administrator nu îl primește de la whereti).",
     },
     Entry {
+        en: "Forget “{search}”",
+        note: "Tooltip of the small × on a past search (empty search page); {search} is that search's text.",
+        de: "„{search}“ vergessen",
+        es: "Olvidar «{search}»",
+        fr: "Oublier « {search} »",
+        it: "Dimentica «{search}»",
+        pl: "Zapomnij „{search}”",
+        pt_br: "Esquecer “{search}”",
+        ro: "Uită „{search}”",
+    },
+    Entry {
         en: "SEARCHES",
         note: "Small uppercase section header on the empty search page, above buttons that repeat the user's last searches; keep it uppercase.",
         de: "SUCHEN",

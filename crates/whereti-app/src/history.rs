@@ -73,6 +73,19 @@ pub fn list() -> Vec<String> {
     with(|l| l.clone()).unwrap_or_default()
 }
 
+/// The × on one past search: forget just that one.
+pub fn remove(query: &str) {
+    let Some(text) = with(|list| {
+        list.retain(|q| q != query);
+        list.join("\n") + "\n"
+    }) else {
+        return;
+    };
+    std::thread::spawn(move || {
+        let _ = std::fs::write(file(), text);
+    });
+}
+
 /// Settings > Search > "Forget".
 pub fn forget() {
     if let Ok(mut l) = LIST.lock() {
