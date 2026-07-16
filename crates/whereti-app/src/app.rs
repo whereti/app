@@ -2164,7 +2164,7 @@ impl WheretiApp {
             return;
         }
         // examples with words are in the user's language; commands are not
-        let groups: [(&str, Vec<(String, &str)>); 3] = [
+        let groups: [(&str, Vec<(String, &str)>); 4] = [
             (
                 tr("Words"),
                 vec![
@@ -2193,6 +2193,17 @@ impl WheretiApp {
                     (tr("content:rent").to_string(), tr("Files that have the words inside")),
                     (tr("loc:italy").to_string(), tr("Photos taken in a town, region or country")),
                     (r"regex:^IMG_\d{4}".to_string(), tr("A regular expression, for experts")),
+                ],
+            ),
+            (
+                tr("Photos, music and documents"),
+                vec![
+                    ("taken:2025-08".to_string(), tr("Photos taken in a month, a year or between two dates")),
+                    ("camera:iphone".to_string(), tr("Photos taken with this camera or phone")),
+                    ("width:>4000".to_string(), tr("Pictures this wide (height: as well), in pixels")),
+                    ("artist:queen".to_string(), tr("Songs by this artist (album: as well)")),
+                    ("duration:>5m".to_string(), tr("Songs and videos this long: 90s, 5m, 1h")),
+                    (tr("author:popescu").to_string(), tr("Word, Excel and PowerPoint files by this author")),
                 ],
             ),
         ];

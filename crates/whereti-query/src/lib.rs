@@ -8,6 +8,8 @@
 //! dm:today  dm:lastweek  dm:2024-01..2024-06
 //! path:D:\proiecte       proiecte\whereti (a backslash means "match the path")
 //! folder:  file:         regex:^IMG_\d{4}\.jpg$
+//! taken:2025-08  camera:canon  width:>4000  height:<1000
+//! artist:queen  album:abbey  duration:>5m  author:popescu
 //! mine:                  only the user's own files: no system, hidden,
 //!                        program, cache or build folders
 //! ```
@@ -47,8 +49,29 @@ pub enum Term {
     /// Where a photo was taken: a town, region or country (`loc:roma`),
     /// looked up in the content index among photos.
     Place(String),
+    /// A property read from the file: when a photo was taken, its camera
+    /// and size, a song's artist, a video's length, a document's author.
+    /// Answered by the engine's property store, never by names.
+    Prop(Prop),
     /// Every term must match (e.g. `folder:raport` = folder AND "raport").
     All(Vec<Term>),
+}
+
+/// A file property condition (`Term::Prop`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Prop {
+    /// When the photo was taken, minutes since 1601 UTC, inclusive.
+    Taken { min: u32, max: u32 },
+    /// Picture or video size in pixels, inclusive.
+    Width { min: u32, max: u32 },
+    Height { min: u32, max: u32 },
+    /// Song or video length in seconds, inclusive.
+    Duration { min: u32, max: u32 },
+    /// Folded text the property must contain.
+    Camera(String),
+    Artist(String),
+    Album(String),
+    Author(String),
 }
 
 /// Terms joined by OR, optionally negated.
@@ -219,6 +242,14 @@ fn parse_function(prefix: &str, value: &str, quoted: bool, ctx: &DateCtx) -> Opt
         "regex" if !value.is_empty() => Some(Term::Regex(value.to_string())),
         "c" | "content" if !value.is_empty() => Some(Term::Content(fold(value))),
         "loc" | "location" | "place" if !value.is_empty() => Some(Term::Place(fold(value))),
+        "taken" | "dt" | "datetaken" => date::parse_range(value, ctx).map(|(min, max)| Term::Prop(Prop::Taken { min, max })),
+        "width" => parse_count(value, 1).map(|(min, max)| Term::Prop(Prop::Width { min, max })),
+        "height" => parse_count(value, 1).map(|(min, max)| Term::Prop(Prop::Height { min, max })),
+        "duration" | "length" => parse_duration(value).map(|(min, max)| Term::Prop(Prop::Duration { min, max })),
+        "camera" if !value.is_empty() => Some(Term::Prop(Prop::Camera(fold(value)))),
+        "artist" if !value.is_empty() => Some(Term::Prop(Prop::Artist(fold(value)))),
+        "album" if !value.is_empty() => Some(Term::Prop(Prop::Album(fold(value)))),
+        "author" if !value.is_empty() => Some(Term::Prop(Prop::Author(fold(value)))),
         "mine" if value.is_empty() => Some(Term::Mine),
         "folder" | "file" => {
             let kind = if prefix == "folder" { Term::FoldersOnly } else { Term::FilesOnly };
@@ -231,6 +262,80 @@ fn parse_function(prefix: &str, value: &str, quoted: bool, ctx: &DateCtx) -> Opt
         }
         _ => None,
     }
+}
+
+/// `>4000`, `<=1000`, `1000..2000`, `4000` -> inclusive range, each number
+/// times `unit`.
+fn parse_count(v: &str, unit: u32) -> Option<(u32, u32)> {
+    parse_range_with(v, |s| s.trim().parse::<u32>().ok().map(|n| (n.saturating_mul(unit), 1)))
+}
+
+/// `>5m`, `<90`, `1h..2h`, `3m30s` (seconds by default) -> seconds, inclusive.
+fn parse_duration(v: &str) -> Option<(u32, u32)> {
+    parse_range_with(v, |s| {
+        let s = s.trim().to_ascii_lowercase();
+        if s.is_empty() {
+            return None;
+        }
+        // "1h30m", "3m30s", "90s", "90", "5min"
+        let (mut total, mut num, mut unit) = (0u32, String::new(), 1u32);
+        let mut chars = s.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c.is_ascii_digit() {
+                num.push(c);
+                continue;
+            }
+            let u = match c {
+                'h' => 3600,
+                'm' => {
+                    // "min"
+                    if chars.peek() == Some(&'i') {
+                        chars.next();
+                        if chars.peek() == Some(&'n') {
+                            chars.next();
+                        }
+                    }
+                    60
+                }
+                's' => 1,
+                _ => return None,
+            };
+            total = total.saturating_add(num.parse::<u32>().ok()?.saturating_mul(u));
+            num.clear();
+            unit = u;
+        }
+        if !num.is_empty() {
+            total = total.saturating_add(num.parse::<u32>().ok()?);
+            unit = 1;
+        }
+        // "5m" means 5:00 to 5:59
+        Some((total, unit))
+    })
+}
+
+/// The comparison syntax of `size:`, for any value parser returning
+/// `(value, unit)`: `=v` / `v` cover a whole unit.
+fn parse_range_with(v: &str, value: impl Fn(&str) -> Option<(u32, u32)>) -> Option<(u32, u32)> {
+    let v = v.trim();
+    if let Some((a, b)) = v.split_once("..") {
+        let lo = if a.trim().is_empty() { 0 } else { value(a)?.0 };
+        let hi = if b.trim().is_empty() { u32::MAX } else { value(b).map(|(n, u)| n.saturating_add(u - 1))? };
+        return (lo <= hi).then_some((lo, hi));
+    }
+    for op in [">=", "<=", ">", "<", "="] {
+        if let Some(rest) = v.strip_prefix(op) {
+            let (n, u) = value(rest)?;
+            return Some(match op {
+                ">=" => (n, u32::MAX),
+                "<=" => (0, n),
+                ">" => (n.saturating_add(1), u32::MAX),
+                "<" => (0, n.checked_sub(1)?),
+                _ => (n, n.saturating_add(u - 1)),
+            });
+        }
+    }
+    let (n, u) = value(v)?;
+    Some((n, n.saturating_add(u - 1)))
 }
 
 const KB: u64 = 1024;
@@ -374,5 +479,25 @@ mod tests {
     fn dates_parse_through_the_query() {
         assert!(matches!(one("dm:today"), Term::Modified { .. }));
         assert_eq!(one("dm:nicicând"), Term::Text("dm:nicicand".into()));
+    }
+
+    #[test]
+    fn property_terms() {
+        let ctx = DateCtx { now: (day_from_civil(2026, 10, 24) * 1440) as u32, tz_offset: 0 };
+        let one = |q: &str| match parse(q, &ctx).clauses.as_slice() {
+            [c] => c.any_of[0].clone(),
+            other => panic!("{q}: {other:?}"),
+        };
+        assert_eq!(one("width:>4000"), Term::Prop(Prop::Width { min: 4001, max: u32::MAX }));
+        assert_eq!(one("height:1000..2000"), Term::Prop(Prop::Height { min: 1000, max: 2000 }));
+        assert_eq!(one("duration:>5m"), Term::Prop(Prop::Duration { min: 301, max: u32::MAX }));
+        assert_eq!(one("duration:3m30s"), Term::Prop(Prop::Duration { min: 210, max: 210 }));
+        assert_eq!(one("duration:5min"), Term::Prop(Prop::Duration { min: 300, max: 359 }));
+        assert_eq!(one("duration:1h.."), Term::Prop(Prop::Duration { min: 3600, max: u32::MAX }));
+        assert_eq!(one("camera:Canon"), Term::Prop(Prop::Camera("canon".into())));
+        assert_eq!(one("artist:\"Ștefan Bănică\""), Term::Prop(Prop::Artist("stefan banica".into())));
+        assert!(matches!(one("taken:2025-08"), Term::Prop(Prop::Taken { .. })));
+        // not a property: searched as text
+        assert_eq!(one("width:wide"), Term::Text("width:wide".into()));
     }
 }

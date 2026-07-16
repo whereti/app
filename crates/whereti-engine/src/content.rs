@@ -102,6 +102,8 @@ pub struct Content {
     tags_state: Mutex<String>,
     /// Where the content index lives (for the one-time OCR pass marker).
     dir: PathBuf,
+    /// Properties of photos, music, videos and Office files (props.rs).
+    props: Mutex<crate::props::PropStore>,
 }
 
 /// The photo model (PLAN.md §55): CLIP ViT-B/32's image half, int8, from
@@ -150,6 +152,7 @@ impl Content {
             tags_state: Mutex::new("off".into()),
             pictures: RwLock::new(picture_folders()),
             dir: dir.to_path_buf(),
+            props: Mutex::new(crate::props::PropStore::load(dir)),
         })
     }
 
@@ -454,11 +457,27 @@ impl Content {
         for k in &removed {
             index.remove(*k);
             known.remove(k);
+            self.props.lock().remove(*k);
         }
+        // indexed before properties were read (or read without them): only those
+        let props_missing: Vec<Candidate> = {
+            let store = self.props.lock();
+            wanted
+                .values()
+                .filter(|c| {
+                    known.get(&c.key).is_some_and(|i| i.size == c.size && i.modified == c.modified)
+                        && !store.contains(c.key)
+                        && crate::props::has_props(&ext_of(&c.path))
+                })
+                .map(|c| Candidate { props_only: true, media_only: false, photo_only: false, path: c.path.clone(), ..*c })
+                .collect()
+        };
         let mut todo: Vec<Candidate> = wanted
             .into_values()
             .filter(|c| known.get(&c.key).is_none_or(|i| i.size != c.size || i.modified != c.modified))
+            .chain(props_missing)
             .collect();
+        let tz = system::date_ctx().tz_offset;
         // The newest files first: what the user works on becomes searchable first.
         todo.sort_unstable_by_key(|c| std::cmp::Reverse(c.modified));
         if !removed.is_empty() || !todo.is_empty() {
@@ -528,11 +547,18 @@ impl Content {
                 }
             }
             let started = Instant::now();
-            if let Some((what, text)) = extract(&c, sandbox, tagger.as_mut()) {
-                index.put(c.key, what, &text).map_err(|e| e.to_string())?;
-                known.insert(c.key, what);
-                since_commit += 1;
-                indexed += 1;
+            if !c.props_only {
+                if let Some((what, text)) = extract(&c, sandbox, tagger.as_mut()) {
+                    index.put(c.key, what, &text).map_err(|e| e.to_string())?;
+                    known.insert(c.key, what);
+                    since_commit += 1;
+                    indexed += 1;
+                }
+            }
+            let ext = ext_of(&c.path);
+            if crate::props::has_props(&ext) {
+                let p = crate::props::read(Path::new(&c.path), &ext, tz);
+                self.props.lock().set(c.key, p);
             }
             {
                 let mut s = self.status.lock();
@@ -541,6 +567,7 @@ impl Content {
             }
             if since_commit >= COMMIT_EVERY_DOCS || (since_commit > 0 && last_commit.elapsed() >= COMMIT_EVERY) {
                 index.commit().map_err(|e| e.to_string())?;
+                self.props.lock().save();
                 self.update_counts(index, known);
                 since_commit = 0;
                 last_commit = Instant::now();
@@ -552,6 +579,7 @@ impl Content {
             std::thread::sleep(rest.max(Duration::from_millis(5)));
         }
         index.commit().map_err(|e| e.to_string())?;
+        self.props.lock().save();
         self.update_counts(index, known);
         if indexed > 0 || !removed.is_empty() {
             shared.log.log(format!(
@@ -610,7 +638,12 @@ impl Content {
                 }
             }
         }
-        let entries = idx.filter(&filters, &entries);
+        let (prop_clauses, filters) = crate::props::split(&filters);
+        let mut entries = idx.filter(&filters, &entries);
+        if !prop_clauses.is_empty() {
+            let with: HashSet<u32> = self.entries_with_props(idx, &prop_clauses).into_iter().collect();
+            entries.retain(|e| with.contains(e));
+        }
         let paths: Vec<String> = entries.iter().map(|&e| idx.full_path(e)).collect();
         let allowed = caller.can_read(&paths);
         let w = idx.weigher_with(active);
@@ -801,6 +834,23 @@ impl Content {
     }
 }
 
+impl Content {
+    /// The live entries whose properties satisfy `clauses` (props.rs).
+    pub fn entries_with_props(&self, idx: &NameIndex, clauses: &[Clause]) -> Vec<u32> {
+        let keys = self.props.lock().keys_matching(clauses);
+        keys.into_iter()
+            .filter_map(|k| {
+                let (letter, record) = split_key(k);
+                idx.volume_index(letter).and_then(|v| idx.live_entry_of(v, record))
+            })
+            .collect()
+    }
+}
+
+fn ext_of(path: &str) -> String {
+    path.rsplit_once('.').map(|(_, e)| e).filter(|e| !e.contains('\\')).unwrap_or("").to_ascii_lowercase()
+}
+
 /// Separates the words to look for in file contents from the conditions
 /// that filter the files. With `content:` terms, plain words stay name
 /// conditions (`raport content:total` = name has „raport”, text has „total”).
@@ -837,6 +887,10 @@ struct Candidate {
     /// A photo in a pictures folder: only where it was taken is read, not
     /// its text (OCR on every holiday photo would cost hours).
     photo_only: bool,
+    /// Music or a video: no text, only its properties.
+    media_only: bool,
+    /// Already indexed: only its properties are read now.
+    props_only: bool,
 }
 
 /// Photos a camera or phone writes its GPS position into.
@@ -907,6 +961,8 @@ fn files_in(idx: &NameIndex, folders: &[String], pictures: &[String]) -> HashMap
             size: idx.size(e),
             modified: idx.modified(e),
             photo_only: false,
+            media_only: false,
+            props_only: false,
         });
     }
     // photos in the pictures folders: where they were taken
@@ -939,7 +995,56 @@ fn files_in(idx: &NameIndex, folders: &[String], pictures: &[String]) -> HashMap
                 size: idx.size(e),
                 modified: idx.modified(e),
                 photo_only: true,
+                media_only: false,
+                props_only: false,
             });
+        }
+    }
+    // music and videos in the user's folders: their properties
+    let media_dirs: Vec<String> = folders.iter().chain(pictures).cloned().chain(media_folders()).collect();
+    if !media_dirs.is_empty() {
+        let paths = media_dirs
+            .iter()
+            .map(|f| {
+                let mut p = fold(f.trim_end_matches('\\'));
+                p.push('\\');
+                Term::Path(p)
+            })
+            .collect();
+        let exts = crate::props::AUDIO_EXTS.iter().chain(crate::props::VIDEO_EXTS).map(|e| e.to_string()).collect();
+        let media = Query {
+            clauses: vec![file(), Clause { negated: false, any_of: paths }, Clause { negated: false, any_of: vec![Term::Ext(exts)] }],
+        };
+        let entries: Vec<u32> = idx.matching(&media).into_iter().filter(|&e| idx.flags(e) & SKIP == 0).collect();
+        let records = idx.records_of(&entries);
+        for (e, r) in entries.into_iter().zip(records) {
+            let Some(record) = r else { continue };
+            let k = key(idx.volume_of(e).letter(), record);
+            out.entry(k).or_insert_with(|| Candidate {
+                key: k,
+                path: idx.full_path(e),
+                size: idx.size(e),
+                modified: idx.modified(e),
+                photo_only: false,
+                media_only: true,
+                props_only: false,
+            });
+        }
+    }
+    out
+}
+
+/// Every user's Music and Videos folders.
+fn media_folders() -> Vec<String> {
+    let drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into());
+    let Ok(dir) = std::fs::read_dir(format!(r"{drive}\Users")) else { return Vec::new() };
+    let mut out = Vec::new();
+    for p in dir.flatten().map(|e| e.path()).filter(|p| p.is_dir()) {
+        for sub in ["Music", "Videos"] {
+            let f = p.join(sub);
+            if f.is_dir() && !std::fs::symlink_metadata(&f).is_ok_and(|m| m.file_type().is_symlink()) {
+                out.push(f.display().to_string());
+            }
         }
     }
     out
@@ -1004,6 +1109,9 @@ fn photo_tags(path: &Path, tagger: &mut TagWorker) -> Option<String> {
 /// Reads one file. `tagger`: recognise what is in photos (when on).
 fn extract(c: &Candidate, sandbox: Option<&Sandbox>, tagger: Option<&mut TagWorker>) -> Option<(Indexed, String)> {
     let what = |status| Indexed { size: c.size, modified: c.modified, status };
+    if c.media_only {
+        return Some((what(Status::Empty), String::new()));
+    }
     let path = Path::new(&c.path);
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
     let kind = whereti_extract::kind_of(&ext)?;
@@ -1222,7 +1330,7 @@ mod tests {
         let file = |name: &str, text: &str, modified: u32| {
             let path = dir.join(name);
             std::fs::write(&path, text).unwrap();
-            Candidate { key: modified as u64, path: path.to_string_lossy().into_owned(), size: text.len() as u64, modified, photo_only: false }
+            Candidate { key: modified as u64, path: path.to_string_lossy().into_owned(), size: text.len() as u64, modified, photo_only: false, media_only: false, props_only: false }
         };
         let plan = ScanPlan {
             needles: vec![fold("chirie"), fold("Iulie")],

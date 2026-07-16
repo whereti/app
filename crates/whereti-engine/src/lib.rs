@@ -8,6 +8,7 @@ pub mod activity;
 pub mod content;
 pub mod engine;
 pub mod log;
+pub mod props;
 pub mod removal;
 pub mod sync;
 pub mod system;

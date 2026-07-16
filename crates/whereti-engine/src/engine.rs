@@ -211,7 +211,14 @@ impl Engine {
                         Sort::Modified => SortBy::Modified,
                     },
                 };
-                let res = idx.search_ranked(&query, &opts, &r.usage, self.shared.activity.ranking(idx));
+                // taken:, camera:, artist:…: among the files with those properties
+                let (prop_clauses, rest) = crate::props::split(&query);
+                let res = if prop_clauses.is_empty() {
+                    idx.search_ranked(&query, &opts, &r.usage, self.shared.activity.ranking(idx))
+                } else {
+                    let within = self.content.entries_with_props(idx, &prop_clauses);
+                    idx.search_within(&rest, &opts, &r.usage, self.shared.activity.ranking(idx), &within)
+                };
                 let rows = res
                     .hits
                     .iter()

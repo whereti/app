@@ -195,6 +195,36 @@ impl NameIndex {
         (starts.concat(), inside.concat())
     }
 
+    /// Like `search_ranked`, among `within` only (entries found elsewhere,
+    /// e.g. by their properties); no close matches.
+    pub fn search_within(
+        &self,
+        query: &Query,
+        opts: &SearchOptions,
+        usage: &[(String, u8)],
+        active: Arc<Vec<u8>>,
+        within: &[u32],
+    ) -> SearchResults {
+        let mut warnings = Vec::new();
+        let clauses = self.compile_clauses(query, &mut warnings);
+        let mut s = Scratch::default();
+        let mut hits: Vec<u32> = within
+            .iter()
+            .copied()
+            .filter(|&i| (i as usize) < self.len() && self.flags[i as usize] & HIDDEN_FROM_SEARCH == 0 && self.eval(&clauses, i, &mut s))
+            .collect();
+        hits.sort_unstable();
+        hits.dedup();
+        let rank_needle = query.clauses.iter().find_map(|c| match (&c.negated, c.any_of.as_slice()) {
+            (false, [Term::Text(t)]) => Some(t.clone()),
+            _ => None,
+        });
+        let total = hits.len();
+        let used = if opts.sort == SortBy::Relevance { self.usage_positions(&hits, usage) } else { Vec::new() };
+        let hits = self.top(hits, opts, rank_needle.as_deref(), &used, active);
+        SearchResults { total, hits, warnings, close: 0 }
+    }
+
     /// Every live entry matching `query`, unranked, in index order.
     pub fn matching(&self, query: &Query) -> Vec<u32> {
         self.matching_entries(query, &mut Vec::new())
@@ -313,7 +343,7 @@ impl NameIndex {
             Term::Mine => Matcher::Mine,
             Term::FilesOnly => Matcher::Files,
             // Answered by the content index, never by names.
-            Term::Content(_) | Term::Place(_) => Matcher::Never,
+            Term::Content(_) | Term::Place(_) | Term::Prop(_) => Matcher::Never,
             Term::All(ts) => Matcher::All(ts.iter().map(|t| self.compile(t, warnings)).collect()),
         }
     }
