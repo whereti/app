@@ -94,6 +94,11 @@ pub struct WheretiApp {
     /// `rows[close_start..]` (up to `content_start`) are close matches: a
     /// word of the query one letter off.
     close_start: Option<usize>,
+    /// `dupe:`: where each set of identical files starts in `rows`, with
+    /// its header.
+    group_labels: std::collections::HashMap<usize, String>,
+    /// The first set's header, shown as the list's own header.
+    first_group_label: Option<String>,
     /// The rename box (F2), while it is open.
     renaming: Option<Renaming>,
     /// The Up arrow brought back this past search (index in history::list).
@@ -182,6 +187,8 @@ impl WheretiApp {
             total: 0,
             content_start: None,
             close_start: None,
+            group_labels: std::collections::HashMap::new(),
+            first_group_label: None,
             renaming: None,
             history_pos: None,
             file_dialog: None,
@@ -285,7 +292,9 @@ impl WheretiApp {
         self.pending_launch =
             if recent || self.filter != Filter::All { Vec::new() } else { self.launch.search(&self.query) };
         self.scan = None; // a new search: offer it again, from the start
-        let content = !recent && !highlight_needles(&self.query).is_empty();
+        // dupe: compares files; their text is not the question
+        let dupes = self.query.split_whitespace().any(|w| matches!(w.to_ascii_lowercase().as_str(), "dupe:" | "dupes:" | "duplicate:" | "duplicates:"));
+        let content = !recent && !dupes && !highlight_needles(&self.query).is_empty();
         self.content_pending = content;
         self.searcher.search(Job { generation: self.generation, query, sort, limit: RESULT_LIMIT, content, recent });
     }
@@ -404,6 +413,26 @@ impl WheretiApp {
                         .map(|it| Row { path: it.target.clone(), is_dir: false, size: 0, modified: 0, flags: 0 })
                         .collect();
                     let close = reply.close as usize;
+                    // sets of identical files: a header over each
+                    self.group_labels.clear();
+                    let mut at = rows.len();
+                    for (k, &n) in reply.groups.iter().enumerate() {
+                        let n = n as usize;
+                        let size = reply.rows.get(at - rows.len()).map_or(0, |r| r.size);
+                        let label = trf!(
+                            "{n} IDENTICAL FILES · {size} EACH · {free} TO FREE",
+                            n = n,
+                            size = shell::size(size),
+                            free = shell::size(size * (n as u64 - 1))
+                        );
+                        self.group_labels.insert(at, if k == 0 { String::new() } else { label });
+                        at += n;
+                    }
+                    let first_group = reply.groups.first().map(|&n| {
+                        let size = reply.rows.first().map_or(0, |r| r.size);
+                        trf!("{n} IDENTICAL FILES · {size} EACH · {free} TO FREE", n = n, size = shell::size(size), free = shell::size(size * (n as u64 - 1)))
+                    });
+                    self.first_group_label = first_group;
                     rows.extend(reply.rows);
                     self.close_start = (close > 0).then(|| rows.len() - close.min(rows.len()));
                     self.launch_items = launch;
@@ -1069,6 +1098,8 @@ impl WheretiApp {
             tr("RECENT").to_string()
         } else if launch_n > 0 {
             tr("APPS AND SETTINGS").to_string()
+        } else if let Some(first) = &self.first_group_label {
+            first.clone()
         } else if self.close_start == Some(0) {
             tr("CLOSE MATCHES").to_string()
         } else if self.content_start == Some(0) {
@@ -1108,6 +1139,10 @@ impl WheretiApp {
             if launch_n > 0 && i == launch_n && content_start != Some(i) && close_start != Some(i) {
                 let files = if self.total == 0 { tr("FILES").to_string() } else { trn!("{n} RESULT|{n} RESULTS", self.total) };
                 labels.push(files);
+                list.push(Item::Section(labels.len() - 1));
+            }
+            if let Some(label) = self.group_labels.get(&i).filter(|l| !l.is_empty()) {
+                labels.push(label.clone());
                 list.push(Item::Section(labels.len() - 1));
             }
             if close_start == Some(i) && i > 0 {
@@ -2185,6 +2220,7 @@ impl WheretiApp {
                     (tr("folder:projects").to_string(), tr("Only folders (file: only files)")),
                     (r"path:C:\Users".to_string(), tr("Only inside a folder")),
                     ("mine:".to_string(), tr("Only your own files, without programs and system files")),
+                    ("dupe: size:>100mb".to_string(), tr("Identical files: the copies you could delete to free space")),
                 ],
             ),
             (

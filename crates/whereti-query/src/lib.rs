@@ -53,6 +53,9 @@ pub enum Term {
     /// and size, a song's artist, a video's length, a document's author.
     /// Answered by the engine's property store, never by names.
     Prop(Prop),
+    /// `dupe:` identical files (answered by the engine, which compares
+    /// their content; to the name index, simply files).
+    Dupe,
     /// Every term must match (e.g. `folder:raport` = folder AND "raport").
     All(Vec<Term>),
 }
@@ -251,6 +254,7 @@ fn parse_function(prefix: &str, value: &str, quoted: bool, ctx: &DateCtx) -> Opt
         "album" if !value.is_empty() => Some(Term::Prop(Prop::Album(fold(value)))),
         "author" if !value.is_empty() => Some(Term::Prop(Prop::Author(fold(value)))),
         "mine" if value.is_empty() => Some(Term::Mine),
+        "dupe" | "dupes" | "duplicate" | "duplicates" if value.is_empty() => Some(Term::Dupe),
         "folder" | "file" => {
             let kind = if prefix == "folder" { Term::FoldersOnly } else { Term::FilesOnly };
             if value.is_empty() {

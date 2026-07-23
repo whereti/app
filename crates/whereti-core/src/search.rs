@@ -341,7 +341,7 @@ impl NameIndex {
             Term::Modified { min, max } => Matcher::Modified(*min, *max),
             Term::FoldersOnly => Matcher::Folders,
             Term::Mine => Matcher::Mine,
-            Term::FilesOnly => Matcher::Files,
+            Term::FilesOnly | Term::Dupe => Matcher::Files,
             // Answered by the content index, never by names.
             Term::Content(_) | Term::Place(_) | Term::Prop(_) => Matcher::Never,
             Term::All(ts) => Matcher::All(ts.iter().map(|t| self.compile(t, warnings)).collect()),

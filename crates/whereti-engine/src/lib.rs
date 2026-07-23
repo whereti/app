@@ -6,6 +6,7 @@
 
 pub mod activity;
 pub mod content;
+pub mod dupes;
 pub mod engine;
 pub mod log;
 pub mod props;

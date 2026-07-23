@@ -45,6 +45,8 @@ const WALK_MIN: Duration = Duration::from_secs(60);
 /// ...and at least this often; in between, by how long a walk takes.
 const WALK_MAX: Duration = Duration::from_secs(30 * 60);
 /// The most results one search may return.
+/// How long one `dupe:` search compares files.
+const DUPES_BUDGET: Duration = Duration::from_secs(6);
 const MAX_LIMIT: u32 = 10_000;
 /// Save once the journal has moved this share of its size since the last save,
 /// so a restart can always replay instead of rescanning.
@@ -192,6 +194,37 @@ impl Engine {
                 version: PROTOCOL_VERSION,
                 server: format!("whereti {}", env!("CARGO_PKG_VERSION")),
             },
+            Request::Search(r) if crate::dupes::wanted(&whereti_query::parse(&r.query, &system::date_ctx())) => {
+                let t = Instant::now();
+                let query = whereti_query::parse(&r.query, &system::date_ctx());
+                // sizes from the index (held briefly), then the files compared without it
+                let candidates = {
+                    let guard = self.shared.index.read();
+                    let Some(idx) = guard.as_ref() else {
+                        return Response::Search(SearchReply {
+                            warnings: vec![format!("the index is not ready yet ({})", self.state())],
+                            ..Default::default()
+                        });
+                    };
+                    crate::dupes::size_groups(idx, &query)
+                };
+                let found = crate::dupes::verify(candidates, DUPES_BUDGET, r.limit.min(MAX_LIMIT) as usize, caller);
+                let mut warnings = Vec::new();
+                if found.checked < found.total {
+                    warnings.push(format!(
+                        "the largest {} of {} sets of same-size files were compared; narrow the search (size:, ext:, path:) for the others",
+                        found.checked, found.total
+                    ));
+                }
+                Response::Search(SearchReply {
+                    total: found.groups.len() as u64,
+                    groups: found.groups.iter().map(|g| g.len() as u32).collect(),
+                    rows: found.groups.into_iter().flatten().collect(),
+                    warnings,
+                    micros: t.elapsed().as_micros() as u64,
+                    close: 0,
+                })
+            }
             Request::Search(r) => {
                 let t = Instant::now();
                 let guard = self.shared.index.read();
@@ -236,6 +269,7 @@ impl Engine {
                     warnings: res.warnings,
                     micros: t.elapsed().as_micros() as u64,
                     close: res.close as u64,
+                    groups: Vec::new(),
                 })
             }
             Request::GetConfig => {

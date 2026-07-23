@@ -28,7 +28,7 @@ use windows_sys::Win32::System::Pipes::{
 };
 
 pub const PIPE_NAME: &str = r"\\.\pipe\whereti";
-pub const PROTOCOL_VERSION: u32 = 10;
+pub const PROTOCOL_VERSION: u32 = 11;
 const MAX_MESSAGE: usize = 64 << 20;
 
 /// The account that created the pipe (OW), SYSTEM and Administrators: full
@@ -122,6 +122,9 @@ pub struct SearchReply {
     /// The last `close` rows are close matches (a word one letter off),
     /// not counted in `total`.
     pub close: u64,
+    /// `dupe:`: the rows come in sets of identical files, of these sizes
+    /// (`total` is then the number of sets).
+    pub groups: Vec<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -602,6 +605,7 @@ mod tests {
             warnings: vec![],
             micros: 1200,
             close: 0,
+            groups: vec![],
         });
         let mut buf = Vec::new();
         write_message(&mut buf, &resp).unwrap();
