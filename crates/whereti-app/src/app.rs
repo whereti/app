@@ -94,6 +94,8 @@ pub struct WheretiApp {
     /// `rows[close_start..]` (up to `content_start`) are close matches: a
     /// word of the query one letter off.
     close_start: Option<usize>,
+    /// `rows[network_start..]` (up to `content_start`) are in the network folders.
+    network_start: Option<usize>,
     /// `dupe:`: where each set of identical files starts in `rows`, with
     /// its header.
     group_labels: std::collections::HashMap<usize, String>,
@@ -173,6 +175,10 @@ impl WheretiApp {
     pub fn new(ctx: &egui::Context, requests: Arc<Requests>, tray: Option<Tray>, visible: bool) -> Self {
         let wake_ctx = ctx.clone();
         let searcher = Searcher::start(move || wake_ctx.request_repaint());
+        {
+            let ctx = ctx.clone();
+            crate::network::start(move || ctx.request_repaint());
+        }
         let settings = SettingsState::load();
         let wake_ctx = ctx.clone();
         let preview = Preview::start(settings.preview, move || wake_ctx.request_repaint());
@@ -187,6 +193,7 @@ impl WheretiApp {
             total: 0,
             content_start: None,
             close_start: None,
+            network_start: None,
             group_labels: std::collections::HashMap::new(),
             first_group_label: None,
             renaming: None,
@@ -402,7 +409,7 @@ impl WheretiApp {
     fn apply_updates(&mut self) {
         for u in self.searcher.updates().collect::<Vec<_>>() {
             match u {
-                Update::Results { generation, reply, round_trip } => {
+                Update::Results { generation, reply, round_trip, network } => {
                     if generation != self.generation {
                         continue; // an older search; a newer one is on its way
                     }
@@ -434,6 +441,11 @@ impl WheretiApp {
                     });
                     self.first_group_label = first_group;
                     rows.extend(reply.rows);
+                    // the network folders' matches, under their own heading
+                    let known: std::collections::HashSet<String> = rows.iter().map(|r| r.path.to_lowercase()).collect();
+                    let network: Vec<Row> = network.into_iter().filter(|r| !known.contains(&r.path.to_lowercase())).collect();
+                    self.network_start = (!network.is_empty()).then_some(rows.len());
+                    rows.extend(network);
                     self.close_start = (close > 0).then(|| rows.len() - close.min(rows.len()));
                     self.launch_items = launch;
                     self.rows = rows;
@@ -742,13 +754,13 @@ impl WheretiApp {
     /// Takes row `i` off the list (a file just deleted), keeping the
     /// sections and the count right.
     fn remove_row(&mut self, i: usize) {
-        let named_end = self.close_start.or(self.content_start).unwrap_or(self.rows.len());
+        let named_end = self.close_start.or(self.network_start).or(self.content_start).unwrap_or(self.rows.len());
         if i >= self.launch_items.len() && i < named_end {
             self.total = self.total.saturating_sub(1);
         }
         let gone = self.rows.remove(i);
         self.thumbs.forget(&gone.path);
-        for s in [&mut self.close_start, &mut self.content_start].into_iter().flatten() {
+        for s in [&mut self.close_start, &mut self.network_start, &mut self.content_start].into_iter().flatten() {
             if *s > i {
                 *s -= 1;
             }
@@ -757,7 +769,10 @@ impl WheretiApp {
         if self.content_start == Some(self.rows.len()) {
             self.content_start = None;
         }
-        if self.close_start.is_some() && self.close_start == Some(self.content_start.unwrap_or(self.rows.len())) {
+        if self.network_start.is_some() && self.network_start == Some(self.content_start.unwrap_or(self.rows.len())) {
+            self.network_start = None;
+        }
+        if self.close_start.is_some() && self.close_start == Some(self.network_start.or(self.content_start).unwrap_or(self.rows.len())) {
             self.close_start = None;
         }
         self.selected = self.selected.min(self.rows.len().saturating_sub(1));
@@ -1143,6 +1158,10 @@ impl WheretiApp {
             }
             if let Some(label) = self.group_labels.get(&i).filter(|l| !l.is_empty()) {
                 labels.push(label.clone());
+                list.push(Item::Section(labels.len() - 1));
+            }
+            if self.network_start == Some(i) {
+                labels.push(trn!("ON THE NETWORK · {n}|ON THE NETWORK · {n}", (self.rows.len() - i - content_start.map_or(0, |c| self.rows.len() - c)) as u64));
                 list.push(Item::Section(labels.len() - 1));
             }
             if close_start == Some(i) && i > 0 {
@@ -2745,6 +2764,11 @@ fn middle_elide(ui: &egui::Ui, path: &str, font: FontId, width: f32) -> String {
         }
     }
     format!("{}\\…\\{}", parts[0], parts[parts.len() - 1])
+}
+
+/// Today and the time zone, for parsing `dm:`/`taken:` in the app.
+pub(crate) fn date_ctx() -> whereti_query::DateCtx {
+    whereti_query::DateCtx { now: now_minutes().clamp(0, u32::MAX as i64) as u32, tz_offset: shell::tz_offset() }
 }
 
 pub(crate) fn now_minutes() -> i64 {

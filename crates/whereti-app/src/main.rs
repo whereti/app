@@ -13,6 +13,7 @@ mod icons;
 mod launch;
 mod license;
 mod links;
+mod network;
 mod preview;
 mod recent;
 mod searcher;

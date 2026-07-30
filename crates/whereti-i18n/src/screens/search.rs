@@ -249,6 +249,17 @@ pub const ENTRIES: &[Entry] = &[
         ro: "Uită „{search}”",
     },
     Entry {
+        en: "ON THE NETWORK · {n}|ON THE NETWORK · {n}",
+        note: "Small uppercase section header over the results found in the network folders; {n} is how many; keep it uppercase; plural forms after |.",
+        de: "IM NETZWERK · {n}|IM NETZWERK · {n}",
+        es: "EN LA RED · {n}|EN LA RED · {n}",
+        fr: "SUR LE RÉSEAU · {n}|SUR LE RÉSEAU · {n}",
+        it: "IN RETE · {n}|IN RETE · {n}",
+        pl: "W SIECI · {n}|W SIECI · {n}|W SIECI · {n}",
+        pt_br: "NA REDE · {n}|NA REDE · {n}",
+        ro: "ÎN REȚEA · {n}|ÎN REȚEA · {n}|ÎN REȚEA · {n}",
+    },
+    Entry {
         en: "SEARCHES",
         note: "Small uppercase section header on the empty search page, above buttons that repeat the user's last searches; keep it uppercase.",
         de: "SUCHEN",

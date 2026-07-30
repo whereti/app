@@ -474,6 +474,59 @@ fn search(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
     });
     ui.add_space(14.0);
 
+    // ---- network folders and NAS
+    card(ui, p, |ui| {
+        ui.add_space(12.0);
+        ui.label(egui::RichText::new(tr("Network folders")).size(14.5).family(semibold()).color(p.text));
+        ui.add_space(2.0);
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(tr("Shared folders, a NAS or a mapped drive (\\\\nas\\photos, Z:\\). whereti looks through them once an hour, as you, and finds them by name."))
+                .size(12.5)
+                .color(p.text2),
+            )
+            .wrap(),
+        );
+        ui.add_space(10.0);
+        let folders = crate::network::folders();
+        let mut list = folders.clone();
+        if !folders.is_empty() {
+            if let Some(i) = path_list(ui, p, &folders, &mut app.file_icons) {
+                list.remove(i);
+            }
+            // how each one went
+            for (folder, s) in crate::network::states().into_iter().filter(|(f, _)| folders.contains(f)) {
+                let text = if s.walking {
+                    trf!("{folder}: looking through it…", folder = folder)
+                } else if let Some(e) = &s.error {
+                    trf!("{folder}: not reachable ({error})", folder = folder, error = e)
+                } else {
+                    crate::trn!("{folder}: {n} file|{folder}: {n} files", s.files, folder = folder)
+                };
+                let color = if s.error.is_some() { p.warn } else { p.text3 };
+                ui.label(egui::RichText::new(text).size(12.0).color(color));
+            }
+            ui.add_space(10.0);
+        }
+        ui.horizontal(|ui| {
+            if button(ui, p, tr("Add a folder…"), false).clicked() {
+                if let Some(path) = app.hwnd.and_then(crate::win::pick_folder) {
+                    if !list.iter().any(|x| x.eq_ignore_ascii_case(&path)) {
+                        list.push(path);
+                    }
+                }
+            }
+            if !folders.is_empty() && button(ui, p, tr("Look through them now"), false).clicked() {
+                crate::network::refresh();
+            }
+        });
+        if list != folders {
+            crate::network::set_folders(list);
+        }
+        ui.add_space(12.0);
+    });
+    ui.add_space(14.0);
+
     // ---- folders to skip
     card(ui, p, |ui| {
         ui.add_space(12.0);

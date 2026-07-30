@@ -25,7 +25,8 @@ pub struct Job {
 }
 
 pub enum Update {
-    Results { generation: u64, reply: SearchReply, round_trip: Duration },
+    /// `network`: matches in the user's network folders (network.rs).
+    Results { generation: u64, reply: SearchReply, round_trip: Duration, network: Vec<whereti_ipc::Row> },
     Content { generation: u64, reply: ContentReply },
     /// One step of looking in the documents not indexed yet.
     Scan { generation: u64, reply: ScanReply },
@@ -190,7 +191,7 @@ fn worker(jobs: Receiver<Msg>, out: Sender<Update>, wake: impl Fn()) {
                 let t = Instant::now();
                 let rows = crate::recent::recent_files(job.limit as usize);
                 let reply = SearchReply { total: rows.len() as u64, rows, ..Default::default() };
-                let _ = out.send(Update::Results { generation: job.generation, reply, round_trip: t.elapsed() });
+                let _ = out.send(Update::Results { generation: job.generation, reply, round_trip: t.elapsed(), network: Vec::new() });
             }
             if let Some(job) = p.search {
                 let usage = crate::usage::for_query(&job.query);
@@ -200,7 +201,13 @@ fn worker(jobs: Receiver<Msg>, out: Sender<Update>, wake: impl Fn()) {
                     Response::Search(mut reply) => {
                         let round_trip = t.elapsed();
                         refresh_rows(&mut reply);
-                        let _ = out.send(Update::Results { generation: job.generation, reply, round_trip });
+                        let network = if reply.groups.is_empty() {
+                            let query = whereti_query::parse(&job.query, &crate::app::date_ctx());
+                            crate::network::search(&query, job.limit as usize)
+                        } else {
+                            Vec::new()
+                        };
+                        let _ = out.send(Update::Results { generation: job.generation, reply, round_trip, network });
                         wake();
                     }
                     Response::Error(e) => {
