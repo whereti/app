@@ -167,6 +167,8 @@ pub struct Found {
     /// Same-size groups looked at, of `total`.
     pub checked: usize,
     pub total: usize,
+    /// It stopped because the time ran out (not because enough were found).
+    pub out_of_time: bool,
 }
 
 /// Compares the files of each same-size group, the largest first, until
@@ -178,8 +180,13 @@ pub fn verify(candidates: Vec<Vec<Row>>, budget: Duration, limit: usize, caller:
     let mut groups = Vec::new();
     let mut files = 0;
     let mut checked = 0;
+    let mut out_of_time = false;
     for group in candidates {
-        if (t.elapsed() >= budget && checked > 0) || files >= limit {
+        if files >= limit {
+            break;
+        }
+        if t.elapsed() >= budget && checked > 0 {
+            out_of_time = true;
             break;
         }
         checked += 1;
@@ -214,7 +221,7 @@ pub fn verify(candidates: Vec<Vec<Row>>, budget: Duration, limit: usize, caller:
             }
         }
     }
-    Found { groups, checked, total }
+    Found { groups, checked, total, out_of_time }
 }
 
 #[cfg(test)]

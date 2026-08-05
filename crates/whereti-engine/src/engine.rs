@@ -210,7 +210,7 @@ impl Engine {
                 };
                 let found = crate::dupes::verify(candidates, DUPES_BUDGET, r.limit.min(MAX_LIMIT) as usize, caller);
                 let mut warnings = Vec::new();
-                if found.checked < found.total {
+                if found.out_of_time {
                     warnings.push(format!(
                         "the largest {} of {} sets of same-size files were compared; narrow the search (size:, ext:, path:) for the others",
                         found.checked, found.total
