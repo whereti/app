@@ -9,6 +9,7 @@
 
 mod archive;
 mod email;
+pub mod meaning;
 mod ocr;
 pub mod tags;
 mod ole;
@@ -111,7 +112,7 @@ const DOC_EXTS: &[&str] = &[
 pub const ZIP_END: &str = "zip-end";
 
 /// Pictures whose text is read by OCR (HEIC only where its codec is installed).
-const IMAGE_EXTS: &[&str] = &["jpg", "jpeg", "jpe", "jfif", "png", "bmp", "tif", "tiff", "gif", "webp", "heic", "heif"];
+const IMAGE_EXTS: &[&str] = &["jpg", "jpeg", "jpe", "jfif", "png", "bmp", "tif", "tiff", "gif", "webp", "heic", "heif", "avif", "jxl"];
 
 /// Windows has an OCR language installed (servers often have none).
 pub fn ocr_available() -> bool {

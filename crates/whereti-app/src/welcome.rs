@@ -142,7 +142,7 @@ pub fn show(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 10.0;
                     let w = (ui.available_width() - 20.0) / 3.0;
-                    tip(ui, p, w, Icon::Search, tr("Type part of a name"), tr("“factura”, “*.pdf”, “ext:docx dm:today”"));
+                    tip(ui, p, w, Icon::Search, tr("Type part of a name"), tr("“invoice”, “*.pdf”, “ext:docx dm:today”"));
                     tip(ui, p, w, Icon::Document, tr("Inside documents too"), tr("Words in PDFs, Word and Excel files show up under the names."));
                     tip(ui, p, w, Icon::Panel, tr("Tab shows a preview"), tr("Enter opens, Ctrl+Enter shows the file in Explorer."));
                 });

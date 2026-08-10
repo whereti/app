@@ -593,7 +593,7 @@ pub(crate) fn ext_weight(ext: &str) -> i8 {
         "pdf" | "doc" | "docx" | "odt" | "rtf" | "txt" | "md" | "xls" | "xlsx" | "xlsm" | "ods" | "csv" | "ppt"
         | "pptx" | "odp" | "pages" | "numbers" | "key" | "epub" | "eml" | "msg" | "one"
         // pictures
-        | "jpg" | "jpeg" | "png" | "gif" | "heic" | "heif" | "webp" | "bmp" | "tif" | "tiff" | "raw" | "cr2"
+        | "jpg" | "jpeg" | "png" | "gif" | "heic" | "heif" | "avif" | "jxl" | "webp" | "bmp" | "tif" | "tiff" | "raw" | "cr2"
         | "cr3" | "nef" | "arw" | "dng" | "psd" | "ai" | "svg"
         // music and video
         | "mp3" | "m4a" | "flac" | "wav" | "ogg" | "opus" | "aac" | "wma" | "mp4" | "mov" | "mkv" | "avi"

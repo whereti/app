@@ -151,7 +151,7 @@ impl Snippets {
 fn photo_line(path: &str, needles: &[String]) -> Option<Snippet> {
     let ext = path.rsplit_once('.')?.1.to_ascii_lowercase();
     let head = match ext.as_str() {
-        "heic" | "heif" => 64 << 20,
+        "heic" | "heif" | "avif" => 64 << 20,
         "jpg" | "jpeg" | "jpe" | "jfif" | "tif" | "tiff" | "png" | "webp" | "bmp" | "gif" => 512 << 10,
         _ => return None,
     };
