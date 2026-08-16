@@ -317,6 +317,18 @@ impl Engine {
                     Err(e) => Response::Error(e),
                 }
             }
+            Request::SetMeaning { on } => match self.content.set_meaning(on) {
+                Ok(()) => Response::Ok,
+                Err(e) => Response::Error(e),
+            },
+            Request::MeaningSearch(r) => {
+                let guard = self.shared.index.read();
+                let Some(idx) = guard.as_ref() else {
+                    return Response::Content(Default::default());
+                };
+                let query = whereti_query::parse(&r.query, &system::date_ctx());
+                Response::Content(self.content.search_meaning(idx, &query, r.limit.min(MAX_LIMIT) as usize, caller))
+            }
             Request::SetPhotoTags { on } => {
                 self.log(format!("photo recognition turned {} by a client", if on { "on" } else { "off" }));
                 match self.content.set_photo_tags(on) {

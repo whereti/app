@@ -31,7 +31,7 @@ pub struct Props {
 
 pub const AUDIO_EXTS: &[&str] = &["mp3", "flac", "m4a", "aac", "ogg", "opus", "wav", "wma", "aiff", "ape", "wv"];
 pub const VIDEO_EXTS: &[&str] = &["mp4", "m4v", "mov"];
-const PHOTO_EXTS: &[&str] = &["jpg", "jpeg", "jpe", "jfif", "heic", "heif", "tif", "tiff", "png", "webp", "dng", "cr2", "nef", "arw"];
+const PHOTO_EXTS: &[&str] = &["jpg", "jpeg", "jpe", "jfif", "heic", "heif", "avif", "jxl", "tif", "tiff", "png", "webp", "dng", "cr2", "nef", "arw"];
 const OFFICE_EXTS: &[&str] = &["docx", "docm", "xlsx", "xlsm", "pptx", "pptm"];
 const ODF_EXTS: &[&str] = &["odt", "ods", "odp"];
 

@@ -29,6 +29,9 @@ pub fn serve_stdio() -> i32 {
     if let Some(model) = arg("--tags") {
         return serve_tags(Path::new(&model));
     }
+    if let (Some(model), Some(tokenizer)) = (arg("--embed"), arg("--tokenizer")) {
+        return serve_embed(Path::new(&model), Path::new(&tokenizer));
+    }
     let ext = arg("--ext").unwrap_or_default();
     let max = arg("--max").and_then(|m| m.parse().ok()).unwrap_or(1_000_000);
 
@@ -85,6 +88,44 @@ fn serve_tags(model: &Path) -> i32 {
         .unwrap_or_else(|_| Err("the model failed".into()));
         let line = match answer {
             Ok(tags) => format!("ok\t{}\n", tags.iter().map(|(i, s)| format!("{i}:{s:.3}")).collect::<Vec<_>>().join(",")),
+            Err(e) => format!("err\t{}\n", e.replace(['\n', '\r', '\t'], " ")),
+        };
+        if out.write_all(line.as_bytes()).and_then(|_| out.flush()).is_err() {
+            return 0;
+        }
+    }
+}
+
+/// Worker side of `EmbedWorker`: texts in, vectors out, until a zero
+/// length. Request: u32 little-endian length, then UTF-8 text. Answer: one
+/// line, `ok<TAB>` and the 384 signed bytes in hex, or `err<TAB>message`.
+fn serve_embed(model: &Path, tokenizer: &Path) -> i32 {
+    let dll = std::env::current_exe().map(|e| e.with_file_name("onnxruntime.dll")).unwrap_or_default();
+    let mut embedder: Option<crate::meaning::Embedder> = None;
+    let (mut input, mut out) = (std::io::stdin().lock(), std::io::stdout().lock());
+    loop {
+        let mut len = [0u8; 4];
+        if input.read_exact(&mut len).is_err() {
+            return 0;
+        }
+        let len = u32::from_le_bytes(len) as usize;
+        if len == 0 {
+            return 0;
+        }
+        let mut bytes = vec![0u8; len];
+        if input.read_exact(&mut bytes).is_err() {
+            return EXIT_DAMAGED;
+        }
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        let answer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if embedder.is_none() {
+                embedder = Some(crate::meaning::Embedder::new(&dll, model, tokenizer)?);
+            }
+            embedder.as_mut().map_or(Err("no model".to_string()), |e| e.embed(&text))
+        }))
+        .unwrap_or_else(|_| Err("the model failed".into()));
+        let line = match answer {
+            Ok(v) => format!("ok\t{}\n", crate::meaning::quantize(&v).iter().map(|b| format!("{:02x}", *b as u8)).collect::<String>()),
             Err(e) => format!("err\t{}\n", e.replace(['\n', '\r', '\t'], " ")),
         };
         if out.write_all(line.as_bytes()).and_then(|_| out.flush()).is_err() {
@@ -219,10 +260,46 @@ impl Sandbox {
 /// than the timeout kills the worker, and the next photo starts a new one.
 pub struct TagWorker {
     exe: PathBuf,
-    model: PathBuf,
+    /// The worker's mode: `--tags <model>`, `--embed <model> --tokenizer <file>`.
+    args: Vec<std::ffi::OsString>,
     memory_limit: usize,
     pub timeout: Duration,
     running: Option<RunningTagger>,
+}
+
+/// The text model's worker (search by meaning): the same process kind as
+/// `TagWorker`, in its `--embed` mode.
+pub struct EmbedWorker(TagWorker);
+
+impl EmbedWorker {
+    /// The worker next to the running executable, with the model and its
+    /// tokenizer; `None` when something is missing.
+    pub fn beside_current_exe(model: &Path, tokenizer: &Path) -> Option<EmbedWorker> {
+        let exe = std::env::current_exe().ok()?.with_file_name("whereti-extract.exe");
+        let dll = exe.with_file_name("onnxruntime.dll");
+        (exe.is_file() && dll.is_file() && model.is_file() && tokenizer.is_file()).then(|| {
+            EmbedWorker(TagWorker {
+                exe,
+                args: vec!["--embed".into(), model.into(), "--tokenizer".into(), tokenizer.into()],
+                memory_limit: 768 << 20,
+                timeout: Duration::from_secs(20),
+                running: None,
+            })
+        })
+    }
+
+    /// The vector of one text ("query: …" or "passage: …"), 384 signed bytes.
+    pub fn embed(&mut self, text: &str) -> Result<Vec<i8>, String> {
+        let hex = self.0.ask(text.as_bytes())?;
+        let v: Vec<i8> = (0..hex.len() / 2)
+            .filter_map(|i| u8::from_str_radix(hex.get(i * 2..i * 2 + 2)?, 16).ok().map(|b| b as i8))
+            .collect();
+        if v.len() == crate::meaning::DIMS {
+            Ok(v)
+        } else {
+            Err("bad vector".into())
+        }
+    }
 }
 
 struct RunningTagger {
@@ -249,7 +326,7 @@ impl TagWorker {
         let dll = exe.with_file_name("onnxruntime.dll");
         (exe.is_file() && dll.is_file() && model.is_file()).then(|| TagWorker {
             exe,
-            model: model.to_path_buf(),
+            args: vec!["--tags".into(), model.into()],
             memory_limit: 768 << 20,
             timeout: Duration::from_secs(20),
             running: None,
@@ -258,7 +335,7 @@ impl TagWorker {
 
     /// A given worker executable (tests); onnxruntime.dll must be beside it.
     pub fn with_exe(exe: PathBuf, model: &Path) -> TagWorker {
-        TagWorker { exe, model: model.to_path_buf(), memory_limit: 768 << 20, timeout: Duration::from_secs(20), running: None }
+        TagWorker { exe, args: vec!["--tags".into(), model.into()], memory_limit: 768 << 20, timeout: Duration::from_secs(20), running: None }
     }
 
     fn start(&self) -> Result<RunningTagger, String> {
@@ -268,8 +345,7 @@ impl TagWorker {
         const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
         let job = Job::new(self.memory_limit).map_err(|e| format!("job object: {e}"))?;
         let mut child = Command::new(&self.exe)
-            .arg("--tags")
-            .arg(&self.model)
+            .args(&self.args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -298,6 +374,18 @@ impl TagWorker {
 
     /// The tags of one photo: `(label, share)`, best first.
     pub fn tags(&mut self, bytes: &[u8]) -> Result<Vec<(usize, f32)>, String> {
+        let list = self.ask(bytes)?;
+        Ok(list
+            .split(',')
+            .filter_map(|t| {
+                let (i, s) = t.split_once(':')?;
+                Some((i.parse().ok()?, s.parse().ok()?))
+            })
+            .collect())
+    }
+
+    /// One request; the answer after `ok<TAB>`.
+    fn ask(&mut self, bytes: &[u8]) -> Result<String, String> {
         if self.running.is_none() {
             self.running = Some(self.start()?);
         }
@@ -316,13 +404,7 @@ impl TagWorker {
             }
         };
         match line.split_once('\t') {
-            Some(("ok", list)) => Ok(list
-                .split(',')
-                .filter_map(|t| {
-                    let (i, s) = t.split_once(':')?;
-                    Some((i.parse().ok()?, s.parse().ok()?))
-                })
-                .collect()),
+            Some(("ok", answer)) => Ok(answer.to_string()),
             Some(("err", e)) => Err(e.to_string()),
             _ => Err(format!("unexpected answer: {line}")),
         }
@@ -358,6 +440,9 @@ fn wait(process: std::os::windows::io::RawHandle, timeout: Duration) -> bool {
 
 /// A Job Object that caps memory and kills its processes when dropped.
 struct Job(windows_sys::Win32::Foundation::HANDLE);
+
+// SAFETY: a kernel handle may be used and closed from any thread.
+unsafe impl Send for Job {}
 
 impl Job {
     fn new(memory_limit: usize) -> std::io::Result<Job> {

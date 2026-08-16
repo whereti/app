@@ -260,6 +260,17 @@ pub const ENTRIES: &[Entry] = &[
         ro: "ÎN REȚEA · {n}|ÎN REȚEA · {n}|ÎN REȚEA · {n}",
     },
     Entry {
+        en: "CLOSE IN MEANING",
+        note: "Small uppercase section header over documents found by meaning (they say what was searched in other words); keep it uppercase.",
+        de: "ÄHNLICHE BEDEUTUNG",
+        es: "SIGNIFICADO PARECIDO",
+        fr: "SENS PROCHE",
+        it: "SIGNIFICATO SIMILE",
+        pl: "PODOBNE ZNACZENIE",
+        pt_br: "SIGNIFICADO PARECIDO",
+        ro: "APROAPE CA ÎNȚELES",
+    },
+    Entry {
         en: "SEARCHES",
         note: "Small uppercase section header on the empty search page, above buttons that repeat the user's last searches; keep it uppercase.",
         de: "SUCHEN",
@@ -1093,7 +1104,7 @@ pub const ENTRIES: &[Entry] = &[
         it: "fattura",
         pl: "faktura",
         pt_br: "fatura",
-        ro: "factura",
+        ro: "factură",
     },
     Entry {
         en: "receipt",

@@ -9,6 +9,7 @@ pub mod content;
 pub mod dupes;
 pub mod engine;
 pub mod log;
+pub mod meaning;
 pub mod props;
 pub mod removal;
 pub mod sync;

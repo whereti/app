@@ -28,7 +28,7 @@ use windows_sys::Win32::System::Pipes::{
 };
 
 pub const PIPE_NAME: &str = r"\\.\pipe\whereti";
-pub const PROTOCOL_VERSION: u32 = 11;
+pub const PROTOCOL_VERSION: u32 = 12;
 const MAX_MESSAGE: usize = 64 << 20;
 
 /// The account that created the pipe (OW), SYSTEM and Administrators: full
@@ -76,6 +76,12 @@ pub enum Request {
     /// Recognise objects and animals in photos (downloads the model the
     /// first time it is turned on).
     SetPhotoTags { on: bool },
+    /// Search documents by meaning (downloads the text model the first
+    /// time it is turned on; off forgets the documents' vectors).
+    SetMeaning { on: bool },
+    /// Documents close in meaning to the plain words of the query (two at
+    /// least); the other conditions filter them. Answered as `Content`.
+    MeaningSearch(SearchRequest),
     /// Learn where the user works (the folders where their files change)
     /// and rank those first; off forgets what was learnt.
     SetWorkFolders { on: bool },
@@ -178,6 +184,8 @@ pub struct ContentStatus {
     /// Objects and animals in photos (PLAN.md §55): "off", "on",
     /// "downloading:<bytes>/<total>" (the model) or "error: …".
     pub tags: String,
+    /// Search by meaning (PLAN.md §65): the same states as `tags`.
+    pub meaning: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

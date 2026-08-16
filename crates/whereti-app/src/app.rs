@@ -61,7 +61,7 @@ impl Filter {
         match self {
             Filter::All => "",
             Filter::Documents => "ext:pdf;doc;docx;xls;xlsx;ppt;pptx;odt;ods;odp;rtf;txt;md;csv;epub;msg;eml",
-            Filter::Images => "ext:jpg;jpeg;png;gif;bmp;webp;heic;tif;tiff;svg;ico;raw;cr2;nef;arw",
+            Filter::Images => "ext:jpg;jpeg;png;gif;bmp;webp;heic;heif;avif;jxl;tif;tiff;svg;ico;raw;cr2;nef;arw;dng",
             Filter::Audio => "ext:mp3;wav;flac;aac;ogg;m4a;wma;opus",
             Filter::Video => "ext:mp4;mkv;avi;mov;wmv;webm;m4v;mpg;mpeg",
             Filter::Folders => "folder:",
@@ -96,6 +96,9 @@ pub struct WheretiApp {
     close_start: Option<usize>,
     /// `rows[network_start..]` (up to `content_start`) are in the network folders.
     network_start: Option<usize>,
+    /// `rows[meaning_start..]` are close in meaning to the query (after the
+    /// content results).
+    meaning_start: Option<usize>,
     /// `dupe:`: where each set of identical files starts in `rows`, with
     /// its header.
     group_labels: std::collections::HashMap<usize, String>,
@@ -194,6 +197,7 @@ impl WheretiApp {
             content_start: None,
             close_start: None,
             network_start: None,
+            meaning_start: None,
             group_labels: std::collections::HashMap::new(),
             first_group_label: None,
             renaming: None,
@@ -303,7 +307,8 @@ impl WheretiApp {
         let dupes = self.query.split_whitespace().any(|w| matches!(w.to_ascii_lowercase().as_str(), "dupe:" | "dupes:" | "duplicate:" | "duplicates:"));
         let content = !recent && !dupes && !highlight_needles(&self.query).is_empty();
         self.content_pending = content;
-        self.searcher.search(Job { generation: self.generation, query, sort, limit: RESULT_LIMIT, content, recent });
+        let meaning = content && self.status.as_ref().is_some_and(|s| s.content.meaning == "on");
+        self.searcher.search(Job { generation: self.generation, query, sort, limit: RESULT_LIMIT, content, recent, meaning });
     }
 
     pub(crate) fn flash(&mut self, msg: impl Into<String>) {
@@ -451,6 +456,7 @@ impl WheretiApp {
                     self.rows = rows;
                     self.total = reply.total;
                     self.content_start = None;
+                    self.meaning_start = None;
                     self.copies.clear();
                     self.round_trip = round_trip;
                     self.warnings = reply.warnings;
@@ -478,6 +484,21 @@ impl WheretiApp {
                     }
                     if !extra.is_empty() {
                         self.content_start = Some(self.rows.len());
+                        self.rows.extend(extra);
+                    }
+                }
+                Update::Meaning { generation, reply } => {
+                    if generation != self.generation {
+                        continue;
+                    }
+                    let shown: std::collections::HashSet<String> = self.rows.iter().map(|r| r.path.to_lowercase()).collect();
+                    let extra: Vec<Row> = reply.rows.into_iter().filter(|r| !shown.contains(&r.path.to_lowercase())).collect();
+                    if !extra.is_empty() {
+                        self.meaning_start = Some(self.rows.len());
+                        // drawn like the content results (with the start of their text)
+                        if self.content_start.is_none() {
+                            self.content_start = Some(self.rows.len());
+                        }
                         self.rows.extend(extra);
                     }
                 }
@@ -1083,7 +1104,7 @@ impl WheretiApp {
                 )
             };
             let icon = if self.query.trim().is_empty() && self.filter == Filter::All { Icon::Clock } else { Icon::Search };
-            if let Some(example) = empty_state(ui, p, icon, p.text3, title, &sub, &["factura", "ext:pdf", "dm:today", "*.jpg"]) {
+            if let Some(example) = empty_state(ui, p, icon, p.text3, title, &sub, &[tr("invoice"), "ext:pdf", "dm:today", "*.jpg"]) {
                 self.query = example.to_string();
                 self.filter = Filter::All;
                 self.run_search();
@@ -1168,7 +1189,11 @@ impl WheretiApp {
                 labels.push(tr("CLOSE MATCHES").to_string());
                 list.push(Item::Section(labels.len() - 1));
             }
-            if content_start == Some(i) {
+            if self.meaning_start == Some(i) {
+                labels.push(tr("CLOSE IN MEANING").to_string());
+                list.push(Item::Section(labels.len() - 1));
+            }
+            if content_start == Some(i) && self.meaning_start != Some(i) {
                 labels.push(section.clone());
                 list.push(Item::Section(labels.len() - 1));
             }
@@ -2661,7 +2686,7 @@ fn type_color(ext: &str, dark: bool) -> Color32 {
         "doc" | "docx" | "odt" | "rtf" | "txt" | "md" => (0x2F, 0x6F, 0xE4),
         "xls" | "xlsx" | "ods" | "csv" => (0x1E, 0x8E, 0x4E),
         "ppt" | "pptx" | "odp" => (0xD9, 0x6A, 0x2B),
-        "jpg" | "jpeg" | "png" | "gif" | "bmp" | "webp" | "heic" | "tif" | "tiff" | "svg" | "ico" | "raw" => {
+        "jpg" | "jpeg" | "png" | "gif" | "bmp" | "webp" | "heic" | "heif" | "avif" | "jxl" | "tif" | "tiff" | "svg" | "ico" | "raw" => {
             (0x16, 0x9E, 0x8F)
         }
         "mp3" | "wav" | "flac" | "aac" | "ogg" | "m4a" | "wma" | "opus" => (0x8E, 0x5B, 0xD6),

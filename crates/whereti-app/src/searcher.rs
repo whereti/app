@@ -22,12 +22,16 @@ pub struct Job {
     pub content: bool,
     /// The "recent" screen: answered from Windows' own recent list.
     pub recent: bool,
+    /// Also look for documents close in meaning (search by meaning is on).
+    pub meaning: bool,
 }
 
 pub enum Update {
     /// `network`: matches in the user's network folders (network.rs).
     Results { generation: u64, reply: SearchReply, round_trip: Duration, network: Vec<whereti_ipc::Row> },
     Content { generation: u64, reply: ContentReply },
+    /// Documents close in meaning to the query.
+    Meaning { generation: u64, reply: ContentReply },
     /// One step of looking in the documents not indexed yet.
     Scan { generation: u64, reply: ScanReply },
     Status(StatusReply),
@@ -53,6 +57,7 @@ enum Msg {
     SetExclusions(Vec<String>),
     SetPhotoTags(bool),
     SetWorkFolders(bool),
+    SetMeaning(bool),
 }
 
 pub struct Searcher {
@@ -98,6 +103,12 @@ impl Searcher {
         let _ = self.tx.send(Msg::SetPhotoTags(on));
     }
 
+    /// Search by meaning on or off (the service downloads the model the
+    /// first time; off forgets the documents' vectors).
+    pub fn set_meaning(&self, on: bool) {
+        let _ = self.tx.send(Msg::SetMeaning(on));
+    }
+
     /// Learning where the user works on or off (off forgets it).
     pub fn set_work_folders(&self, on: bool) {
         let _ = self.tx.send(Msg::SetWorkFolders(on));
@@ -118,6 +129,7 @@ struct Pending {
     exclusions: Option<Vec<String>>,
     photo_tags: Option<bool>,
     work_folders: Option<bool>,
+    meaning: Option<bool>,
 }
 
 fn worker(jobs: Receiver<Msg>, out: Sender<Update>, wake: impl Fn()) {
@@ -141,6 +153,10 @@ fn worker(jobs: Receiver<Msg>, out: Sender<Update>, wake: impl Fn()) {
             }
             Msg::SetWorkFolders(on) => {
                 p.work_folders = Some(on);
+                p.status = true;
+            }
+            Msg::SetMeaning(on) => {
+                p.meaning = Some(on);
                 p.status = true;
             }
         };
@@ -171,6 +187,11 @@ fn worker(jobs: Receiver<Msg>, out: Sender<Update>, wake: impl Fn()) {
         let result = (|| -> std::io::Result<()> {
             if let Some(on) = p.work_folders {
                 if let Response::Error(e) = c.call(&Request::SetWorkFolders { on })? {
+                    let _ = out.send(Update::Done(e));
+                }
+            }
+            if let Some(on) = p.meaning {
+                if let Response::Error(e) = c.call(&Request::SetMeaning { on })? {
                     let _ = out.send(Update::Done(e));
                 }
             }
@@ -222,13 +243,31 @@ fn worker(jobs: Receiver<Msg>, out: Sender<Update>, wake: impl Fn()) {
                         Err(_) => {
                             let usage = crate::usage::for_query(&job.query);
                             let req = Request::ContentSearch(SearchRequest {
-                                query: job.query,
+                                query: job.query.clone(),
                                 limit: 200,
                                 sort: job.sort,
                                 usage,
                             });
                             if let Response::Content(reply) = c.call(&req)? {
                                 let _ = out.send(Update::Content { generation: job.generation, reply });
+                                wake();
+                            }
+                            // then by meaning, if typing still pauses
+                            if job.meaning {
+                                match jobs.recv_timeout(CONTENT_DEBOUNCE) {
+                                    Ok(m) => carried = Some(m),
+                                    Err(_) => {
+                                        let req = Request::MeaningSearch(SearchRequest {
+                                            query: job.query,
+                                            limit: 20,
+                                            sort: job.sort,
+                                            usage: Vec::new(),
+                                        });
+                                        if let Response::Content(reply) = c.call(&req)? {
+                                            let _ = out.send(Update::Meaning { generation: job.generation, reply });
+                                        }
+                                    }
+                                }
                             }
                         }
                     }

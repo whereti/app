@@ -104,6 +104,12 @@ pub struct Content {
     dir: PathBuf,
     /// Properties of photos, music, videos and Office files (props.rs).
     props: Mutex<crate::props::PropStore>,
+    /// Search by meaning: wanted by the user (meaning.txt), its state, the
+    /// documents' vectors and the model's worker (meaning.rs).
+    meaning_on: AtomicBool,
+    meaning_state: Mutex<String>,
+    vectors: Mutex<crate::meaning::Vectors>,
+    model: Mutex<crate::meaning::Model>,
 }
 
 /// The photo model (PLAN.md §55): CLIP ViT-B/32's image half, int8, from
@@ -153,6 +159,10 @@ impl Content {
             pictures: RwLock::new(picture_folders()),
             dir: dir.to_path_buf(),
             props: Mutex::new(crate::props::PropStore::load(dir)),
+            meaning_on: AtomicBool::new(std::fs::read_to_string(dir.join("meaning.txt")).is_ok_and(|s| s.trim() == "on")),
+            meaning_state: Mutex::new("off".into()),
+            vectors: Mutex::new(crate::meaning::Vectors::load(dir)),
+            model: Mutex::new(crate::meaning::Model::new()),
         })
     }
 
@@ -231,7 +241,142 @@ impl Content {
     pub fn status(&self) -> ContentStatus {
         let mut s = self.status.lock().clone();
         s.tags = self.tags_state.lock().clone();
+        s.meaning = self.meaning_state.lock().clone();
         s
+    }
+
+    /// Turns search by meaning on or off. On, the text model is downloaded
+    /// the first time (in the background) and the documents are read for
+    /// their meaning; off forgets their vectors.
+    pub fn set_meaning(self: &Arc<Self>, on: bool) -> Result<(), String> {
+        std::fs::write(self.dir.join("meaning.txt"), if on { "on\n" } else { "off\n" })
+            .map_err(|e| format!("cannot save the setting: {e}"))?;
+        self.meaning_on.store(on, Ordering::SeqCst);
+        if on {
+            self.ensure_meaning_model();
+        } else {
+            *self.meaning_state.lock() = "off".into();
+            self.vectors.lock().clear();
+            *self.model.lock() = crate::meaning::Model::new();
+        }
+        self.dirty.store(true, Ordering::Relaxed);
+        self.poke();
+        Ok(())
+    }
+
+    /// Search by meaning is wanted and the model is there.
+    fn meaning_ready(&self) -> bool {
+        self.meaning_on.load(Ordering::SeqCst) && crate::meaning::model_ready()
+    }
+
+    /// Downloads the text model if it is missing (once, in the background).
+    fn ensure_meaning_model(self: &Arc<Self>) {
+        let total = crate::meaning::total_size();
+        if crate::meaning::model_ready() {
+            *self.meaning_state.lock() = "on".into();
+            return;
+        }
+        {
+            let mut st = self.meaning_state.lock();
+            if st.starts_with("downloading") {
+                return;
+            }
+            *st = format!("downloading:0/{total}");
+        }
+        let me = self.clone();
+        let _ = std::thread::Builder::new().name("meaning-model".into()).spawn(move || {
+            let _bg = Background::begin();
+            let result = (|| -> Result<(), String> {
+                let agent = format!("whereti/{}", env!("CARGO_PKG_VERSION"));
+                let mut before = 0u64;
+                for f in &crate::meaning::FILES {
+                    let path = crate::meaning::path(f);
+                    if std::fs::metadata(&path).is_ok_and(|m| m.len() == f.size) {
+                        before += f.size;
+                        continue;
+                    }
+                    let mut last = 0u64;
+                    let (status, bytes) = whereti_net::http_get(&crate::meaning::url(f), &agent, f.size + 1, &mut |done, _| {
+                        if done - last >= 1 << 20 || done == f.size {
+                            last = done;
+                            *me.meaning_state.lock() = format!("downloading:{}/{total}", before + done);
+                        }
+                    })?;
+                    if status != 200 {
+                        return Err(format!("the server answered {status}"));
+                    }
+                    if bytes.len() as u64 != f.size || whereti_net::sha256_hex(&bytes)? != f.sha256 {
+                        return Err("the model did not arrive whole".into());
+                    }
+                    let dir = path.parent().expect("models dir");
+                    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+                    let part = path.with_extension("part");
+                    std::fs::write(&part, &bytes).map_err(|e| e.to_string())?;
+                    std::fs::rename(&part, &path).map_err(|e| e.to_string())?;
+                    before += f.size;
+                }
+                Ok(())
+            })();
+            *me.meaning_state.lock() = match result {
+                Ok(()) => "on".into(),
+                Err(e) => format!("error: {e}"),
+            };
+            me.dirty.store(true, Ordering::Relaxed);
+            me.poke();
+        });
+    }
+
+    /// The vectors of one document's text (its first pieces).
+    fn read_meaning(&self, key: u64, text: &str) {
+        let mut vectors = Vec::new();
+        for piece in whereti_extract::meaning::pieces(text, crate::meaning::PIECES) {
+            match self.model.lock().embed(&format!("passage: {piece}")) {
+                Ok(v) => vectors.push(v),
+                Err(_) => break,
+            }
+        }
+        // kept even when empty: a document without text is not read again
+        self.vectors.lock().set(key, vectors);
+    }
+
+    /// Documents close in meaning to the query's plain words; the other
+    /// conditions filter them. Only files the caller may read.
+    pub fn search_meaning(&self, idx: &NameIndex, query: &Query, limit: usize, caller: &dyn Caller) -> ContentReply {
+        let t = Instant::now();
+        if !self.meaning_ready() {
+            return ContentReply::default();
+        }
+        let (words, filters) = split_query(query);
+        let Some(question) = crate::meaning::question(&words) else { return ContentReply::default() };
+        let Ok(q) = self.model.lock().embed(&format!("query: {question}")) else { return ContentReply::default() };
+        let hits = self.vectors.lock().closest(&q, 200);
+        let entries: Vec<u32> = hits
+            .iter()
+            .filter_map(|(k, _)| {
+                let (letter, record) = split_key(*k);
+                idx.volume_index(letter).and_then(|v| idx.live_entry_of(v, record))
+            })
+            .collect();
+        let (prop_clauses, filters) = crate::props::split(&filters);
+        let mut kept = idx.filter(&filters, &entries);
+        if !prop_clauses.is_empty() {
+            let with: HashSet<u32> = self.entries_with_props(idx, &prop_clauses).into_iter().collect();
+            kept.retain(|e| with.contains(e));
+        }
+        // in the order of `hits`
+        let kept: HashSet<u32> = kept.into_iter().collect();
+        let ordered: Vec<u32> = entries.into_iter().filter(|e| kept.contains(e)).collect();
+        let paths: Vec<String> = ordered.iter().map(|&e| idx.full_path(e)).collect();
+        let allowed = caller.can_read(&paths);
+        let rows: Vec<Row> = ordered
+            .iter()
+            .zip(paths)
+            .zip(allowed)
+            .filter(|(_, ok)| *ok)
+            .take(limit)
+            .map(|((&e, path), _)| Row { path, is_dir: false, size: idx.size(e), modified: idx.modified(e), flags: idx.flags(e) })
+            .collect();
+        ContentReply { total: rows.len() as u64, copies: vec![Vec::new(); rows.len()], rows, micros: t.elapsed().as_micros() as u64, note: None }
     }
 
     /// Turns recognising objects and animals in photos on or off. On, the
@@ -365,6 +510,9 @@ impl Content {
         if self.tags_on.load(Ordering::SeqCst) {
             self.ensure_model();
         }
+        if self.meaning_on.load(Ordering::SeqCst) {
+            self.ensure_meaning_model();
+        }
         let places_marker = self.dir.join("places-2"); // 2: again, with the tolerant EXIF reader (0.0.12)
         let places_pass = !places_marker.exists();
         if places_pass {
@@ -413,6 +561,7 @@ impl Content {
             let mut wake = self.wake.lock();
             if !*wake {
                 self.wake_cv.wait_for(&mut wake, CHECK_EVERY);
+                self.model.lock().tidy();
             }
             forced = std::mem::take(&mut *wake);
         }
@@ -458,7 +607,26 @@ impl Content {
             index.remove(*k);
             known.remove(k);
             self.props.lock().remove(*k);
+            self.vectors.lock().remove(*k);
         }
+        // search by meaning turned on: the documents already indexed, again for it
+        let meaning_now = self.meaning_ready();
+        let meaning_missing: Vec<Candidate> = if meaning_now {
+            let vectors = self.vectors.lock();
+            wanted
+                .values()
+                .filter(|c| {
+                    !c.photo_only
+                        && !c.media_only
+                        && known.get(&c.key).is_some_and(|i| i.size == c.size && i.modified == c.modified && i.status == Status::Ok)
+                        && !vectors.contains(c.key)
+                        && !is_picture(&c.path)
+                })
+                .map(|c| Candidate { meaning_only: true, props_only: false, path: c.path.clone(), ..*c })
+                .collect()
+        } else {
+            Vec::new()
+        };
         // indexed before properties were read (or read without them): only those
         let props_missing: Vec<Candidate> = {
             let store = self.props.lock();
@@ -476,6 +644,7 @@ impl Content {
             .into_values()
             .filter(|c| known.get(&c.key).is_none_or(|i| i.size != c.size || i.modified != c.modified))
             .chain(props_missing)
+            .chain(meaning_missing)
             .collect();
         let tz = system::date_ctx().tz_offset;
         // The newest files first: what the user works on becomes searchable first.
@@ -547,12 +716,19 @@ impl Content {
                 }
             }
             let started = Instant::now();
-            if !c.props_only {
+            if c.meaning_only {
+                if let Some((_, text)) = extract(&c, sandbox, None) {
+                    self.read_meaning(c.key, &text);
+                }
+            } else if !c.props_only {
                 if let Some((what, text)) = extract(&c, sandbox, tagger.as_mut()) {
                     index.put(c.key, what, &text).map_err(|e| e.to_string())?;
                     known.insert(c.key, what);
                     since_commit += 1;
                     indexed += 1;
+                    if meaning_now && !c.photo_only && !c.media_only && !is_picture(&c.path) {
+                        self.read_meaning(c.key, &text);
+                    }
                 }
             }
             let ext = ext_of(&c.path);
@@ -568,6 +744,7 @@ impl Content {
             if since_commit >= COMMIT_EVERY_DOCS || (since_commit > 0 && last_commit.elapsed() >= COMMIT_EVERY) {
                 index.commit().map_err(|e| e.to_string())?;
                 self.props.lock().save();
+                self.vectors.lock().save();
                 self.update_counts(index, known);
                 since_commit = 0;
                 last_commit = Instant::now();
@@ -580,6 +757,7 @@ impl Content {
         }
         index.commit().map_err(|e| e.to_string())?;
         self.props.lock().save();
+        self.vectors.lock().save();
         self.update_counts(index, known);
         if indexed > 0 || !removed.is_empty() {
             shared.log.log(format!(
@@ -891,10 +1069,12 @@ struct Candidate {
     media_only: bool,
     /// Already indexed: only its properties are read now.
     props_only: bool,
+    /// Already indexed: read again only for its meaning.
+    meaning_only: bool,
 }
 
 /// Photos a camera or phone writes its GPS position into.
-const PHOTO_EXTS: &[&str] = &["jpg", "jpeg", "jpe", "jfif", "heic", "heif", "tif", "tiff", "png", "webp"];
+const PHOTO_EXTS: &[&str] = &["jpg", "jpeg", "jpe", "jfif", "heic", "heif", "avif", "tif", "tiff", "png", "webp"];
 
 /// Where a photo was taken, as text for the index: "Rome, Lazio, Italy"
 /// and then every name of the place. `None` without a GPS position.
@@ -903,7 +1083,7 @@ fn place_text(path: &Path, ext: &str) -> Option<String> {
         return None;
     }
     // EXIF is at the start of a JPEG; a HEIC keeps it anywhere in the file
-    let head = if matches!(ext, "heic" | "heif") { 64 << 20 } else { 512 << 10 };
+    let head = if matches!(ext, "heic" | "heif" | "avif") { 64 << 20 } else { 512 << 10 };
     let bytes = read_head(path, head).ok()?;
     let (lat, lon) = whereti_places::gps(&bytes)?;
     let place = whereti_places::place_of(lat, lon)?;
@@ -962,7 +1142,7 @@ fn files_in(idx: &NameIndex, folders: &[String], pictures: &[String]) -> HashMap
             modified: idx.modified(e),
             photo_only: false,
             media_only: false,
-            props_only: false,
+            props_only: false, meaning_only: false,
         });
     }
     // photos in the pictures folders: where they were taken
@@ -996,7 +1176,7 @@ fn files_in(idx: &NameIndex, folders: &[String], pictures: &[String]) -> HashMap
                 modified: idx.modified(e),
                 photo_only: true,
                 media_only: false,
-                props_only: false,
+                props_only: false, meaning_only: false,
             });
         }
     }
@@ -1027,7 +1207,7 @@ fn files_in(idx: &NameIndex, folders: &[String], pictures: &[String]) -> HashMap
                 modified: idx.modified(e),
                 photo_only: false,
                 media_only: true,
-                props_only: false,
+                props_only: false, meaning_only: false,
             });
         }
     }
@@ -1330,7 +1510,7 @@ mod tests {
         let file = |name: &str, text: &str, modified: u32| {
             let path = dir.join(name);
             std::fs::write(&path, text).unwrap();
-            Candidate { key: modified as u64, path: path.to_string_lossy().into_owned(), size: text.len() as u64, modified, photo_only: false, media_only: false, props_only: false }
+            Candidate { key: modified as u64, path: path.to_string_lossy().into_owned(), size: text.len() as u64, modified, photo_only: false, media_only: false, props_only: false, meaning_only: false }
         };
         let plan = ScanPlan {
             needles: vec![fold("chirie"), fold("Iulie")],

@@ -454,6 +454,29 @@ fn search(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
     });
     ui.add_space(14.0);
 
+    // ---- search by meaning
+    let meaning = app.status.as_ref().map(|s| s.content.meaning.clone()).filter(|t| !t.is_empty()).unwrap_or_else(|| "off".into());
+    card(ui, p, |ui| {
+        row(
+            ui,
+            p,
+            tr("Search documents by meaning"),
+            tr("Finds documents that say what you typed in other words: \"rental contract\" finds the lease. It downloads a model once (135 MB, from Hugging Face); your documents are read on your PC and never leave it."),
+            |ui| {
+                let mut on = meaning != "off";
+                if toggle(ui, p, &mut on, tr("Search documents by meaning")).clicked() {
+                    app.searcher.set_meaning(on);
+                }
+            },
+        );
+        let line = if meaning == "on" { Some(tr("On. Documents are read for their meaning in the background; results come under \"Close in meaning\".").to_string()) } else { photo_tags_line(&meaning) };
+        if let Some(line) = line {
+            ui.label(egui::RichText::new(line).size(12.5).color(if meaning.starts_with("error") { p.error } else { p.text2 }));
+            ui.add_space(12.0);
+        }
+    });
+    ui.add_space(14.0);
+
     // ---- objects and animals in photos
     let tags = photo_tags_state(app);
     card(ui, p, |ui| {
