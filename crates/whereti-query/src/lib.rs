@@ -17,6 +17,7 @@
 //! Parsing never fails: anything that is not valid syntax is searched literally.
 
 mod date;
+pub mod kinds;
 mod fold;
 mod glob;
 

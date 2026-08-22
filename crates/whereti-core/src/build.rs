@@ -589,17 +589,10 @@ pub(crate) fn looks_generated(name: &str) -> bool {
 /// the files programs keep for themselves last.
 pub(crate) fn ext_weight(ext: &str) -> i8 {
     match ext {
-        // documents
-        "pdf" | "doc" | "docx" | "odt" | "rtf" | "txt" | "md" | "xls" | "xlsx" | "xlsm" | "ods" | "csv" | "ppt"
-        | "pptx" | "odp" | "pages" | "numbers" | "key" | "epub" | "eml" | "msg" | "one"
-        // pictures
-        | "jpg" | "jpeg" | "png" | "gif" | "heic" | "heif" | "avif" | "jxl" | "webp" | "bmp" | "tif" | "tiff" | "raw" | "cr2"
-        | "cr3" | "nef" | "arw" | "dng" | "psd" | "ai" | "svg"
-        // music and video
-        | "mp3" | "m4a" | "flac" | "wav" | "ogg" | "opus" | "aac" | "wma" | "mp4" | "mov" | "mkv" | "avi"
-        | "wmv" | "webm" | "m4v"
-        // archives, programs, shortcuts, drawings
-        | "zip" | "rar" | "7z" | "exe" | "msi" | "lnk" | "url" | "dwg" | "skp" | "blend" => -4,
+        // documents, pictures, music, videos and archives (whereti_query::kinds)
+        e if whereti_query::kinds::category(e).is_some() => -4,
+        // programs, shortcuts, drawings
+        "exe" | "msi" | "lnk" | "url" | "dwg" | "skp" | "blend" => -4,
         // what programs keep for themselves
         "dll" | "sys" | "log" | "tmp" | "temp" | "dat" | "bin" | "cache" | "pdb" | "obj" | "o" | "lib" | "a"
         | "so" | "mui" | "cat" | "manifest" | "etl" | "idx" | "pack" | "map" | "lock" | "pyc" | "class" | "ldb"

@@ -57,14 +57,15 @@ impl Filter {
     }
 
     /// The same query syntax a power user would type (PLAN.md §10.5).
-    fn clause(self) -> &'static str {
+    fn clause(self) -> String {
+        use whereti_query::kinds::{ext_clause, Category};
         match self {
-            Filter::All => "",
-            Filter::Documents => "ext:pdf;doc;docx;xls;xlsx;ppt;pptx;odt;ods;odp;rtf;txt;md;csv;epub;msg;eml",
-            Filter::Images => "ext:jpg;jpeg;png;gif;bmp;webp;heic;heif;avif;jxl;tif;tiff;svg;ico;raw;cr2;nef;arw;dng",
-            Filter::Audio => "ext:mp3;wav;flac;aac;ogg;m4a;wma;opus",
-            Filter::Video => "ext:mp4;mkv;avi;mov;wmv;webm;m4v;mpg;mpeg",
-            Filter::Folders => "folder:",
+            Filter::All => String::new(),
+            Filter::Documents => ext_clause(Category::Document),
+            Filter::Images => ext_clause(Category::Picture),
+            Filter::Audio => ext_clause(Category::Audio),
+            Filter::Video => ext_clause(Category::Video),
+            Filter::Folders => "folder:".into(),
         }
     }
 }
@@ -2686,12 +2687,10 @@ fn type_color(ext: &str, dark: bool) -> Color32 {
         "doc" | "docx" | "odt" | "rtf" | "txt" | "md" => (0x2F, 0x6F, 0xE4),
         "xls" | "xlsx" | "ods" | "csv" => (0x1E, 0x8E, 0x4E),
         "ppt" | "pptx" | "odp" => (0xD9, 0x6A, 0x2B),
-        "jpg" | "jpeg" | "png" | "gif" | "bmp" | "webp" | "heic" | "heif" | "avif" | "jxl" | "tif" | "tiff" | "svg" | "ico" | "raw" => {
-            (0x16, 0x9E, 0x8F)
-        }
-        "mp3" | "wav" | "flac" | "aac" | "ogg" | "m4a" | "wma" | "opus" => (0x8E, 0x5B, 0xD6),
-        "mp4" | "mkv" | "avi" | "mov" | "wmv" | "webm" | "m4v" => (0xC2, 0x3B, 0x7A),
-        "zip" | "rar" | "7z" | "tar" | "gz" | "zst" | "cab" | "iso" => (0x9C, 0x6B, 0x3A),
+        e if whereti_query::kinds::category(e) == Some(whereti_query::kinds::Category::Picture) => (0x16, 0x9E, 0x8F),
+        e if whereti_query::kinds::category(e) == Some(whereti_query::kinds::Category::Audio) => (0x8E, 0x5B, 0xD6),
+        e if whereti_query::kinds::category(e) == Some(whereti_query::kinds::Category::Video) => (0xC2, 0x3B, 0x7A),
+        e if whereti_query::kinds::category(e) == Some(whereti_query::kinds::Category::Archive) => (0x9C, 0x6B, 0x3A),
         "exe" | "msi" | "bat" | "cmd" | "ps1" | "dll" | "lnk" => (0x55, 0x65, 0x7A),
         "rs" | "py" | "js" | "ts" | "tsx" | "jsx" | "go" | "java" | "c" | "cpp" | "h" | "cs" | "php" | "rb" | "html"
         | "css" | "json" | "yaml" | "yml" | "toml" | "xml" | "sql" | "sh" => (0xC9, 0x7A, 0x14),

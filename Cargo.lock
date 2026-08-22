@@ -5522,6 +5522,7 @@ dependencies = [
  "quick-xml 0.42.0",
  "sevenz-rust2",
  "tokenizers",
+ "whereti-query",
  "windows",
  "windows-sys 0.61.2",
  "zip",

@@ -29,15 +29,19 @@ pub struct Props {
     pub author: String,
 }
 
-pub const AUDIO_EXTS: &[&str] = &["mp3", "flac", "m4a", "aac", "ogg", "opus", "wav", "wma", "aiff", "ape", "wv"];
-pub const VIDEO_EXTS: &[&str] = &["mp4", "m4v", "mov"];
-const PHOTO_EXTS: &[&str] = &["jpg", "jpeg", "jpe", "jfif", "heic", "heif", "avif", "jxl", "tif", "tiff", "png", "webp", "dng", "cr2", "nef", "arw"];
+use whereti_query::kinds::{AUDIO_TAGGED as AUDIO_EXTS, RAW, VIDEO_TAGGED as VIDEO_EXTS};
+const PHOTO_EXTS: &[&str] = whereti_query::kinds::PHOTOS;
 const OFFICE_EXTS: &[&str] = &["docx", "docm", "xlsx", "xlsm", "pptx", "pptm"];
 const ODF_EXTS: &[&str] = &["odt", "ods", "odp"];
 
 /// The file has properties worth reading.
 pub fn has_props(ext: &str) -> bool {
-    AUDIO_EXTS.contains(&ext) || VIDEO_EXTS.contains(&ext) || PHOTO_EXTS.contains(&ext) || OFFICE_EXTS.contains(&ext) || ODF_EXTS.contains(&ext)
+    AUDIO_EXTS.contains(&ext)
+        || VIDEO_EXTS.contains(&ext)
+        || PHOTO_EXTS.contains(&ext)
+        || RAW.contains(&ext)
+        || OFFICE_EXTS.contains(&ext)
+        || ODF_EXTS.contains(&ext)
 }
 
 /// Reads the properties of `path` (`ext` lower case). Never fails: what
@@ -50,7 +54,7 @@ pub fn read(path: &Path, ext: &str, tz_offset: i32) -> Props {
 
 fn read_inner(path: &Path, ext: &str, tz_offset: i32) -> Props {
     let mut p = Props::default();
-    if PHOTO_EXTS.contains(&ext) {
+    if PHOTO_EXTS.contains(&ext) || RAW.contains(&ext) {
         // EXIF is at the start of a JPEG; HEIC and RAW keep it further in
         let head = if matches!(ext, "jpg" | "jpeg" | "jpe" | "jfif" | "png" | "webp") { 512 << 10 } else { 16 << 20 };
         if let Ok(bytes) = read_head(path, head) {

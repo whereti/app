@@ -60,8 +60,9 @@ const CHECK_EVERY: Duration = Duration::from_secs(10);
 const SAFETY_ROUND: Duration = Duration::from_secs(30 * 60);
 /// Documents indexed wherever they are (outside system and noise folders).
 const EVERYWHERE: &[&str] = &[
-    "pdf", "docx", "docm", "dotx", "dotm", "doc", "xlsx", "xlsm", "xlsb", "xls", "pptx", "pptm", "ppsx", "potx", "ppt",
-    "odt", "ods", "odp", "rtf", "eml", "msg",
+    "pdf", "docx", "docm", "dotx", "dotm", "doc", "dot", "xlsx", "xlsm", "xlsb", "xls", "xltx", "xltm", "pptx", "pptm",
+    "ppsx", "ppsm", "potx", "potm", "ppt", "pps", "pot", "odt", "ott", "ods", "ots", "odp", "otp", "rtf", "eml", "msg",
+    "epub", "fb2", "xps", "oxps",
 ];
 const SKIP: u16 = FLAG_CLOUD | FLAG_NOISE | FLAG_SYSTEM | FLAG_HIDDEN;
 
@@ -1074,7 +1075,7 @@ struct Candidate {
 }
 
 /// Photos a camera or phone writes its GPS position into.
-const PHOTO_EXTS: &[&str] = &["jpg", "jpeg", "jpe", "jfif", "heic", "heif", "avif", "tif", "tiff", "png", "webp"];
+const PHOTO_EXTS: &[&str] = whereti_query::kinds::PHOTOS;
 
 /// Where a photo was taken, as text for the index: "Rome, Lazio, Italy"
 /// and then every name of the place. `None` without a GPS position.
@@ -1083,7 +1084,7 @@ fn place_text(path: &Path, ext: &str) -> Option<String> {
         return None;
     }
     // EXIF is at the start of a JPEG; a HEIC keeps it anywhere in the file
-    let head = if matches!(ext, "heic" | "heif" | "avif") { 64 << 20 } else { 512 << 10 };
+    let head = if matches!(ext, "heic" | "heif" | "hif" | "avif" | "jxl") { 64 << 20 } else { 512 << 10 };
     let bytes = read_head(path, head).ok()?;
     let (lat, lon) = whereti_places::gps(&bytes)?;
     let place = whereti_places::place_of(lat, lon)?;
@@ -1191,7 +1192,7 @@ fn files_in(idx: &NameIndex, folders: &[String], pictures: &[String]) -> HashMap
                 Term::Path(p)
             })
             .collect();
-        let exts = crate::props::AUDIO_EXTS.iter().chain(crate::props::VIDEO_EXTS).map(|e| e.to_string()).collect();
+        let exts = whereti_query::kinds::AUDIO_TAGGED.iter().chain(whereti_query::kinds::VIDEO_TAGGED).map(|e| e.to_string()).collect();
         let media = Query {
             clauses: vec![file(), Clause { negated: false, any_of: paths }, Clause { negated: false, any_of: vec![Term::Ext(exts)] }],
         };

@@ -78,15 +78,24 @@ pub enum Kind {
     Image,
     /// ZIP, 7z, RAR: the names inside, and the text of the documents.
     Archive,
+    /// EPUB e-book: its chapters (XHTML in a ZIP).
+    Epub,
+    /// FictionBook (.fb2): XML.
+    FictionBook,
+    /// XPS / OpenXPS: the text of its fixed pages.
+    Xps,
 }
 
 pub fn kind_of(ext: &str) -> Option<Kind> {
     let ext = ext.to_ascii_lowercase();
     Some(match ext.as_str() {
         "docx" | "docm" | "dotx" | "dotm" => Kind::Docx,
-        "pptx" | "pptm" | "ppsx" | "potx" => Kind::Pptx,
-        "xlsx" | "xlsm" | "xlsb" | "xls" | "ods" => Kind::Spreadsheet,
-        "odt" | "odp" => Kind::OpenDocument,
+        "pptx" | "pptm" | "ppsx" | "ppsm" | "potx" | "potm" => Kind::Pptx,
+        "xlsx" | "xlsm" | "xlsb" | "xls" | "xltx" | "xltm" | "ods" | "ots" => Kind::Spreadsheet,
+        "odt" | "ott" | "odp" | "otp" => Kind::OpenDocument,
+        "epub" => Kind::Epub,
+        "fb2" => Kind::FictionBook,
+        "xps" | "oxps" => Kind::Xps,
         "pdf" => Kind::Pdf,
         "rtf" => Kind::Rtf,
         "html" | "htm" | "xhtml" => Kind::Html,
@@ -103,8 +112,9 @@ pub fn kind_of(ext: &str) -> Option<Kind> {
 
 /// Extensions with a converter, besides plain text.
 const DOC_EXTS: &[&str] = &[
-    "docx", "docm", "dotx", "dotm", "pptx", "pptm", "ppsx", "potx", "xlsx", "xlsm", "xlsb", "xls", "ods", "odt", "odp",
-    "pdf", "rtf", "html", "htm", "xhtml", "eml", "msg", "doc", "dot", "ppt", "pps", "pot", "zip", "7z", "rar",
+    "docx", "docm", "dotx", "dotm", "pptx", "pptm", "ppsx", "ppsm", "potx", "potm", "xlsx", "xlsm", "xlsb", "xls", "xltx",
+    "xltm", "ods", "ots", "odt", "ott", "odp", "otp", "pdf", "rtf", "html", "htm", "xhtml", "eml", "msg", "doc", "dot", "ppt",
+    "pps", "pot", "epub", "fb2", "xps", "oxps", "zip", "7z", "rar",
 ];
 
 /// The end of a ZIP too large to send whole: `extract(ZIP_END, ...)` lists
@@ -112,7 +122,8 @@ const DOC_EXTS: &[&str] = &[
 pub const ZIP_END: &str = "zip-end";
 
 /// Pictures whose text is read by OCR (HEIC only where its codec is installed).
-const IMAGE_EXTS: &[&str] = &["jpg", "jpeg", "jpe", "jfif", "png", "bmp", "tif", "tiff", "gif", "webp", "heic", "heif", "avif", "jxl"];
+/// (Windows decodes them: see whereti_query::kinds; icons are not read.)
+const IMAGE_EXTS: &[&str] = &["jpg", "jpeg", "jpe", "jfif", "png", "bmp", "dib", "tif", "tiff", "gif", "webp", "heic", "heif", "hif", "avif", "jxl", "jxr", "wdp"];
 
 /// Windows has an OCR language installed (servers often have none).
 pub fn ocr_available() -> bool {
@@ -176,6 +187,9 @@ pub fn extract(ext: &str, bytes: &[u8], max_chars: usize) -> Result<Extracted, E
         Kind::Outlook => ole::msg(bytes, &mut out)?,
         Kind::WordBinary => ole::doc(bytes, &mut out)?,
         Kind::PowerPointBinary => ole::ppt(bytes, &mut out)?,
+        Kind::Epub => epub(bytes, &mut out)?,
+        Kind::FictionBook => out.push(&html_to_text(&decode_text(bytes)?)),
+        Kind::Xps => xps(bytes, &mut out)?,
         Kind::Archive => match ext.to_ascii_lowercase().as_str() {
             "zip" => archive::zip(bytes, &mut out)?,
             "7z" => archive::sevenz(bytes, &mut out)?,
@@ -387,6 +401,78 @@ fn pptx(bytes: &[u8], out: &mut Out) -> Result<(), ExtractError> {
     Ok(())
 }
 
+/// An e-book: its chapters in reading order (the OPF spine), else every
+/// XHTML file in name order.
+fn epub(bytes: &[u8], out: &mut Out) -> Result<(), ExtractError> {
+    let mut zip = zip_archive(bytes)?;
+    let names = zip_names(&zip);
+    let mut chapters: Vec<String> = Vec::new();
+    if let Some(opf) = names.iter().find(|n| n.to_ascii_lowercase().ends_with(".opf")).cloned() {
+        let base = opf.rsplit_once('/').map_or(String::new(), |(b, _)| format!("{b}/"));
+        if let Some(xml) = zip_entry(&mut zip, &opf) {
+            let xml = String::from_utf8_lossy(&xml);
+            // id -> href, then the spine's itemrefs in order
+            let attr = |tag: &str, name: &str| -> Option<String> {
+                let at = tag.find(&format!("{name}=\""))? + name.len() + 2;
+                Some(tag[at..].split('"').next()?.to_string())
+            };
+            let mut hrefs = std::collections::HashMap::new();
+            for tag in xml.split('<').filter(|t| t.starts_with("item ") || t.starts_with("opf:item ")) {
+                if let (Some(id), Some(href)) = (attr(tag, "id"), attr(tag, "href")) {
+                    hrefs.insert(id, href);
+                }
+            }
+            for tag in xml.split('<').filter(|t| t.starts_with("itemref") || t.starts_with("opf:itemref")) {
+                if let Some(href) = attr(tag, "idref").and_then(|id| hrefs.get(&id)) {
+                    chapters.push(format!("{base}{}", href.replace("%20", " ")));
+                }
+            }
+        }
+    }
+    if chapters.is_empty() {
+        chapters = names.into_iter().filter(|n| {
+            let n = n.to_ascii_lowercase();
+            n.ends_with(".xhtml") || n.ends_with(".html") || n.ends_with(".htm")
+        }).collect();
+        chapters.sort();
+    }
+    for name in chapters {
+        if out.full() {
+            break;
+        }
+        if let Some(html) = zip_entry(&mut zip, &name) {
+            out.push(&html_to_text(&String::from_utf8_lossy(&html)));
+            out.newline();
+        }
+    }
+    Ok(())
+}
+
+/// XPS / OpenXPS: the `UnicodeString` of every glyph run, page by page.
+fn xps(bytes: &[u8], out: &mut Out) -> Result<(), ExtractError> {
+    let mut zip = zip_archive(bytes)?;
+    let mut pages: Vec<String> = zip_names(&zip).into_iter().filter(|n| n.to_ascii_lowercase().ends_with(".fpage")).collect();
+    // Pages/1.fpage before Pages/10.fpage
+    let num = |n: &str| n.rsplit('/').next().and_then(|f| f.split('.').next()).and_then(|d| d.parse::<u32>().ok()).unwrap_or(u32::MAX);
+    pages.sort_by(|a, b| (num(a), a).cmp(&(num(b), b)));
+    for page in pages {
+        if out.full() {
+            break;
+        }
+        let Some(xml) = zip_entry(&mut zip, &page) else { continue };
+        let xml = String::from_utf8_lossy(&xml);
+        for part in xml.split("UnicodeString=\"").skip(1) {
+            let text = part.split('"').next().unwrap_or("");
+            let text = text.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&apos;", "'");
+            // "{}" escapes a leading brace
+            out.push(text.strip_prefix("{}").unwrap_or(&text));
+            out.push(" ");
+        }
+        out.newline();
+    }
+    Ok(())
+}
+
 fn odf(bytes: &[u8], out: &mut Out) -> Result<(), ExtractError> {
     let mut zip = zip_archive(bytes)?;
     let xml = zip_entry(&mut zip, "content.xml").ok_or_else(|| ExtractError::Damaged("no content.xml".into()))?;
@@ -505,6 +591,31 @@ pub fn html_to_text(html: &str) -> String {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn epub_chapters_in_spine_order_and_xps_pages() {
+        let opf = r#"<package><manifest><item id="c2" href="text/two.xhtml"/><item id="c1" href="text/one.xhtml"/></manifest><spine><itemref idref="c1"/><itemref idref="c2"/></spine></package>"#;
+        let book = make_zip(&[
+            ("META-INF/container.xml", "<container/>"),
+            ("OEBPS/content.opf", opf),
+            ("OEBPS/text/two.xhtml", "<html><body><p>Capitolul doi</p></body></html>"),
+            ("OEBPS/text/one.xhtml", "<html><body><p>Capitolul unu</p></body></html>"),
+        ]);
+        let t = extract("epub", &book, 10_000).unwrap().text;
+        assert!(t.find("unu").unwrap() < t.find("doi").unwrap(), "{t}");
+
+        let page = |s: &str| format!(r#"<FixedPage><Glyphs UnicodeString="{s}" /></FixedPage>"#);
+        let xps = make_zip(&[
+            ("Documents/1/Pages/10.fpage", &page("pagina zece")),
+            ("Documents/1/Pages/2.fpage", &page("pagina doi &amp; trei")),
+        ]);
+        let t = extract("oxps", &xps, 10_000).unwrap().text;
+        assert!(t.contains("pagina doi & trei") && t.find("doi").unwrap() < t.find("zece").unwrap(), "{t}");
+        // templates read like the documents they make
+        assert_eq!(kind_of("ott"), Some(Kind::OpenDocument));
+        assert_eq!(kind_of("xltx"), Some(Kind::Spreadsheet));
+        assert_eq!(kind_of("potm"), Some(Kind::Pptx));
+    }
 
     fn make_zip(files: &[(&str, &str)]) -> Vec<u8> {
         let mut buf = Cursor::new(Vec::new());
