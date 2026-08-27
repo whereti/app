@@ -82,6 +82,9 @@ pub enum Request {
     /// Documents close in meaning to the plain words of the query (two at
     /// least); the other conditions filter them. Answered as `Content`.
     MeaningSearch(SearchRequest),
+    /// What whereti read from one file: what is in a photo, when and with
+    /// what it was taken, a song's artist… (only if the caller may read it).
+    FileInfo { path: String },
     /// Learn where the user works (the folders where their files change)
     /// and rank those first; off forgets what was learnt.
     SetWorkFolders { on: bool },
@@ -188,6 +191,24 @@ pub struct ContentStatus {
     pub meaning: String,
 }
 
+/// What whereti read from a file (see `Request::FileInfo`). Zero / empty:
+/// not known.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct FileInfo {
+    /// When the photo was taken, minutes since 1601 UTC.
+    pub taken: u32,
+    pub width: u32,
+    pub height: u32,
+    /// Seconds.
+    pub duration: u32,
+    pub camera: String,
+    pub artist: String,
+    pub album: String,
+    pub author: String,
+    /// What the photo model saw: label numbers (whereti_extract::tags::labels).
+    pub tags: Vec<u16>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VolumeStatus {
     pub letter: char,
@@ -222,6 +243,7 @@ pub enum Response {
     Ok,
     Error(String),
     Scan(ScanReply),
+    FileInfo(FileInfo),
 }
 
 pub fn write_message<T: Serialize>(w: &mut impl Write, msg: &T) -> io::Result<()> {

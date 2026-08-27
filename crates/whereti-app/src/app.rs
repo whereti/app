@@ -105,6 +105,8 @@ pub struct WheretiApp {
     group_labels: std::collections::HashMap<usize, String>,
     /// The first set's header, shown as the list's own header.
     first_group_label: Option<String>,
+    /// What the service read from the previewed file (asked, answer).
+    file_info: (Option<String>, Option<(String, whereti_ipc::FileInfo)>),
     /// The rename box (F2), while it is open.
     renaming: Option<Renaming>,
     /// The Up arrow brought back this past search (index in history::list).
@@ -202,6 +204,7 @@ impl WheretiApp {
             group_labels: std::collections::HashMap::new(),
             first_group_label: None,
             renaming: None,
+            file_info: (None, None),
             history_pos: None,
             file_dialog: None,
             refocus_after_rename: false,
@@ -488,6 +491,7 @@ impl WheretiApp {
                         self.rows.extend(extra);
                     }
                 }
+                Update::FileInfo { path, info } => self.file_info.1 = Some((path, info)),
                 Update::Meaning { generation, reply } => {
                     if generation != self.generation {
                         continue;
@@ -1830,6 +1834,13 @@ impl eframe::App for WheretiApp {
         if show_preview {
             let file = if self.is_launch(self.selected) { None } else { self.rows.get(self.selected) };
         self.preview.select(file);
+            // and what the service read from it (photos, music, documents)
+            if let Some(f) = file.filter(|f| !f.is_dir) {
+                if self.file_info.0.as_deref() != Some(f.path.as_str()) {
+                    self.file_info.0 = Some(f.path.clone());
+                    self.searcher.file_info(f.path.clone());
+                }
+            }
             let needles = highlight_needles(&self.query);
             let width = ctx.content_rect().width();
             egui::Panel::right("preview")
@@ -1843,7 +1854,8 @@ impl eframe::App for WheretiApp {
                     let r = ui.max_rect();
                     ui.painter().vline(r.left() - 16.0, r.y_range().expand(12.0), Stroke::new(1.0, p.line));
                     let row = if self.is_launch(self.selected) { None } else { self.rows.get(self.selected) };
-                    self.preview.show(ui, &p, row, &mut self.file_icons, &needles, self.tz)
+                    let info = row.and_then(|r| self.file_info.1.as_ref().filter(|(p, _)| p == &r.path).map(|(_, i)| i.clone()));
+                    self.preview.show(ui, &p, row, &mut self.file_icons, &needles, self.tz, info.as_ref())
                 });
         }
         egui::CentralPanel::default()

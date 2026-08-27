@@ -32,6 +32,8 @@ pub enum Update {
     Content { generation: u64, reply: ContentReply },
     /// Documents close in meaning to the query.
     Meaning { generation: u64, reply: ContentReply },
+    /// What the service read from one file (the preview shows it).
+    FileInfo { path: String, info: whereti_ipc::FileInfo },
     /// One step of looking in the documents not indexed yet.
     Scan { generation: u64, reply: ScanReply },
     Status(StatusReply),
@@ -58,6 +60,7 @@ enum Msg {
     SetPhotoTags(bool),
     SetWorkFolders(bool),
     SetMeaning(bool),
+    FileInfo(String),
 }
 
 pub struct Searcher {
@@ -109,6 +112,11 @@ impl Searcher {
         let _ = self.tx.send(Msg::SetMeaning(on));
     }
 
+    /// Asks what the service read from a file (the newest ask wins).
+    pub fn file_info(&self, path: String) {
+        let _ = self.tx.send(Msg::FileInfo(path));
+    }
+
     /// Learning where the user works on or off (off forgets it).
     pub fn set_work_folders(&self, on: bool) {
         let _ = self.tx.send(Msg::SetWorkFolders(on));
@@ -130,6 +138,7 @@ struct Pending {
     photo_tags: Option<bool>,
     work_folders: Option<bool>,
     meaning: Option<bool>,
+    file_info: Option<String>,
 }
 
 fn worker(jobs: Receiver<Msg>, out: Sender<Update>, wake: impl Fn()) {
@@ -159,6 +168,7 @@ fn worker(jobs: Receiver<Msg>, out: Sender<Update>, wake: impl Fn()) {
                 p.meaning = Some(on);
                 p.status = true;
             }
+            Msg::FileInfo(path) => p.file_info = Some(path),
         };
         take(first);
         loop {
@@ -271,6 +281,11 @@ fn worker(jobs: Receiver<Msg>, out: Sender<Update>, wake: impl Fn()) {
                             }
                         }
                     }
+                }
+            }
+            if let Some(path) = p.file_info {
+                if let Response::FileInfo(info) = c.call(&Request::FileInfo { path: path.clone() })? {
+                    let _ = out.send(Update::FileInfo { path, info });
                 }
             }
             if let Some(job) = p.scan {

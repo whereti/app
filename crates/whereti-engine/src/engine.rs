@@ -317,6 +317,25 @@ impl Engine {
                     Err(e) => Response::Error(e),
                 }
             }
+            Request::FileInfo { path } => {
+                if !caller.can_read(std::slice::from_ref(&path)).first().copied().unwrap_or(false) {
+                    return Response::FileInfo(Default::default());
+                }
+                let key = {
+                    let guard = self.shared.index.read();
+                    let Some(idx) = guard.as_ref() else { return Response::FileInfo(Default::default()) };
+                    // by its name (one quick scan), then the exact path
+                    let name = path.rsplit('\\').next().unwrap_or(&path);
+                    let q = whereti_query::Query {
+                        clauses: vec![whereti_query::Clause { negated: false, any_of: vec![whereti_query::Term::Text(whereti_query::fold(name))] }],
+                    };
+                    idx.matching(&q).into_iter().find(|&e| idx.full_path(e).eq_ignore_ascii_case(&path)).and_then(|e| {
+                        let record = idx.records_of(&[e]).into_iter().next().flatten()?;
+                        Some(whereti_content::key(idx.volume_of(e).letter(), record))
+                    })
+                };
+                Response::FileInfo(key.map(|k| self.content.file_info(k)).unwrap_or_default())
+            }
             Request::SetMeaning { on } => match self.content.set_meaning(on) {
                 Ok(()) => Response::Ok,
                 Err(e) => Response::Error(e),

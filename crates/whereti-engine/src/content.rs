@@ -589,7 +589,9 @@ impl Content {
             files_in(idx, &folders, &pictures)
         };
         // recognition turned on (model ready) or off: the photos again
-        let tags_now = if self.tags_ready() { "on" } else { "off" };
+        // "on-2": photos tagged before 0.0.25 are read again once, so what
+        // was seen in each is kept (and shown in the preview)
+        let tags_now = if self.tags_ready() { "on-2" } else { "off" };
         let tags_marker = self.dir.join("tags-indexed");
         let tags_before = std::fs::read_to_string(&tags_marker).map(|s| s.trim().to_string()).unwrap_or_else(|_| "off".into());
         if tags_before != tags_now {
@@ -602,7 +604,7 @@ impl Content {
             shared.log.log(format!("content: {} photos are read again ({tags_now} recognition)", before - known.len()));
             let _ = std::fs::write(&tags_marker, format!("{tags_now}\n"));
         }
-        let mut tagger = if tags_now == "on" { TagWorker::beside_current_exe(&model_path()) } else { None };
+        let mut tagger = if tags_now != "off" { TagWorker::beside_current_exe(&model_path()) } else { None };
         let removed: Vec<u64> = known.keys().filter(|k| !wanted.contains_key(k)).copied().collect();
         for k in &removed {
             index.remove(*k);
@@ -648,6 +650,7 @@ impl Content {
             .chain(meaning_missing)
             .collect();
         let tz = system::date_ctx().tz_offset;
+        let mut seen: Vec<u16> = Vec::new();
         // The newest files first: what the user works on becomes searchable first.
         todo.sort_unstable_by_key(|c| std::cmp::Reverse(c.modified));
         if !removed.is_empty() || !todo.is_empty() {
@@ -718,11 +721,12 @@ impl Content {
             }
             let started = Instant::now();
             if c.meaning_only {
-                if let Some((_, text)) = extract(&c, sandbox, None) {
+                if let Some((_, text)) = extract(&c, sandbox, None, &mut Vec::new()) {
                     self.read_meaning(c.key, &text);
                 }
             } else if !c.props_only {
-                if let Some((what, text)) = extract(&c, sandbox, tagger.as_mut()) {
+                seen.clear();
+                if let Some((what, text)) = extract(&c, sandbox, tagger.as_mut(), &mut seen) {
                     index.put(c.key, what, &text).map_err(|e| e.to_string())?;
                     known.insert(c.key, what);
                     since_commit += 1;
@@ -734,7 +738,13 @@ impl Content {
             }
             let ext = ext_of(&c.path);
             if crate::props::has_props(&ext) {
-                let p = crate::props::read(Path::new(&c.path), &ext, tz);
+                let mut p = crate::props::read(Path::new(&c.path), &ext, tz);
+                p.tags = if c.props_only {
+                    // only the properties were read: keep the tags known
+                    self.props.lock().get(c.key).map(|old| old.tags.clone()).unwrap_or_default()
+                } else {
+                    std::mem::take(&mut seen)
+                };
                 self.props.lock().set(c.key, p);
             }
             {
@@ -997,7 +1007,7 @@ impl Content {
             for (c, ok) in chunk.iter().zip(allowed) {
                 i += 1;
                 if ok {
-                    if let Some((_, text)) = extract(c, sandbox.as_ref(), None) {
+                    if let Some((_, text)) = extract(c, sandbox.as_ref(), None, &mut Vec::new()) {
                         let folded = fold(&text);
                         if plan.needles.iter().all(|w| folded.contains(w.as_str())) {
                             rows.push(Row { path: c.path.clone(), is_dir: false, size: c.size, modified: c.modified, flags: 0 });
@@ -1014,6 +1024,22 @@ impl Content {
 }
 
 impl Content {
+    /// What was read from the file with this key (props.rs).
+    pub fn file_info(&self, key: u64) -> whereti_ipc::FileInfo {
+        let Some(p) = self.props.lock().get(key).cloned() else { return Default::default() };
+        whereti_ipc::FileInfo {
+            taken: p.taken,
+            width: p.width,
+            height: p.height,
+            duration: p.duration,
+            camera: p.camera,
+            artist: p.artist,
+            album: p.album,
+            author: p.author,
+            tags: p.tags,
+        }
+    }
+
     /// The live entries whose properties satisfy `clauses` (props.rs).
     pub fn entries_with_props(&self, idx: &NameIndex, clauses: &[Clause]) -> Vec<u32> {
         let keys = self.props.lock().keys_matching(clauses);
@@ -1080,11 +1106,18 @@ const PHOTO_EXTS: &[&str] = whereti_query::kinds::PHOTOS;
 /// Where a photo was taken, as text for the index: "Rome, Lazio, Italy"
 /// and then every name of the place. `None` without a GPS position.
 fn place_text(path: &Path, ext: &str) -> Option<String> {
-    if !PHOTO_EXTS.contains(&ext) {
+    let raw = whereti_query::kinds::RAW.contains(&ext);
+    if !PHOTO_EXTS.contains(&ext) && !raw {
         return None;
     }
     // EXIF is at the start of a JPEG; a HEIC keeps it anywhere in the file
-    let head = if matches!(ext, "heic" | "heif" | "hif" | "avif" | "jxl") { 64 << 20 } else { 512 << 10 };
+    let head = if matches!(ext, "heic" | "heif" | "hif" | "avif" | "jxl") {
+        64 << 20
+    } else if raw {
+        16 << 20
+    } else {
+        512 << 10
+    };
     let bytes = read_head(path, head).ok()?;
     let (lat, lon) = whereti_places::gps(&bytes)?;
     let place = whereti_places::place_of(lat, lon)?;
@@ -1146,23 +1179,11 @@ fn files_in(idx: &NameIndex, folders: &[String], pictures: &[String]) -> HashMap
             props_only: false, meaning_only: false,
         });
     }
-    // photos in the pictures folders: where they were taken
-    if !pictures.is_empty() {
-        let paths = pictures
-            .iter()
-            .map(|f| {
-                let mut p = fold(f.trim_end_matches('\\'));
-                p.push('\\');
-                Term::Path(p)
-            })
-            .collect();
-        let photos = Query {
-            clauses: vec![
-                file(),
-                Clause { negated: false, any_of: paths },
-                Clause { negated: false, any_of: vec![Term::Ext(PHOTO_EXTS.iter().map(|e| e.to_string()).collect())] },
-            ],
-        };
+    // photos anywhere on the disks (not in programs, caches, hidden or
+    // system folders): where they were taken and what is in them
+    {
+        let exts = PHOTO_EXTS.iter().chain(whereti_query::kinds::RAW).map(|e| e.to_string()).collect();
+        let photos = Query { clauses: vec![file(), Clause { negated: false, any_of: vec![Term::Ext(exts)] }] };
         let entries: Vec<u32> =
             idx.matching(&photos).into_iter().filter(|&e| idx.flags(e) & SKIP == 0 && idx.size(e) >= MIN_PICTURE).collect();
         let records = idx.records_of(&entries);
@@ -1281,14 +1302,16 @@ fn is_picture(path: &str) -> bool {
 /// locked, no access): it is tried again in a later round.
 /// What is in a photo, as words for the index ("dog Hund perro chien
 /// cane pies cachorro câine"); `None` without tags.
-fn photo_tags(path: &Path, tagger: &mut TagWorker) -> Option<String> {
+fn photo_tags(path: &Path, tagger: &mut TagWorker, seen: &mut Vec<u16>) -> Option<String> {
     let bytes = read_shared(path, MAX_TAGGED).ok()?;
     let tags = tagger.tags(&bytes).ok()?;
+    *seen = tags.iter().map(|(i, _)| *i as u16).collect();
     (!tags.is_empty()).then(|| whereti_extract::tags::index_text(&tags))
 }
 
 /// Reads one file. `tagger`: recognise what is in photos (when on).
-fn extract(c: &Candidate, sandbox: Option<&Sandbox>, tagger: Option<&mut TagWorker>) -> Option<(Indexed, String)> {
+/// `seen`: the photo model's labels, when it looked at a photo.
+fn extract(c: &Candidate, sandbox: Option<&Sandbox>, tagger: Option<&mut TagWorker>, seen: &mut Vec<u16>) -> Option<(Indexed, String)> {
     let what = |status| Indexed { size: c.size, modified: c.modified, status };
     if c.media_only {
         return Some((what(Status::Empty), String::new()));
@@ -1298,7 +1321,7 @@ fn extract(c: &Candidate, sandbox: Option<&Sandbox>, tagger: Option<&mut TagWork
     let kind = whereti_extract::kind_of(&ext)?;
     // a photo: where it was taken and what is in it
     let place = if kind == Kind::Image {
-        let tags = tagger.and_then(|t| photo_tags(path, t));
+        let tags = tagger.and_then(|t| photo_tags(path, t, seen));
         match (place_text(path, &ext), tags) {
             (Some(p), Some(t)) => Some(format!("{p}\n{t}")),
             (p, t) => p.or(t),

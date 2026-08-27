@@ -27,6 +27,8 @@ pub struct Props {
     pub artist: String,
     pub album: String,
     pub author: String,
+    /// What the photo model saw: label numbers (whereti_extract::tags::labels).
+    pub tags: Vec<u16>,
 }
 
 use whereti_query::kinds::{AUDIO_TAGGED as AUDIO_EXTS, RAW, VIDEO_TAGGED as VIDEO_EXTS};
@@ -226,7 +228,12 @@ impl PropStore {
             if lines.next() == Some(HEADER) {
                 for line in lines {
                     let f: Vec<&str> = line.split('\t').collect();
-                    let [key, taken, width, height, duration, camera, artist, album, author] = f.as_slice() else { continue };
+                    // 10 fields since 0.0.25 (the tags); 9 before
+                    let (fields, tags) = match f.as_slice() {
+                        [rest @ .., tags] if rest.len() == 9 => (rest, *tags),
+                        rest => (rest, ""),
+                    };
+                    let [key, taken, width, height, duration, camera, artist, album, author] = fields else { continue };
                     let Ok(key) = key.parse() else { continue };
                     let n = |s: &str| s.parse().unwrap_or(0);
                     map.insert(
@@ -240,6 +247,7 @@ impl PropStore {
                             artist: artist.to_string(),
                             album: album.to_string(),
                             author: author.to_string(),
+                            tags: tags.split(',').filter_map(|t| t.parse().ok()).collect(),
                         },
                     );
                 }
@@ -276,11 +284,11 @@ impl PropStore {
         text.push('\n');
         for (k, p) in &self.map {
             if p.is_empty() {
-                text.push_str(&format!("{k}\t0\t0\t0\t0\t\t\t\t\n"));
+                text.push_str(&format!("{k}\t0\t0\t0\t0\t\t\t\t\t\n"));
                 continue;
             }
             text.push_str(&format!(
-                "{k}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                "{k}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
                 p.taken,
                 p.width,
                 p.height,
@@ -288,13 +296,18 @@ impl PropStore {
                 clean(&p.camera),
                 clean(&p.artist),
                 clean(&p.album),
-                clean(&p.author)
+                clean(&p.author),
+                p.tags.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(",")
             ));
         }
         let tmp = self.path.with_extension("tmp");
         if std::fs::write(&tmp, text).is_ok() && std::fs::rename(&tmp, &self.path).is_ok() {
             self.dirty = false;
         }
+    }
+
+    pub fn get(&self, key: u64) -> Option<&Props> {
+        self.map.get(&key)
     }
 
     /// Keys of the files whose properties satisfy every clause.
@@ -314,7 +327,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let mut s = PropStore::load(&dir);
         let canon = Props { taken: exif_minutes("2025:08:14 18:30:05").unwrap(), width: 6000, height: 4000, camera: "Canon EOS 80D".into(), ..Default::default() };
-        let song = Props { duration: 330, artist: "Ștefan Bănică".into(), album: "Best of".into(), ..Default::default() };
+        let song = Props { duration: 330, artist: "Ștefan Bănică".into(), album: "Best of".into(), tags: vec![3, 17], ..Default::default() };
         s.set(1, canon);
         s.set(2, song);
         s.set(3, Props::default());
@@ -332,6 +345,7 @@ mod tests {
         assert_eq!(keys("artist:banica duration:>5m"), vec![2]);
         assert_eq!(keys("!camera:canon"), vec![2, 3]);
         assert_eq!(keys("taken:2024"), Vec::<u64>::new());
+        assert_eq!(s.get(2).unwrap().tags, vec![3, 17]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

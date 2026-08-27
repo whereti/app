@@ -103,7 +103,7 @@ pub fn kind_of(ext: &str) -> Option<Kind> {
         "msg" => Kind::Outlook,
         "doc" | "dot" => Kind::WordBinary,
         "ppt" | "pps" | "pot" => Kind::PowerPointBinary,
-        e if IMAGE_EXTS.contains(&e) => Kind::Image,
+        e if IMAGE_EXTS.contains(&e) || whereti_query::kinds::RAW.contains(&e) => Kind::Image,
         e if archive::is_archive(e) => Kind::Archive,
         e if TEXT_EXTS.contains(&e) => Kind::Text,
         _ => return None,

@@ -110,6 +110,7 @@ impl Preview {
         self.cache.iter().find(|c| &c.path == path)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn show(
         &mut self,
         ui: &mut egui::Ui,
@@ -118,6 +119,7 @@ impl Preview {
         icons: &mut crate::file_icons::FileIcons,
         needles: &[String],
         tz: i32,
+        info: Option<&whereti_ipc::FileInfo>,
     ) {
         let icon = row.and_then(|r| icons.get(ui.ctx(), &r.path, r.is_dir));
         let icon = icon.as_ref();
@@ -161,6 +163,9 @@ impl Preview {
             }
         }
         ui.label(egui::RichText::new(facts.join("  ·  ")).size(12.0).color(p.text3));
+        if let Some(info) = info {
+            details(ui, p, info, tz);
+        }
         ui.add_space(10.0);
 
         if row.is_dir {
@@ -513,3 +518,61 @@ fn read_shared_head(path: &Path, max: u64) -> Result<Vec<u8>, SandboxError> {
     }
 }
 
+
+/// What whereti read from the file: what the photo model saw, when and with
+/// what a photo was taken, its size, a song's artist and length, a
+/// document's author. Nothing when nothing is known.
+fn details(ui: &mut egui::Ui, p: &Palette, info: &whereti_ipc::FileInfo, tz: i32) {
+    let mut lines: Vec<String> = Vec::new();
+    if !info.tags.is_empty() {
+        // the labels in the app's language (en, de, es, fr, it, pl, pt-BR, ro)
+        let col = match whereti_i18n::current().locale().code.get(..2).unwrap_or("en") {
+            "de" => 1,
+            "es" => 2,
+            "fr" => 3,
+            "it" => 4,
+            "pl" => 5,
+            "pt" => 6,
+            "ro" => 7,
+            _ => 0,
+        };
+        let labels = whereti_extract::tags::labels();
+        let names: Vec<&str> = info.tags.iter().filter_map(|&t| labels.get(t as usize)?.get(col).copied()).collect();
+        if !names.is_empty() {
+            lines.push(trf!("In the photo: {things}", things = names.join(", ")));
+        }
+    }
+    let mut photo = Vec::new();
+    if info.taken != 0 {
+        photo.push(trf!("taken {when}", when = relative_time(info.taken, tz, crate::app::now_minutes())));
+    }
+    if !info.camera.is_empty() {
+        photo.push(info.camera.clone());
+    }
+    if info.width != 0 && info.height != 0 {
+        photo.push(format!("{} × {}", info.width, info.height));
+    }
+    if !photo.is_empty() {
+        lines.push(photo.join("  ·  "));
+    }
+    let mut media = Vec::new();
+    if !info.artist.is_empty() {
+        media.push(info.artist.clone());
+    }
+    if !info.album.is_empty() {
+        media.push(info.album.clone());
+    }
+    if info.duration != 0 {
+        let (h, m, s) = (info.duration / 3600, info.duration / 60 % 60, info.duration % 60);
+        media.push(if h > 0 { format!("{h}:{m:02}:{s:02}") } else { format!("{m}:{s:02}") });
+    }
+    if !media.is_empty() {
+        lines.push(media.join("  ·  "));
+    }
+    if !info.author.is_empty() {
+        lines.push(trf!("by {author}", author = info.author));
+    }
+    for line in lines {
+        ui.add(egui::Label::new(egui::RichText::new(line).size(12.0).color(p.text2)).wrap());
+    }
+}
