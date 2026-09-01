@@ -29,12 +29,15 @@ pub struct Props {
     pub author: String,
     /// What the photo model saw: label numbers (whereti_extract::tags::labels).
     pub tags: Vec<u16>,
+    /// The photo model looked at it (with or without finding anything).
+    pub tagged: bool,
 }
 
 use whereti_query::kinds::{AUDIO_TAGGED as AUDIO_EXTS, RAW, VIDEO_TAGGED as VIDEO_EXTS};
 const PHOTO_EXTS: &[&str] = whereti_query::kinds::PHOTOS;
-const OFFICE_EXTS: &[&str] = &["docx", "docm", "xlsx", "xlsm", "pptx", "pptm"];
-const ODF_EXTS: &[&str] = &["odt", "ods", "odp"];
+const OFFICE_EXTS: &[&str] =
+    &["docx", "docm", "dotx", "dotm", "xlsx", "xlsm", "xlsb", "xltx", "xltm", "pptx", "pptm", "ppsx", "ppsm", "potx", "potm"];
+const ODF_EXTS: &[&str] = &["odt", "ott", "ods", "ots", "odp", "otp"];
 
 /// The file has properties worth reading.
 pub fn has_props(ext: &str) -> bool {
@@ -57,11 +60,22 @@ pub fn read(path: &Path, ext: &str, tz_offset: i32) -> Props {
 fn read_inner(path: &Path, ext: &str, tz_offset: i32) -> Props {
     let mut p = Props::default();
     if PHOTO_EXTS.contains(&ext) || RAW.contains(&ext) {
-        // EXIF is at the start of a JPEG; HEIC and RAW keep it further in
-        let head = if matches!(ext, "jpg" | "jpeg" | "jpe" | "jfif" | "png" | "webp") { 512 << 10 } else { 16 << 20 };
+        // the same head as the place reader (content.rs): EXIF is at the
+        // start of a JPEG; HEIC/AVIF keep it anywhere, RAW a little further in
+        let raw = RAW.contains(&ext);
+        let head = if matches!(ext, "heic" | "heif" | "hif" | "avif" | "jxl") {
+            64 << 20
+        } else if raw {
+            16 << 20
+        } else {
+            512 << 10
+        };
         if let Ok(bytes) = read_head(path, head) {
-            if let Ok(size) = imagesize::blob_size(&bytes) {
-                (p.width, p.height) = (size.width as u32, size.height as u32);
+            // a RAW file's first image is its small preview: its size is not the photo's
+            if !raw {
+                if let Ok(size) = imagesize::blob_size(&bytes) {
+                    (p.width, p.height) = (size.width as u32, size.height as u32);
+                }
             }
             photo_exif(&bytes, tz_offset, &mut p);
         }
@@ -228,7 +242,8 @@ impl PropStore {
             if lines.next() == Some(HEADER) {
                 for line in lines {
                     let f: Vec<&str> = line.split('\t').collect();
-                    // 10 fields since 0.0.25 (the tags); 9 before
+                    // 10 fields since 0.0.25 (the tags: "" not looked at, "x" looked
+                    // at and nothing found, else label numbers); 9 before
                     let (fields, tags) = match f.as_slice() {
                         [rest @ .., tags] if rest.len() == 9 => (rest, *tags),
                         rest => (rest, ""),
@@ -248,6 +263,7 @@ impl PropStore {
                             album: album.to_string(),
                             author: author.to_string(),
                             tags: tags.split(',').filter_map(|t| t.parse().ok()).collect(),
+                            tagged: !tags.is_empty(),
                         },
                     );
                 }
@@ -297,7 +313,7 @@ impl PropStore {
                 clean(&p.artist),
                 clean(&p.album),
                 clean(&p.author),
-                p.tags.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(",")
+                if p.tagged && p.tags.is_empty() { "x".to_string() } else { p.tags.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(",") }
             ));
         }
         let tmp = self.path.with_extension("tmp");
@@ -327,10 +343,11 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let mut s = PropStore::load(&dir);
         let canon = Props { taken: exif_minutes("2025:08:14 18:30:05").unwrap(), width: 6000, height: 4000, camera: "Canon EOS 80D".into(), ..Default::default() };
-        let song = Props { duration: 330, artist: "Ștefan Bănică".into(), album: "Best of".into(), tags: vec![3, 17], ..Default::default() };
+        let song = Props { duration: 330, artist: "Ștefan Bănică".into(), album: "Best of".into(), tags: vec![3, 17], tagged: true, ..Default::default() };
         s.set(1, canon);
         s.set(2, song);
         s.set(3, Props::default());
+        s.set(4, Props { tagged: true, ..Default::default() });
         s.save();
         let s = PropStore::load(&dir);
         let ctx = DateCtx { now: exif_minutes("2026:10:24 12:00:00").unwrap(), tz_offset: 0 };
@@ -342,10 +359,12 @@ mod tests {
         };
         assert_eq!(keys("taken:2025-08"), vec![1]);
         assert_eq!(keys("camera:canon width:>4000"), vec![1]);
-        assert_eq!(keys("artist:banica duration:>5m"), vec![2]);
-        assert_eq!(keys("!camera:canon"), vec![2, 3]);
+        assert_eq!(keys("artist:banica duration:>=5m"), vec![2]);
+        assert!(keys("artist:banica duration:>5m").is_empty(), "5:30 is not over 5 minutes: 5m covers 5:00-5:59");
+        assert_eq!(keys("!camera:canon"), vec![2, 3, 4]);
         assert_eq!(keys("taken:2024"), Vec::<u64>::new());
         assert_eq!(s.get(2).unwrap().tags, vec![3, 17]);
+        assert!(s.get(4).unwrap().tagged && !s.get(3).unwrap().tagged);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -102,6 +102,8 @@ fn serve_tags(model: &Path) -> i32 {
 fn serve_embed(model: &Path, tokenizer: &Path) -> i32 {
     let dll = std::env::current_exe().map(|e| e.with_file_name("onnxruntime.dll")).unwrap_or_default();
     let mut embedder: Option<crate::meaning::Embedder> = None;
+    // a model that cannot load is not loaded again for every text
+    let mut failed: Option<String> = None;
     let (mut input, mut out) = (std::io::stdin().lock(), std::io::stdout().lock());
     loop {
         let mut len = [0u8; 4];
@@ -118,8 +120,17 @@ fn serve_embed(model: &Path, tokenizer: &Path) -> i32 {
         }
         let text = String::from_utf8_lossy(&bytes).into_owned();
         let answer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if let Some(e) = &failed {
+                return Err(e.clone());
+            }
             if embedder.is_none() {
-                embedder = Some(crate::meaning::Embedder::new(&dll, model, tokenizer)?);
+                match crate::meaning::Embedder::new(&dll, model, tokenizer) {
+                    Ok(e) => embedder = Some(e),
+                    Err(e) => {
+                        failed = Some(e.clone());
+                        return Err(e);
+                    }
+                }
             }
             embedder.as_mut().map_or(Err("no model".to_string()), |e| e.embed(&text))
         }))

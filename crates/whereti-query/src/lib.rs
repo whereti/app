@@ -66,7 +66,7 @@ pub enum Term {
 pub enum Prop {
     /// When the photo was taken, minutes since 1601 UTC, inclusive.
     Taken { min: u32, max: u32 },
-    /// Picture or video size in pixels, inclusive.
+    /// Picture size in pixels, inclusive (videos: not read).
     Width { min: u32, max: u32 },
     Height { min: u32, max: u32 },
     /// Song or video length in seconds, inclusive.
@@ -330,10 +330,12 @@ fn parse_range_with(v: &str, value: impl Fn(&str) -> Option<(u32, u32)>) -> Opti
     for op in [">=", "<=", ">", "<", "="] {
         if let Some(rest) = v.strip_prefix(op) {
             let (n, u) = value(rest)?;
+            // a value covers its whole unit: "5m" is 5:00 to 5:59, so ">5m"
+            // starts at 6:00 and "<=5m" ends at 5:59 (as dates do)
             return Some(match op {
                 ">=" => (n, u32::MAX),
-                "<=" => (0, n),
-                ">" => (n.saturating_add(1), u32::MAX),
+                "<=" => (0, n.saturating_add(u - 1)),
+                ">" => (n.saturating_add(u), u32::MAX),
                 "<" => (0, n.checked_sub(1)?),
                 _ => (n, n.saturating_add(u - 1)),
             });
@@ -495,7 +497,8 @@ mod tests {
         };
         assert_eq!(one("width:>4000"), Term::Prop(Prop::Width { min: 4001, max: u32::MAX }));
         assert_eq!(one("height:1000..2000"), Term::Prop(Prop::Height { min: 1000, max: 2000 }));
-        assert_eq!(one("duration:>5m"), Term::Prop(Prop::Duration { min: 301, max: u32::MAX }));
+        assert_eq!(one("duration:>5m"), Term::Prop(Prop::Duration { min: 360, max: u32::MAX }));
+        assert_eq!(one("duration:<=5m"), Term::Prop(Prop::Duration { min: 0, max: 359 }));
         assert_eq!(one("duration:3m30s"), Term::Prop(Prop::Duration { min: 210, max: 210 }));
         assert_eq!(one("duration:5min"), Term::Prop(Prop::Duration { min: 300, max: 359 }));
         assert_eq!(one("duration:1h.."), Term::Prop(Prop::Duration { min: 3600, max: u32::MAX }));

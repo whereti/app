@@ -25,7 +25,8 @@ pub const PICTURES: &[&str] = &[
 
 /// Camera raw files (Windows' Raw Image Extension decodes them).
 pub const RAW: &[&str] = &[
-    "dng", "3fr", "ari", "arw", "bay", "cap", "cr2", "cr3", "crw", "dcs", "dcr", "drf", "eip", "erf", "fff", "iiq",
+    // not "cap" (network captures share it)
+    "dng", "3fr", "ari", "arw", "bay", "cr2", "cr3", "crw", "dcs", "dcr", "drf", "eip", "erf", "fff", "iiq",
     "k25", "kdc", "mef", "mos", "mrw", "nef", "nrw", "orf", "ori", "pef", "ptx", "pxn", "raf", "raw", "rw2", "rwl",
     "sr2", "srf", "srw", "x3f",
 ];
@@ -41,15 +42,17 @@ pub const PHOTOS: &[&str] = &["jpg", "jpeg", "jpe", "jfif", "heic", "heif", "hif
 /// text is read only for the formats `whereti-extract` knows).
 pub const DOCUMENTS: &[&str] = &[
     // word processing
-    "pdf", "doc", "docx", "docm", "dot", "dotx", "dotm", "odt", "ott", "rtf", "txt", "md", "markdown", "pages", "wpd", "wps", "hwp",
+    // not "dot" (Graphviz) or "pot" (gettext): their Office meanings are rare
+    "pdf", "doc", "docx", "docm", "dotx", "dotm", "odt", "ott", "rtf", "txt", "md", "markdown", "pages", "wpd", "wps", "hwp",
     // spreadsheets
     "xls", "xlsx", "xlsm", "xlsb", "xltx", "xltm", "ods", "ots", "csv", "tsv", "numbers",
     // presentations
-    "ppt", "pptx", "pptm", "pps", "ppsx", "ppsm", "pot", "potx", "potm", "odp", "otp", "key",
+    // not "key" (Keynote) or "pub" (Publisher): certificates and SSH keys share them
+    "ppt", "pptx", "pptm", "pps", "ppsx", "ppsm", "potx", "potm", "odp", "otp",
     // books and fixed layout
     "epub", "mobi", "azw", "azw3", "fb2", "djvu", "xps", "oxps",
     // mail and notes
-    "eml", "msg", "one", "vsd", "vsdx", "pub", "tex",
+    "eml", "msg", "one", "vsd", "vsdx", "tex",
 ];
 
 pub const AUDIO: &[&str] = &[
@@ -58,8 +61,8 @@ pub const AUDIO: &[&str] = &[
 ];
 
 pub const VIDEO: &[&str] = &[
-    "mp4", "m4v", "mov", "mkv", "avi", "wmv", "webm", "mpg", "mpeg", "m2ts", "mts", "ts", "3gp", "3g2", "flv", "vob", "ogv",
-    "asf",
+    // not "ts": TypeScript is far more common on a PC than MPEG transport streams
+    "mp4", "m4v", "mov", "mkv", "avi", "wmv", "webm", "mpg", "mpeg", "m2ts", "mts", "3gp", "3g2", "flv", "vob", "ogv", "asf",
 ];
 
 /// Music whose tags and length whereti reads.

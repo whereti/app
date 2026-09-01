@@ -105,6 +105,9 @@ pub struct Content {
     dir: PathBuf,
     /// Properties of photos, music, videos and Office files (props.rs).
     props: Mutex<crate::props::PropStore>,
+    /// Files whose reading once took the service down (a parser crash
+    /// aborts the process): never read in-process again (crash.txt).
+    crashed: Mutex<HashSet<u64>>,
     /// Search by meaning: wanted by the user (meaning.txt), its state, the
     /// documents' vectors and the model's worker (meaning.rs).
     meaning_on: AtomicBool,
@@ -160,6 +163,7 @@ impl Content {
             pictures: RwLock::new(picture_folders()),
             dir: dir.to_path_buf(),
             props: Mutex::new(crate::props::PropStore::load(dir)),
+            crashed: Mutex::new(load_crashed(dir, log)),
             meaning_on: AtomicBool::new(std::fs::read_to_string(dir.join("meaning.txt")).is_ok_and(|s| s.trim() == "on")),
             meaning_state: Mutex::new("off".into()),
             vectors: Mutex::new(crate::meaning::Vectors::load(dir)),
@@ -215,11 +219,15 @@ impl Content {
             if !is_dir {
                 let name = idx.name(e);
                 let ext = name.rsplit_once('.').map(|(_, x)| x.to_ascii_lowercase()).unwrap_or_default();
-                if !self.exts.contains(ext.as_str()) && !PHOTO_EXTS.contains(&ext.as_str()) {
+                let photo_or_media = CAMERA_EXTS.contains(&ext.as_str())
+                    || whereti_query::kinds::RAW.contains(&ext.as_str())
+                    || whereti_query::kinds::AUDIO_TAGGED.contains(&ext.as_str())
+                    || whereti_query::kinds::VIDEO_TAGGED.contains(&ext.as_str());
+                if !self.exts.contains(ext.as_str()) && !PHOTO_EXTS.contains(&ext.as_str()) && !photo_or_media {
                     continue;
                 }
-                // a document anywhere (outside noise) counts right away
-                if EVERYWHERE.contains(&ext.as_str()) && idx.flags(e) & SKIP == 0 {
+                // a document, photo or song anywhere (outside noise) counts right away
+                if (EVERYWHERE.contains(&ext.as_str()) || photo_or_media) && idx.flags(e) & SKIP == 0 {
                     self.dirty.store(true, Ordering::Relaxed);
                     return;
                 }
@@ -328,29 +336,51 @@ impl Content {
     }
 
     /// The vectors of one document's text (its first pieces).
-    fn read_meaning(&self, key: u64, text: &str) {
+    /// `false` when the model failed (the document is tried again later).
+    fn read_meaning(&self, key: u64, text: &str) -> bool {
         let mut vectors = Vec::new();
         for piece in whereti_extract::meaning::pieces(text, crate::meaning::PIECES) {
             match self.model.lock().embed(&format!("passage: {piece}")) {
                 Ok(v) => vectors.push(v),
-                Err(_) => break,
+                Err(e) => {
+                    *self.meaning_state.lock() = format!("error: {e}");
+                    return false;
+                }
             }
         }
-        // kept even when empty: a document without text is not read again
+        // kept even when empty (no text): such a document is not read again
         self.vectors.lock().set(key, vectors);
+        true
+    }
+
+    /// The question's vector, before the name index is locked (the model
+    /// may take a moment to start); `None` when it is not a question.
+    pub fn embed_question(&self, query: &Query) -> Option<Vec<i8>> {
+        if !self.meaning_ready() {
+            return None;
+        }
+        let (words, _) = split_query(query);
+        let question = crate::meaning::question(&words)?;
+        // never wait long behind the indexing for the model
+        let mut model = self.model.try_lock_for(Duration::from_secs(3))?;
+        model.embed(&format!("query: {question}")).ok()
+    }
+
+    /// Notes the file being read in-process (a crash then names it).
+    fn reading(&self, key: Option<u64>) {
+        let path = self.dir.join("reading.txt");
+        let _ = match key {
+            Some(k) => std::fs::write(path, k.to_string()),
+            None => std::fs::write(path, ""),
+        };
     }
 
     /// Documents close in meaning to the query's plain words; the other
     /// conditions filter them. Only files the caller may read.
-    pub fn search_meaning(&self, idx: &NameIndex, query: &Query, limit: usize, caller: &dyn Caller) -> ContentReply {
+    pub fn search_meaning(&self, idx: &NameIndex, query: &Query, q: &[i8], limit: usize, caller: &dyn Caller) -> ContentReply {
         let t = Instant::now();
-        if !self.meaning_ready() {
-            return ContentReply::default();
-        }
-        let (words, filters) = split_query(query);
-        let Some(question) = crate::meaning::question(&words) else { return ContentReply::default() };
-        let Ok(q) = self.model.lock().embed(&format!("query: {question}")) else { return ContentReply::default() };
-        let hits = self.vectors.lock().closest(&q, 200);
+        let (_, filters) = split_query(query);
+        let hits = self.vectors.lock().closest(q, 200);
         let entries: Vec<u32> = hits
             .iter()
             .filter_map(|(k, _)| {
@@ -498,6 +528,12 @@ impl Content {
         // Once, when OCR arrives: documents that gave no text before (scanned
         // PDFs) are read again. Forgetting them makes the next round redo them.
         let ocr_marker = self.dir.join("ocr-1");
+        let places_marker = self.dir.join("places-2"); // 2: again, with the tolerant EXIF reader (0.0.12)
+        if known.is_empty() {
+            // a new index: nothing indexed before to read again
+            let _ = std::fs::write(&ocr_marker, "new index\n");
+            let _ = std::fs::write(&places_marker, "new index\n");
+        }
         let ocr_pass = !ocr_marker.exists();
         if ocr_pass {
             let before = known.len();
@@ -514,7 +550,6 @@ impl Content {
         if self.meaning_on.load(Ordering::SeqCst) {
             self.ensure_meaning_model();
         }
-        let places_marker = self.dir.join("places-2"); // 2: again, with the tolerant EXIF reader (0.0.12)
         let places_pass = !places_marker.exists();
         if places_pass {
             let before = known.len();
@@ -589,22 +624,35 @@ impl Content {
             files_in(idx, &folders, &pictures)
         };
         // recognition turned on (model ready) or off: the photos again
-        // "on-2": photos tagged before 0.0.25 are read again once, so what
-        // was seen in each is kept (and shown in the preview)
-        let tags_now = if self.tags_ready() { "on-2" } else { "off" };
-        let tags_marker = self.dir.join("tags-indexed");
-        let tags_before = std::fs::read_to_string(&tags_marker).map(|s| s.trim().to_string()).unwrap_or_else(|_| "off".into());
-        if tags_before != tags_now {
-            let photos: HashSet<u64> = {
-                let guard = shared.index.read();
-                guard.as_ref().map(photo_keys).unwrap_or_default()
-            };
-            let before = known.len();
-            known.retain(|k, _| !photos.contains(k));
-            shared.log.log(format!("content: {} photos are read again ({tags_now} recognition)", before - known.len()));
-            let _ = std::fs::write(&tags_marker, format!("{tags_now}\n"));
+        // Recognition on: photos not looked at yet by the model are read again;
+        // off: photos that carry tags are read again without them. Kept per
+        // photo (props `tagged`), so a pass cut short goes on after a restart.
+        let mut tagger = if self.tags_ready() { TagWorker::beside_current_exe(&model_path()) } else { None };
+        let want_tags = tagger.is_some();
+        {
+            let props = self.props.lock();
+            let redo: Vec<u64> = wanted
+                .values()
+                .filter(|c| is_picture(&c.path) && known.contains_key(&c.key))
+                // read without the model but should be (on), or with it and should not be (off);
+                // photos with no properties yet are only redone when recognition is on
+                .filter(|c| match props.get(c.key) {
+                    Some(p) => p.tagged != want_tags,
+                    None => want_tags,
+                })
+                .map(|c| c.key)
+                .collect();
+            if !redo.is_empty() {
+                shared.log.log(format!(
+                    "content: {} photos are read again ({} recognition)",
+                    redo.len(),
+                    if want_tags { "with" } else { "without" }
+                ));
+            }
+            for k in redo {
+                known.remove(&k);
+            }
         }
-        let mut tagger = if tags_now != "off" { TagWorker::beside_current_exe(&model_path()) } else { None };
         let removed: Vec<u64> = known.keys().filter(|k| !wanted.contains_key(k)).copied().collect();
         for k in &removed {
             index.remove(*k);
@@ -613,7 +661,7 @@ impl Content {
             self.vectors.lock().remove(*k);
         }
         // search by meaning turned on: the documents already indexed, again for it
-        let meaning_now = self.meaning_ready();
+        let mut meaning_now = self.meaning_ready();
         let meaning_missing: Vec<Candidate> = if meaning_now {
             let vectors = self.vectors.lock();
             wanted
@@ -720,10 +768,23 @@ impl Content {
                 }
             }
             let started = Instant::now();
+            // a file that once crashed a parser is not read in-process again
+            if self.crashed.lock().contains(&c.key) {
+                if !c.props_only && !c.meaning_only {
+                    let what = Indexed { size: c.size, modified: c.modified, status: Status::Failed };
+                    index.put(c.key, what, "").map_err(|e| e.to_string())?;
+                    known.insert(c.key, what);
+                }
+                continue;
+            }
+            self.reading(Some(c.key));
             if c.meaning_only {
                 if let Some((_, text)) = extract(&c, sandbox, None, &mut Vec::new()) {
-                    self.read_meaning(c.key, &text);
+                    if !self.read_meaning(c.key, &text) {
+                        meaning_now = false;
+                    }
                 }
+                since_commit += 1;
             } else if !c.props_only {
                 seen.clear();
                 if let Some((what, text)) = extract(&c, sandbox, tagger.as_mut(), &mut seen) {
@@ -732,21 +793,35 @@ impl Content {
                     since_commit += 1;
                     indexed += 1;
                     if meaning_now && !c.photo_only && !c.media_only && !is_picture(&c.path) {
-                        self.read_meaning(c.key, &text);
+                        if !self.read_meaning(c.key, &text) {
+                            meaning_now = false; // the model failed: not for the rest of this round
+                        }
+                    } else {
+                        // a record reused by another kind of file: no old vectors on it
+                        self.vectors.lock().remove(c.key);
                     }
                 }
             }
             let ext = ext_of(&c.path);
             if crate::props::has_props(&ext) {
                 let mut p = crate::props::read(Path::new(&c.path), &ext, tz);
-                p.tags = if c.props_only {
-                    // only the properties were read: keep the tags known
-                    self.props.lock().get(c.key).map(|old| old.tags.clone()).unwrap_or_default()
+                if c.props_only {
+                    // only the properties were read: keep what the model saw
+                    if let Some(old) = self.props.lock().get(c.key) {
+                        p.tags = old.tags.clone();
+                        p.tagged = old.tagged;
+                    }
+                    since_commit += 1;
                 } else {
-                    std::mem::take(&mut seen)
-                };
+                    p.tags = std::mem::take(&mut seen);
+                    p.tagged = want_tags && is_picture(&c.path);
+                }
                 self.props.lock().set(c.key, p);
+            } else if !c.props_only && !c.meaning_only {
+                // a record reused by another kind of file: no old properties on it
+                self.props.lock().remove(c.key);
             }
+            self.reading(None);
             {
                 let mut s = self.status.lock();
                 s.done = n as u64 + 1;
@@ -969,7 +1044,7 @@ impl Content {
         }
         let known = self.known_keys.read();
         let mut candidates: Vec<Candidate> =
-            files_in(idx, &self.folders(), &[]).into_values().filter(|c| !known.contains(&c.key)).collect();
+            files_in(idx, &self.folders(), &[]).into_values().filter(|c| !known.contains(&c.key) && !c.photo_only && !c.media_only).collect();
         drop(known);
         if !filters.clauses.is_empty() {
             let entries: Vec<u32> = candidates
@@ -1072,7 +1147,7 @@ pub fn split_query(query: &Query) -> (String, Query) {
             (false, [Term::Place(t)]) => {
                 // the place names are in the text of photos: look among photos only
                 words.push(t.clone());
-                let photos = PHOTO_EXTS.iter().map(|e| e.to_string()).collect();
+                let photos = PHOTO_EXTS.iter().chain(whereti_query::kinds::RAW).map(|e| e.to_string()).collect();
                 filters.clauses.push(Clause { negated: false, any_of: vec![Term::Ext(photos)] });
             }
             (false, [Term::Text(t)]) if !explicit => words.push(t.clone()),
@@ -1102,6 +1177,27 @@ struct Candidate {
 
 /// Photos a camera or phone writes its GPS position into.
 const PHOTO_EXTS: &[&str] = whereti_query::kinds::PHOTOS;
+/// What cameras and phones write (PHOTOS without PNG and WebP).
+const CAMERA_EXTS: &[&str] = &["jpg", "jpeg", "jpe", "jfif", "heic", "heif", "hif", "avif", "jxl", "tif", "tiff"];
+
+/// Keys of files whose in-process reading crashed the service: the one
+/// named in reading.txt at start (it was being read when the service went
+/// down) is added to crash.txt for good.
+fn load_crashed(dir: &Path, log: &dyn Fn(String)) -> HashSet<u64> {
+    let list = dir.join("crash.txt");
+    let mut set: HashSet<u64> =
+        std::fs::read_to_string(&list).map(|t| t.lines().filter_map(|l| l.trim().parse().ok()).collect()).unwrap_or_default();
+    let reading = dir.join("reading.txt");
+    if let Some(k) = std::fs::read_to_string(&reading).ok().and_then(|t| t.trim().parse::<u64>().ok()) {
+        if set.insert(k) {
+            log(format!("content: file {k} stopped the service while it was read; it is skipped from now on"));
+            let text: String = set.iter().map(|k| format!("{k}\n")).collect();
+            let _ = std::fs::write(&list, text);
+        }
+    }
+    let _ = std::fs::write(&reading, "");
+    set
+}
 
 /// Where a photo was taken, as text for the index: "Rome, Lazio, Italy"
 /// and then every name of the place. `None` without a GPS position.
@@ -1182,10 +1278,32 @@ fn files_in(idx: &NameIndex, folders: &[String], pictures: &[String]) -> HashMap
     // photos anywhere on the disks (not in programs, caches, hidden or
     // system folders): where they were taken and what is in them
     {
-        let exts = PHOTO_EXTS.iter().chain(whereti_query::kinds::RAW).map(|e| e.to_string()).collect();
-        let photos = Query { clauses: vec![file(), Clause { negated: false, any_of: vec![Term::Ext(exts)] }] };
-        let entries: Vec<u32> =
-            idx.matching(&photos).into_iter().filter(|&e| idx.flags(e) & SKIP == 0 && idx.size(e) >= MIN_PICTURE).collect();
+        // anywhere: what cameras and phones write; PNG and WebP (screenshots,
+        // game and app images) only in the Pictures and content folders
+        let camera: Vec<String> =
+            CAMERA_EXTS.iter().chain(whereti_query::kinds::RAW).map(|e| e.to_string()).collect();
+        let anywhere = Query { clauses: vec![file(), Clause { negated: false, any_of: vec![Term::Ext(camera)] }] };
+        let mut entries: Vec<u32> = idx.matching(&anywhere);
+        let places: Vec<Term> = pictures
+            .iter()
+            .chain(folders)
+            .map(|f| {
+                let mut p = fold(f.trim_end_matches('\\'));
+                p.push('\\');
+                Term::Path(p)
+            })
+            .collect();
+        if !places.is_empty() {
+            let screens = Query {
+                clauses: vec![
+                    file(),
+                    Clause { negated: false, any_of: places },
+                    Clause { negated: false, any_of: vec![Term::Ext(vec!["png".into(), "webp".into()])] },
+                ],
+            };
+            entries.extend(idx.matching(&screens));
+        }
+        let entries: Vec<u32> = entries.into_iter().filter(|&e| idx.flags(e) & SKIP == 0 && idx.size(e) >= MIN_PICTURE).collect();
         let records = idx.records_of(&entries);
         for (e, r) in entries.into_iter().zip(records) {
             let Some(record) = r else { continue };
@@ -1202,22 +1320,32 @@ fn files_in(idx: &NameIndex, folders: &[String], pictures: &[String]) -> HashMap
             });
         }
     }
-    // music and videos in the user's folders: their properties
-    let media_dirs: Vec<String> = folders.iter().chain(pictures).cloned().chain(media_folders()).collect();
-    if !media_dirs.is_empty() {
-        let paths = media_dirs
+    // music and videos anywhere on the disks (not in programs, caches,
+    // hidden or system folders): their properties. Outside the user's own
+    // folders only from 1 MB up (games keep thousands of small sounds).
+    {
+        let exts = whereti_query::kinds::AUDIO_TAGGED.iter().chain(whereti_query::kinds::VIDEO_TAGGED).map(|e| e.to_string()).collect();
+        let media = Query { clauses: vec![file(), Clause { negated: false, any_of: vec![Term::Ext(exts)] }] };
+        let own: Vec<String> = folders
             .iter()
+            .chain(pictures)
+            .cloned()
+            .chain(media_folders())
             .map(|f| {
                 let mut p = fold(f.trim_end_matches('\\'));
                 p.push('\\');
-                Term::Path(p)
+                p
             })
             .collect();
-        let exts = whereti_query::kinds::AUDIO_TAGGED.iter().chain(whereti_query::kinds::VIDEO_TAGGED).map(|e| e.to_string()).collect();
-        let media = Query {
-            clauses: vec![file(), Clause { negated: false, any_of: paths }, Clause { negated: false, any_of: vec![Term::Ext(exts)] }],
-        };
-        let entries: Vec<u32> = idx.matching(&media).into_iter().filter(|&e| idx.flags(e) & SKIP == 0).collect();
+        let entries: Vec<u32> = idx
+            .matching(&media)
+            .into_iter()
+            .filter(|&e| idx.flags(e) & SKIP == 0)
+            .filter(|&e| idx.size(e) >= 1 << 20 || {
+                let p = fold(&idx.full_path(e));
+                own.iter().any(|f| p.starts_with(f.as_str()))
+            })
+            .collect();
         let records = idx.records_of(&entries);
         for (e, r) in entries.into_iter().zip(records) {
             let Some(record) = r else { continue };
@@ -1277,7 +1405,10 @@ fn picture_folders() -> Vec<String> {
 /// Keys of every photo in the name index (for the one-time places pass).
 fn photo_keys(idx: &NameIndex) -> HashSet<u64> {
     let q = Query {
-        clauses: vec![Clause { negated: false, any_of: vec![Term::Ext(PHOTO_EXTS.iter().map(|e| e.to_string()).collect())] }],
+        clauses: vec![Clause {
+            negated: false,
+            any_of: vec![Term::Ext(PHOTO_EXTS.iter().chain(whereti_query::kinds::RAW).map(|e| e.to_string()).collect())],
+        }],
     };
     let entries = idx.matching(&q);
     let records = idx.records_of(&entries);
@@ -1559,6 +1690,19 @@ mod tests {
         let after = content.scan_run(&plan, 4, Duration::from_secs(1), 100, &NotSecrets);
         assert!(after.done && after.rows.is_empty());
         drop(content);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_that_crashed_the_service_is_skipped_for_good() {
+        let dir = std::env::temp_dir().join(format!("whereti-crash-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("reading.txt"), "42").unwrap();
+        let set = load_crashed(&dir, &|_| {});
+        assert!(set.contains(&42));
+        // the next start remembers it, and nothing new is blamed
+        let again = load_crashed(&dir, &|_| {});
+        assert_eq!(again.len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

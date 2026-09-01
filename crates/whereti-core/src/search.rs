@@ -115,7 +115,8 @@ impl NameIndex {
         });
         let total = hits.len();
         let used = if opts.sort == SortBy::Relevance { self.usage_positions(&hits, usage) } else { Vec::new() };
-        let exact = hits.clone();
+        // (a copy only when close matches will be looked for)
+        let exact = if total < FEW_HITS { hits.clone() } else { Vec::new() };
         let mut hits = self.top(hits, opts, rank_needle.as_deref(), &used, active.clone());
         let mut close = 0;
         if total < FEW_HITS && hits.len() < opts.limit {
@@ -148,13 +149,14 @@ impl NameIndex {
         SearchResults { total, hits, warnings, close }
     }
 
-    /// Close matches of `query`: its longest plain word (4+ letters) one
+    /// Close matches of `query`: one of its plain words (4+ letters) one
     /// letter off (one letter swapped with the next, missing, extra or
-    /// wrong), every other condition as typed. In index order, without the
-    /// entries of `exact` (sorted): those where the near word starts a word
-    /// of the name, then the others.
+    /// wrong), every other condition as typed. The words are tried longest
+    /// first; the first that gives anything wins ("raport anaul" corrects
+    /// "anaul"). In index order, without the entries of `exact` (sorted):
+    /// those where the near word starts a word of the name, then the others.
     fn close_entries(&self, query: &Query, exact: &[u32]) -> (Vec<u32>, Vec<u32>) {
-        let word = query
+        let mut words: Vec<(usize, &str)> = query
             .clauses
             .iter()
             .enumerate()
@@ -162,8 +164,18 @@ impl NameIndex {
                 (false, [Term::Text(t)]) if t.chars().count() >= MIN_CLOSE_LEN => Some((ci, t.as_str())),
                 _ => None,
             })
-            .max_by_key(|(_, t)| t.len());
-        let Some((ci, word)) = word else { return Default::default() };
+            .collect();
+        words.sort_by_key(|(_, t)| std::cmp::Reverse(t.len()));
+        for (ci, word) in words {
+            let found = self.close_for_word(query, exact, ci, word);
+            if !found.0.is_empty() || !found.1.is_empty() {
+                return found;
+            }
+        }
+        Default::default()
+    }
+
+    fn close_for_word(&self, query: &Query, exact: &[u32], ci: usize, word: &str) -> (Vec<u32>, Vec<u32>) {
         let variants = near_words(word);
         if variants.is_empty() || self.is_empty() {
             return Default::default();

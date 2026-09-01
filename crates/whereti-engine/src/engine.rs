@@ -206,13 +206,20 @@ impl Engine {
                             ..Default::default()
                         });
                     };
-                    crate::dupes::size_groups(idx, &query)
+                    // property conditions (camera:, artist:…) narrow the files first
+                    let (prop_clauses, _) = crate::props::split(&query);
+                    let within: Option<std::collections::HashSet<u32>> =
+                        (!prop_clauses.is_empty()).then(|| self.content.entries_with_props(idx, &prop_clauses).into_iter().collect());
+                    crate::dupes::size_groups(idx, &query, within.as_ref())
                 };
                 let found = crate::dupes::verify(candidates, DUPES_BUDGET, r.limit.min(MAX_LIMIT) as usize, caller);
                 let mut warnings = Vec::new();
+                if crate::dupes::unsupported(&query) {
+                    warnings.push("dupe: compares files by name, size and content; content: and loc: are not applied to it".to_string());
+                }
                 if found.out_of_time {
                     warnings.push(format!(
-                        "the largest {} of {} sets of same-size files were compared; narrow the search (size:, ext:, path:) for the others",
+                        "the largest {} of {} sets of same-size files were compared so far; search again to go on, or narrow it (size:, ext:, path:)",
                         found.checked, found.total
                     ));
                 }
@@ -248,6 +255,21 @@ impl Engine {
                 let (prop_clauses, rest) = crate::props::split(&query);
                 let res = if prop_clauses.is_empty() {
                     idx.search_ranked(&query, &opts, &r.usage, self.shared.activity.ranking(idx))
+                } else if prop_clauses.iter().all(|c| c.negated) {
+                    // only "not this camera / artist": every file, minus those that have it
+                    // (files whose properties were never read are not excluded)
+                    let positive: Vec<whereti_query::Clause> =
+                        prop_clauses.iter().map(|c| whereti_query::Clause { negated: false, any_of: c.any_of.clone() }).collect();
+                    let excluded: std::collections::HashSet<u32> =
+                        positive.iter().flat_map(|c| self.content.entries_with_props(idx, std::slice::from_ref(c))).collect();
+                    let wide = SearchOptions { limit: opts.limit + excluded.len().min(10_000), ..opts };
+                    let mut res = idx.search_ranked(&rest, &wide, &r.usage, self.shared.activity.ranking(idx));
+                    let before = res.hits.len();
+                    res.hits.retain(|h| !excluded.contains(h));
+                    res.total = res.total.saturating_sub(before - res.hits.len());
+                    res.hits.truncate(opts.limit);
+                    res.close = res.close.min(res.hits.len());
+                    res
                 } else {
                     let within = self.content.entries_with_props(idx, &prop_clauses);
                     idx.search_within(&rest, &opts, &r.usage, self.shared.activity.ranking(idx), &within)
@@ -326,6 +348,9 @@ impl Engine {
                     let Some(idx) = guard.as_ref() else { return Response::FileInfo(Default::default()) };
                     // by its name (one quick scan), then the exact path
                     let name = path.rsplit('\\').next().unwrap_or(&path);
+                    if name.is_empty() {
+                        return Response::FileInfo(Default::default());
+                    }
                     let q = whereti_query::Query {
                         clauses: vec![whereti_query::Clause { negated: false, any_of: vec![whereti_query::Term::Text(whereti_query::fold(name))] }],
                     };
@@ -341,12 +366,16 @@ impl Engine {
                 Err(e) => Response::Error(e),
             },
             Request::MeaningSearch(r) => {
+                let query = whereti_query::parse(&r.query, &system::date_ctx());
+                // the model first, without the name index locked
+                let Some(q) = self.content.embed_question(&query) else {
+                    return Response::Content(Default::default());
+                };
                 let guard = self.shared.index.read();
                 let Some(idx) = guard.as_ref() else {
                     return Response::Content(Default::default());
                 };
-                let query = whereti_query::parse(&r.query, &system::date_ctx());
-                Response::Content(self.content.search_meaning(idx, &query, r.limit.min(MAX_LIMIT) as usize, caller))
+                Response::Content(self.content.search_meaning(idx, &query, &q, r.limit.min(MAX_LIMIT) as usize, caller))
             }
             Request::SetPhotoTags { on } => {
                 self.log(format!("photo recognition turned {} by a client", if on { "on" } else { "off" }));

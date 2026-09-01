@@ -132,6 +132,8 @@ fn a_word_one_letter_off_finds_close_matches_after_the_exact_ones() {
     assert_eq!(close(&idx, "plna").len(), 2);
     // enough exact hits: no close ones
     assert!(close(&idx, "txt").is_empty());
+    // the word with the typo need not be the longest
+    assert_eq!(close(&idx, "raport anaul"), vec![r"C:\Users\ana\Documents\Raport anual 2025.pdf"]);
     // close matches come after the exact ones and never repeat them
     let r = idx.search(&parse("raport", &ctx()), &SearchOptions::default());
     assert_eq!(r.hits.len(), r.total + r.close);

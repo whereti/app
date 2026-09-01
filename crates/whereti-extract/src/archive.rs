@@ -141,7 +141,7 @@ fn rar5_names(b: &[u8]) -> Result<Vec<String>, ExtractError> {
     let bad = || ExtractError::Damaged("bad RAR header".into());
     let mut names = Vec::new();
     let mut pos = 8;
-    while pos + 4 < b.len() && names.len() < MAX_NAMES {
+    while pos < b.len().saturating_sub(4) && names.len() < MAX_NAMES {
         let mut p = pos + 4; // CRC32
         let size = vint(b, &mut p).ok_or_else(bad)? as usize;
         let start = p;
@@ -179,7 +179,11 @@ fn rar5_names(b: &[u8]) -> Result<Vec<String>, ExtractError> {
             5 => break,
             _ => {}
         }
-        pos = end.checked_add(data as usize).ok_or_else(bad)?;
+        // a data size past the end: the archive is cut short, stop here
+        match usize::try_from(data).ok().and_then(|d| end.checked_add(d)).filter(|&p| p <= b.len()) {
+            Some(p) => pos = p,
+            None => break,
+        }
     }
     Ok(names)
 }
@@ -190,7 +194,7 @@ fn rar4_names(b: &[u8]) -> Result<Vec<String>, ExtractError> {
     let u32_at = |p: usize| b.get(p..p + 4).map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]) as u64);
     let mut names = Vec::new();
     let mut pos = 7;
-    while pos + 7 <= b.len() && names.len() < MAX_NAMES {
+    while pos < b.len().saturating_sub(6) && names.len() < MAX_NAMES {
         let kind = b[pos + 2];
         let flags = u16_at(pos + 3).ok_or_else(bad)?;
         let head = u16_at(pos + 5).ok_or_else(bad)?;
@@ -223,7 +227,10 @@ fn rar4_names(b: &[u8]) -> Result<Vec<String>, ExtractError> {
             0x7B => break,
             _ => {}
         }
-        pos = pos.checked_add(head).and_then(|p| p.checked_add(add as usize)).ok_or_else(bad)?;
+        match pos.checked_add(head).and_then(|p| p.checked_add(usize::try_from(add).ok()?)).filter(|&p| p <= b.len()) {
+            Some(p) => pos = p,
+            None => break,
+        }
     }
     Ok(names)
 }
@@ -236,7 +243,17 @@ pub(crate) fn zip_tail_names(tail: &[u8], out: &mut Out) -> Result<(), ExtractEr
     let u32_at = |p: usize| tail.get(p..p + 4).map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]) as usize);
     // end of central directory: the last "PK\5\6"
     let eocd = (0..tail.len().saturating_sub(21)).rev().find(|&p| tail[p..].starts_with(b"PK\x05\x06")).ok_or_else(bad)?;
-    let cd_size = u32_at(eocd + 12).ok_or_else(bad)?;
+    let mut cd_size = u32_at(eocd + 12).ok_or_else(bad)?;
+    // the directory ends where the end records start: ZIP64 adds its own
+    // record (PK 6 6) and a 20-byte locator (PK 6 7) before the classic one
+    let mut cd_end = eocd;
+    if eocd >= 20 && tail[eocd - 20..].starts_with(b"PK\x06\x07") {
+        let z64 = (0..eocd - 20).rev().find(|&p| tail[p..].starts_with(b"PK\x06\x06")).ok_or_else(bad)?;
+        let size64 = tail.get(z64 + 40..z64 + 48).map(|s| u64::from_le_bytes(s.try_into().expect("8 bytes"))).ok_or_else(bad)?;
+        cd_size = usize::try_from(size64).map_err(|_| bad())?;
+        cd_end = z64;
+    }
+    let eocd = cd_end;
     let mut p = eocd.checked_sub(cd_size).ok_or_else(bad)?;
     let mut read = 0;
     let mut names = 0;
