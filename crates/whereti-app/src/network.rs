@@ -97,11 +97,20 @@ pub fn start(wake_ui: impl Fn() + Send + 'static) {
     if let Ok(mut f) = FOLDERS.write() {
         *f = list;
     }
-    load_cache();
     std::thread::Builder::new()
         .name("network folders".into())
-        .spawn(move || walker(wake_ui))
+        .spawn(move || {
+            // the cache can be large: read it here, not on the window's thread
+            load_cache();
+            wake_ui();
+            walker(wake_ui)
+        })
         .expect("a thread");
+}
+
+/// The user added network folders.
+pub fn has_folders() -> bool {
+    FOLDERS.read().is_ok_and(|f| !f.is_empty())
 }
 
 fn walker(wake_ui: impl Fn()) {
@@ -307,7 +316,13 @@ pub fn search(query: &Query, limit: usize) -> Vec<Row> {
             (level, u32::MAX - e.modified, e)
         })
         .collect();
-    hits.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)).then_with(|| a.2.path.cmp(&b.2.path)));
+    // the best `limit` only: no full sort of what may be most of the list
+    let order = |a: &(u8, u32, &Entry), b: &(u8, u32, &Entry)| (a.0, a.1).cmp(&(b.0, b.1)).then_with(|| a.2.path.cmp(&b.2.path));
+    if hits.len() > limit && limit > 0 {
+        hits.select_nth_unstable_by(limit - 1, order);
+        hits.truncate(limit);
+    }
+    hits.sort_by(order);
     hits.into_iter()
         .take(limit)
         .map(|(_, _, e)| Row { path: e.path.clone(), is_dir: e.is_dir, size: e.size, modified: e.modified, flags: 0 })

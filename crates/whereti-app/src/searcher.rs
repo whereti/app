@@ -27,8 +27,9 @@ pub struct Job {
 }
 
 pub enum Update {
-    /// `network`: matches in the user's network folders (network.rs).
-    Results { generation: u64, reply: SearchReply, round_trip: Duration, network: Vec<whereti_ipc::Row> },
+    Results { generation: u64, reply: SearchReply, round_trip: Duration },
+    /// Matches in the user's network folders (network.rs), after the results.
+    Network { generation: u64, rows: Vec<whereti_ipc::Row> },
     Content { generation: u64, reply: ContentReply },
     /// Documents close in meaning to the query.
     Meaning { generation: u64, reply: ContentReply },
@@ -222,7 +223,7 @@ fn worker(jobs: Receiver<Msg>, out: Sender<Update>, wake: impl Fn()) {
                 let t = Instant::now();
                 let rows = crate::recent::recent_files(job.limit as usize);
                 let reply = SearchReply { total: rows.len() as u64, rows, ..Default::default() };
-                let _ = out.send(Update::Results { generation: job.generation, reply, round_trip: t.elapsed(), network: Vec::new() });
+                let _ = out.send(Update::Results { generation: job.generation, reply, round_trip: t.elapsed() });
             }
             if let Some(job) = p.search {
                 let usage = crate::usage::for_query(&job.query);
@@ -232,14 +233,18 @@ fn worker(jobs: Receiver<Msg>, out: Sender<Update>, wake: impl Fn()) {
                     Response::Search(mut reply) => {
                         let round_trip = t.elapsed();
                         refresh_rows(&mut reply);
-                        let network = if reply.groups.is_empty() {
-                            let query = whereti_query::parse(&job.query, &crate::app::date_ctx());
-                            crate::network::search(&query, job.limit as usize)
-                        } else {
-                            Vec::new()
-                        };
-                        let _ = out.send(Update::Results { generation: job.generation, reply, round_trip, network });
+                        let dupes = !reply.groups.is_empty();
+                        let _ = out.send(Update::Results { generation: job.generation, reply, round_trip });
                         wake();
+                        // then the network folders (not for dupe:, which compares local files)
+                        if !dupes && crate::network::has_folders() {
+                            let query = whereti_query::parse(&job.query, &crate::app::date_ctx());
+                            let rows = crate::network::search(&query, job.limit as usize);
+                            if !rows.is_empty() {
+                                let _ = out.send(Update::Network { generation: job.generation, rows });
+                                wake();
+                            }
+                        }
                     }
                     Response::Error(e) => {
                         let _ = out.send(Update::Offline(e));
@@ -327,6 +332,8 @@ const REFRESHED: usize = 60;
 fn refresh_rows(reply: &mut SearchReply) {
     let (mut gone, mut gone_close) = (0u64, 0u64);
     let first_close = reply.rows.len().saturating_sub(reply.close as usize);
+    // dupe: rows come in sets: keep them all (the next search drops what went)
+    let dupes = !reply.groups.is_empty();
     let mut k = 0;
     reply.rows.retain_mut(|row| {
         k += 1;
@@ -343,7 +350,7 @@ fn refresh_rows(reply: &mut SearchReply) {
                 }
                 true
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && !dupes => {
                 if k > first_close {
                     gone_close += 1;
                 } else {

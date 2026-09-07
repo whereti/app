@@ -335,6 +335,16 @@ fn key(vk: VIRTUAL_KEY, up: bool) -> INPUT {
 /// leaves it in front. Nothing is opened or saved.
 pub fn jump(d: &FileDialog, folder: &str) -> Result<(), String> {
     let wait = |ms| std::thread::sleep(std::time::Duration::from_millis(ms));
+    // the Enter that chose the folder must be up first: held or repeated,
+    // it would reach the dialog and press its Open/Save button
+    for _ in 0..50 {
+        // SAFETY: no arguments.
+        let down = unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(VK_RETURN.0 as i32) } as u16 & 0x8000 != 0;
+        if !down {
+            break;
+        }
+        wait(20);
+    }
     // SAFETY: window calls on a handle checked to be alive.
     unsafe {
         if !IsWindow(Some(d.dialog)).as_bool() {
@@ -374,4 +384,17 @@ pub fn jump(d: &FileDialog, folder: &str) -> Result<(), String> {
             .map_err(|e| e.message())?;
     }
     Ok(())
+}
+
+/// On a network share or a mapped network drive (no Recycle Bin there, and
+/// reading can block for a sleeping NAS).
+pub fn is_network_path(path: &str) -> bool {
+    use windows::Win32::Storage::FileSystem::GetDriveTypeW;
+    if path.starts_with("\\\\") {
+        return true;
+    }
+    let Some(letter) = path.chars().next().filter(|c| c.is_ascii_alphabetic() && path[1..].starts_with(':')) else { return false };
+    const DRIVE_REMOTE: u32 = 4;
+    // SAFETY: a NUL-terminated root path.
+    unsafe { GetDriveTypeW(&HSTRING::from(format!("{letter}:\\"))) == DRIVE_REMOTE }
 }

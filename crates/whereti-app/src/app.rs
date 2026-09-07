@@ -100,17 +100,22 @@ pub struct WheretiApp {
     /// `rows[meaning_start..]` are close in meaning to the query (after the
     /// content results).
     meaning_start: Option<usize>,
-    /// `dupe:`: where each set of identical files starts in `rows`, with
-    /// its header.
-    group_labels: std::collections::HashMap<usize, String>,
-    /// The first set's header, shown as the list's own header.
-    first_group_label: Option<String>,
+    /// `dupe:`: each set of identical files in `rows`, as (start, length).
+    dupe_sets: Vec<(usize, usize)>,
     /// What the service read from the previewed file (asked, answer).
     file_info: (Option<String>, Option<(String, whereti_ipc::FileInfo)>),
     /// The rename box (F2), while it is open.
     renaming: Option<Renaming>,
     /// The Up arrow brought back this past search (index in history::list).
     history_pos: Option<usize>,
+    /// The user moved in the list (arrows, Page keys, a click) since the
+    /// last edit of the search text: Delete then acts on the selected file.
+    list_moved: bool,
+    /// A file on a drive without a Recycle Bin, waiting for "Delete
+    /// permanently?".
+    confirm_delete: Option<String>,
+    /// PageUp/PageDown in the Images grid: tiles on one screen.
+    grid_page: usize,
     /// Called from an Open/Save window: Enter moves it to the result's folder.
     file_dialog: Option<crate::win::FileDialog>,
     /// The rename box just closed: focus the search field next frame (while
@@ -201,8 +206,10 @@ impl WheretiApp {
             close_start: None,
             network_start: None,
             meaning_start: None,
-            group_labels: std::collections::HashMap::new(),
-            first_group_label: None,
+            dupe_sets: Vec::new(),
+            list_moved: false,
+            confirm_delete: None,
+            grid_page: 1,
             renaming: None,
             file_info: (None, None),
             history_pos: None,
@@ -406,6 +413,8 @@ impl WheretiApp {
     fn hide(&mut self, ctx: &egui::Context) {
         self.remember_search();
         self.file_dialog = None;
+        // thumbnails are memory: made again when the grid is shown again
+        self.thumbs.clear();
         ctx.send_viewport_cmd(ViewportCommand::Visible(false));
         self.visible = false;
         // A focused text field blinks its cursor, which wakes the app twice a
@@ -418,7 +427,7 @@ impl WheretiApp {
     fn apply_updates(&mut self) {
         for u in self.searcher.updates().collect::<Vec<_>>() {
             match u {
-                Update::Results { generation, reply, round_trip, network } => {
+                Update::Results { generation, reply, round_trip } => {
                     if generation != self.generation {
                         continue; // an older search; a newer one is on its way
                     }
@@ -429,33 +438,19 @@ impl WheretiApp {
                         .map(|it| Row { path: it.target.clone(), is_dir: false, size: 0, modified: 0, flags: 0 })
                         .collect();
                     let close = reply.close as usize;
-                    // sets of identical files: a header over each
-                    self.group_labels.clear();
+                    // sets of identical files: (start, length) each, with a header
+                    self.dupe_sets.clear();
                     let mut at = rows.len();
-                    for (k, &n) in reply.groups.iter().enumerate() {
-                        let n = n as usize;
-                        let size = reply.rows.get(at - rows.len()).map_or(0, |r| r.size);
-                        let label = trf!(
-                            "{n} IDENTICAL FILES · {size} EACH · {free} TO FREE",
-                            n = n,
-                            size = shell::size(size),
-                            free = shell::size(size * (n as u64 - 1))
-                        );
-                        self.group_labels.insert(at, if k == 0 { String::new() } else { label });
-                        at += n;
+                    for &n in &reply.groups {
+                        self.dupe_sets.push((at, n as usize));
+                        at += n as usize;
                     }
-                    let first_group = reply.groups.first().map(|&n| {
-                        let size = reply.rows.first().map_or(0, |r| r.size);
-                        trf!("{n} IDENTICAL FILES · {size} EACH · {free} TO FREE", n = n, size = shell::size(size), free = shell::size(size * (n as u64 - 1)))
-                    });
-                    self.first_group_label = first_group;
                     rows.extend(reply.rows);
-                    // the network folders' matches, under their own heading
-                    let known: std::collections::HashSet<String> = rows.iter().map(|r| r.path.to_lowercase()).collect();
-                    let network: Vec<Row> = network.into_iter().filter(|r| !known.contains(&r.path.to_lowercase())).collect();
-                    self.network_start = (!network.is_empty()).then_some(rows.len());
-                    rows.extend(network);
+                    // the close matches are the last rows of the reply (before
+                    // the network rows, which come in their own update)
                     self.close_start = (close > 0).then(|| rows.len() - close.min(rows.len()));
+                    self.network_start = None;
+                    self.list_moved = false;
                     self.launch_items = launch;
                     self.rows = rows;
                     self.total = reply.total;
@@ -492,6 +487,23 @@ impl WheretiApp {
                     }
                 }
                 Update::FileInfo { path, info } => self.file_info.1 = Some((path, info)),
+                Update::Network { generation, rows } => {
+                    if generation != self.generation {
+                        continue;
+                    }
+                    let shown: std::collections::HashSet<String> = self.rows.iter().map(|r| r.path.to_lowercase()).collect();
+                    let extra: Vec<Row> = rows.into_iter().filter(|r| !shown.contains(&r.path.to_lowercase())).collect();
+                    if !extra.is_empty() {
+                        // after the names (and their close matches), before what came from contents
+                        let at = self.content_start.unwrap_or(self.rows.len());
+                        let n = extra.len();
+                        self.rows.splice(at..at, extra);
+                        self.network_start = Some(at);
+                        for s in [&mut self.content_start, &mut self.meaning_start].into_iter().flatten() {
+                            *s += n;
+                        }
+                    }
+                }
                 Update::Meaning { generation, reply } => {
                     if generation != self.generation {
                         continue;
@@ -524,10 +536,16 @@ impl WheretiApp {
                     let known: std::collections::HashSet<String> = self.rows.iter().map(|r| r.path.clone()).collect();
                     let extra: Vec<Row> = reply.rows.into_iter().filter(|r| !known.contains(&r.path)).collect();
                     if !extra.is_empty() {
+                        // with the content results, before those close in meaning
+                        let at = self.meaning_start.unwrap_or(self.rows.len());
                         if self.content_start.is_none() {
-                            self.content_start = Some(self.rows.len());
+                            self.content_start = Some(at);
                         }
-                        self.rows.extend(extra);
+                        let n = extra.len();
+                        self.rows.splice(at..at, extra);
+                        if let Some(m) = self.meaning_start.as_mut() {
+                            *m += n;
+                        }
                     }
                 }
                 Update::Status(s) => {
@@ -550,7 +568,11 @@ impl WheretiApp {
                 }
                 Update::Config(c) => self.settings.on_config(c),
                 Update::Done(msg) => self.flash(msg),
-                Update::Offline(msg) => self.offline = Some(msg),
+                Update::Offline(msg) => {
+                    self.offline = Some(msg);
+                    // the preview's details were not answered: ask again later
+                    self.file_info.0 = None;
+                }
             }
         }
     }
@@ -571,9 +593,19 @@ impl WheretiApp {
             let dialog = self.file_dialog.take();
             self.hide(ctx);
             if let Some(d) = dialog {
-                if crate::win::jump(&d, &folder).is_err() {
+                if let Err(e) = crate::win::jump(&d, &folder) {
                     self.show(ctx);
-                    self.flash(tr("That window did not accept the folder (an app running as administrator does not take it from whereti)."));
+                    let msg = match e.as_str() {
+                        "closed" => tr("That Open or Save window was closed meanwhile.").to_string(),
+                        "refused" => tr("That window did not accept the folder (an app running as administrator does not take it from whereti).").to_string(),
+                        "no address bar" => tr("whereti could not reach that window's address bar. Click into the window and try again.").to_string(),
+                        other => other.to_string(),
+                    };
+                    self.flash(msg);
+                    // still there: Enter tries again
+                    if e != "closed" {
+                        self.file_dialog = Some(d);
+                    }
                 }
             }
             return;
@@ -604,11 +636,11 @@ impl WheretiApp {
             }
             crate::settings::stop_recording(self);
         }
-        // the rename box takes the keys while it is open
-        if self.renaming.is_some() {
+        // the rename box and the delete question take the keys while open
+        if self.renaming.is_some() || self.confirm_delete.is_some() {
             return;
         }
-        let page = ((self.view_height / ROW_HEIGHT) as usize).max(1);
+        let page = if self.grid_view() { self.grid_page.max(1) } else { ((self.view_height / ROW_HEIGHT) as usize).max(1) };
         let search_page = self.page == Page::Search;
         let f1 = ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::F1));
         if f1 {
@@ -693,6 +725,9 @@ impl WheretiApp {
         if self.selected != before {
             self.scroll_to_selected = true;
         }
+        if down || up || pg_down || pg_up || self.selected != before {
+            self.list_moved = true;
+        }
         if menu && !self.is_launch(self.selected) {
             if let (Some(hwnd), Some(row)) = (self.hwnd, self.rows.get(self.selected)) {
                 if let Err(e) = crate::win::context_menu(hwnd, &row.path.clone()) {
@@ -716,6 +751,7 @@ impl WheretiApp {
                 self.hide(ctx);
             } else {
                 self.query.clear();
+                self.history_pos = None;
                 self.run_search();
                 // egui drops focus on Esc; keep typing in the search field
                 self.focus_search = true;
@@ -735,6 +771,10 @@ impl WheretiApp {
         let range = self.search_id.and_then(|id| egui::text_edit::TextEditState::load(ctx, id)).and_then(|s| s.cursor.char_range());
         let selected_text = range.is_some_and(|r| !r.is_empty());
         let at_end = range.is_none_or(|r| r.primary.index.0 >= self.query.chars().count());
+        // Delete acts on the file only when the list is what the user is in:
+        // the box is empty, or they moved in the list since they last typed.
+        // Never with Shift, Ctrl or Alt held.
+        let list_focus = self.query.is_empty() || self.list_moved;
         let (rename, delete, copy) = ctx.input_mut(|i| {
             let copy = !selected_text && i.events.iter().any(|e| matches!(e, egui::Event::Copy));
             if copy {
@@ -742,7 +782,7 @@ impl WheretiApp {
             }
             (
                 i.consume_key(Modifiers::NONE, Key::F2),
-                !selected_text && at_end && i.consume_key(Modifiers::NONE, Key::Delete),
+                list_focus && !selected_text && at_end && i.modifiers.is_none() && i.consume_key(Modifiers::NONE, Key::Delete),
                 copy,
             )
         });
@@ -759,37 +799,117 @@ impl WheretiApp {
         if rename {
             let name = path.rsplit('\\').next().unwrap_or("").to_string();
             if !name.is_empty() && !name.ends_with(':') {
-                self.renaming = Some(Renaming { path, name, fresh: true, error: None });
+                let is_dir = self.rows[self.selected].is_dir;
+                self.renaming = Some(Renaming { path, name, is_dir, fresh: true, error: None });
             }
         } else if delete {
-            let Some(hwnd) = self.hwnd else { return };
-            match crate::win::recycle(hwnd, &path) {
-                Ok(true) => {
-                    if let Some(i) = self.rows.iter().position(|r| r.path == path) {
-                        self.remove_row(i);
-                    }
-                    self.flash(tr("Moved to the Recycle Bin"));
-                }
-                Ok(false) => {}
-                Err(e) => self.flash(e),
+            if crate::win::is_network_path(&path) {
+                // no Recycle Bin there: ask first
+                self.confirm_delete = Some(path);
+            } else {
+                self.delete_file(&path, false);
             }
+        }
+    }
+
+    /// Moves `path` to the Recycle Bin (`permanent`: a drive without one,
+    /// after the user said yes) and takes it off the list.
+    fn delete_file(&mut self, path: &str, permanent: bool) {
+        let Some(hwnd) = self.hwnd else { return };
+        match crate::win::recycle(hwnd, path) {
+            Ok(true) => {
+                if let Some(i) = self.rows.iter().position(|r| r.path == path) {
+                    self.remove_row(i);
+                }
+                self.flash(if permanent { tr("Deleted") } else { tr("Moved to the Recycle Bin") });
+            }
+            Ok(false) => {}
+            Err(e) => self.flash(e),
+        }
+        self.focus_search = true;
+    }
+
+    /// "Delete permanently?" for a file on a drive without a Recycle Bin.
+    fn confirm_delete_box(&mut self, ctx: &egui::Context, p: &Palette) {
+        let Some(path) = self.confirm_delete.clone() else { return };
+        let name = path.rsplit('\\').next().unwrap_or(&path).to_string();
+        let (mut yes, mut no) = (false, false);
+        let modal = egui::Modal::new(egui::Id::unique("confirm-delete"))
+            .frame(
+                Frame::NONE
+                    .fill(p.surface)
+                    .stroke(Stroke::new(1.0, p.border))
+                    .corner_radius(CornerRadius::same(12))
+                    .inner_margin(Margin::same(18)),
+            )
+            .show(ctx, |ui| {
+                ui.set_width(420.0);
+                ui.label(egui::RichText::new(tr("Delete permanently?")).size(15.0).family(semibold()).color(p.text));
+                ui.add_space(6.0);
+                ui.add(egui::Label::new(egui::RichText::new(&name).size(13.0).color(p.text)).wrap());
+                ui.add_space(4.0);
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(tr("This drive has no Recycle Bin: the file cannot be brought back.")).size(12.5).color(p.text2),
+                    )
+                    .wrap(),
+                );
+                ui.add_space(14.0);
+                ui.horizontal(|ui| {
+                    if crate::settings::button(ui, p, tr("Delete"), true).clicked() {
+                        yes = true;
+                    }
+                    if crate::settings::button(ui, p, tr("Cancel"), false).clicked() {
+                        no = true;
+                    }
+                });
+                if ui.input(|i| i.key_pressed(Key::Escape)) {
+                    no = true;
+                }
+            });
+        if modal.should_close() {
+            no = true;
+        }
+        if yes {
+            self.confirm_delete = None;
+            self.delete_file(&path, true);
+        } else if no {
+            self.confirm_delete = None;
             self.focus_search = true;
         }
+    }
+
+    /// The header of a set of identical files.
+    fn dupe_label(&self, start: usize, len: usize) -> String {
+        let size = self.rows.get(start).map_or(0, |r| r.size);
+        trn!(
+            "{n} IDENTICAL FILE · {size} EACH · {free} TO FREE|{n} IDENTICAL FILES · {size} EACH · {free} TO FREE",
+            len as u64,
+            size = shell::size(size),
+            free = shell::size(size * (len as u64).saturating_sub(1))
+        )
     }
 
     /// Takes row `i` off the list (a file just deleted), keeping the
     /// sections and the count right.
     fn remove_row(&mut self, i: usize) {
+        if !self.dupe_sets.is_empty() {
+            self.remove_dupe_row(i);
+            return;
+        }
         let named_end = self.close_start.or(self.network_start).or(self.content_start).unwrap_or(self.rows.len());
         if i >= self.launch_items.len() && i < named_end {
             self.total = self.total.saturating_sub(1);
         }
         let gone = self.rows.remove(i);
         self.thumbs.forget(&gone.path);
-        for s in [&mut self.close_start, &mut self.network_start, &mut self.content_start].into_iter().flatten() {
+        for s in [&mut self.close_start, &mut self.network_start, &mut self.content_start, &mut self.meaning_start].into_iter().flatten() {
             if *s > i {
                 *s -= 1;
             }
+        }
+        if self.meaning_start == Some(self.rows.len()) {
+            self.meaning_start = None;
         }
         // a section left empty goes away with its header
         if self.content_start == Some(self.rows.len()) {
@@ -801,6 +921,32 @@ impl WheretiApp {
         if self.close_start.is_some() && self.close_start == Some(self.network_start.or(self.content_start).unwrap_or(self.rows.len())) {
             self.close_start = None;
         }
+        self.selected = self.selected.min(self.rows.len().saturating_sub(1));
+    }
+
+    /// In a `dupe:` list: one copy fewer in its set; a set left with one
+    /// file is no longer a set of copies, and goes (with that file's row).
+    fn remove_dupe_row(&mut self, i: usize) {
+        let Some(k) = self.dupe_sets.iter().position(|&(s, n)| (s..s + n).contains(&i)) else { return };
+        let gone = self.rows.remove(i);
+        self.thumbs.forget(&gone.path);
+        self.dupe_sets[k].1 -= 1;
+        let mut removed = 1;
+        if self.dupe_sets[k].1 < 2 {
+            let (start, n) = self.dupe_sets.remove(k);
+            for _ in 0..n {
+                self.rows.remove(start);
+            }
+            removed += n;
+            for s in self.dupe_sets.iter_mut().skip(k) {
+                s.0 -= removed;
+            }
+        } else {
+            for s in self.dupe_sets.iter_mut().skip(k + 1) {
+                s.0 -= 1;
+            }
+        }
+        self.total = self.dupe_sets.len() as u64;
         self.selected = self.selected.min(self.rows.len().saturating_sub(1));
     }
 
@@ -841,9 +987,8 @@ impl WheretiApp {
                         r.fresh = false;
                     } else {
                         resp.request_focus();
-                        let is_dir = std::path::Path::new(&r.path).is_dir();
                         let stem = match r.name.rfind('.') {
-                            Some(dot) if dot > 0 && !is_dir => r.name[..dot].chars().count(),
+                            Some(dot) if dot > 0 && !r.is_dir => r.name[..dot].chars().count(),
                             _ => r.name.chars().count(),
                         };
                         let mut state = egui::text_edit::TextEditState::load(ui.ctx(), id).unwrap_or_default();
@@ -903,8 +1048,8 @@ impl WheretiApp {
         }
         let parent = r.path.rsplit_once('\\').map_or("", |(p, _)| p);
         let new_path = format!("{parent}\\{name}");
-        // same name in other letters (raport -> Raport) is a rename, not a clash
-        if !name.eq_ignore_ascii_case(old) && std::path::Path::new(&new_path).exists() {
+        // same name in other letters (raport -> Raport, ș -> Ș) is a rename, not a clash
+        if name.to_lowercase() != old.to_lowercase() && std::path::Path::new(&new_path).exists() {
             r.error = Some(tr("There is already a file or folder with this name here.").to_string());
             return;
         }
@@ -913,8 +1058,14 @@ impl WheretiApp {
         match crate::win::rename(hwnd, &path, &name) {
             Ok(true) => {
                 self.renaming = None;
-                if let Some(row) = self.rows.iter_mut().find(|row| row.path == path) {
-                    row.path = new_path;
+                // the row, and (a folder) the rows of what is inside it
+                let inside = format!("{path}\\");
+                for row in self.rows.iter_mut() {
+                    if row.path == path {
+                        row.path = new_path.clone();
+                    } else if row.path.starts_with(&inside) {
+                        row.path = format!("{new_path}{}", &row.path[path.len()..]);
+                    }
                 }
                 self.flash(tr("Renamed"));
             }
@@ -973,6 +1124,7 @@ impl WheretiApp {
                 }
                 if resp.changed() {
                     self.history_pos = None;
+                    self.list_moved = false;
                     if self.page == Page::Welcome {
                         crate::welcome::finish(self);
                     }
@@ -1002,6 +1154,7 @@ impl WheretiApp {
                     if !self.query.is_empty() {
                         if icon_button(ui, p, IconKind::Close, false).on_hover_text(tr("Clear (Esc)")).clicked() {
                             self.query.clear();
+                            self.history_pos = None;
                             self.run_search();
                             self.focus_search = true;
                         }
@@ -1111,6 +1264,7 @@ impl WheretiApp {
             let icon = if self.query.trim().is_empty() && self.filter == Filter::All { Icon::Clock } else { Icon::Search };
             if let Some(example) = empty_state(ui, p, icon, p.text3, title, &sub, &[tr("invoice"), "ext:pdf", "dm:today", "*.jpg"]) {
                 self.query = example.to_string();
+                self.history_pos = None;
                 self.filter = Filter::All;
                 self.run_search();
                 self.focus_search = true;
@@ -1139,8 +1293,8 @@ impl WheretiApp {
             tr("RECENT").to_string()
         } else if launch_n > 0 {
             tr("APPS AND SETTINGS").to_string()
-        } else if let Some(first) = &self.first_group_label {
-            first.clone()
+        } else if let Some(&(start, len)) = self.dupe_sets.first() {
+            self.dupe_label(start, len)
         } else if self.close_start == Some(0) {
             tr("CLOSE MATCHES").to_string()
         } else if self.content_start == Some(0) {
@@ -1182,8 +1336,8 @@ impl WheretiApp {
                 labels.push(files);
                 list.push(Item::Section(labels.len() - 1));
             }
-            if let Some(label) = self.group_labels.get(&i).filter(|l| !l.is_empty()) {
-                labels.push(label.clone());
+            if let Some(&(start, len)) = self.dupe_sets.iter().skip(1).find(|(s, _)| *s == i) {
+                labels.push(self.dupe_label(start, len));
                 list.push(Item::Section(labels.len() - 1));
             }
             if self.network_start == Some(i) {
@@ -1330,6 +1484,9 @@ impl WheretiApp {
 
     /// A click, double click, drag or right click on result `i`.
     fn after_list(&mut self, ctx: &egui::Context, clicked: Option<(usize, bool)>, dragged: Option<usize>, menu_for: Option<usize>) {
+        if clicked.is_some() || menu_for.is_some() {
+            self.list_moved = true;
+        }
         if let Some((i, open)) = clicked {
             self.selected = i;
             if open {
@@ -1379,6 +1536,7 @@ impl WheretiApp {
         let image_h = (tile_w * 0.75).round();
         let line_h = image_h + NAME_H + GAP;
         self.grid_cols = cols;
+        self.grid_page = ((self.view_height / line_h).floor().max(1.0) as usize) * cols;
         let lines = self.rows.len().div_ceil(cols);
         let total = lines as f32 * line_h;
 
@@ -1808,6 +1966,7 @@ impl eframe::App for WheretiApp {
         }
         self.handle_keys(&ctx);
         self.rename_box(&ctx, &p);
+        self.confirm_delete_box(&ctx, &p);
         self.file_icons.begin_frame();
 
         egui::Panel::bottom("status")
@@ -2360,6 +2519,7 @@ impl WheretiApp {
             });
         if let Some(q) = chosen {
             self.query = q;
+            self.history_pos = None;
             self.page = Page::Search;
             self.help_open = false;
             self.focus_search = true;
@@ -2845,6 +3005,8 @@ struct Renaming {
     path: String,
     /// The name being typed.
     name: String,
+    /// A folder (its whole name is selected, not the part before a dot).
+    is_dir: bool,
     /// Just opened: select the name before the extension.
     fresh: bool,
     error: Option<String>,

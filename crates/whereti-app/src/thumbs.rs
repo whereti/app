@@ -19,8 +19,8 @@ use windows::Win32::UI::Shell::{IShellItemImageFactory, SHCreateItemFromParsingN
 
 /// Longer side asked from Windows (tiles are ~170 px, sharp on 150% screens).
 const SIDE: i32 = 256;
-/// Thumbnails kept as textures; the oldest go beyond this.
-const KEEP: usize = 600;
+/// Thumbnails kept as textures (~250 KB each); the oldest go beyond this.
+const KEEP: usize = 240;
 /// Textures made per frame.
 const PER_FRAME: usize = 8;
 
@@ -77,6 +77,12 @@ impl Thumbs {
         if let Some(t) = self.cache.get(path) {
             return t.clone();
         }
+        // a NAS asleep would hold the one thumbnail thread for its timeout:
+        // network files show their icon
+        if crate::win::is_network_path(path) {
+            self.cache.insert(path.to_string(), None);
+            return None;
+        }
         if self.asked.insert(path.to_string()) {
             let _ = self.tx.send(path.to_string());
         }
@@ -106,6 +112,14 @@ impl Thumbs {
     /// A file changed or went away: fetch it again next time.
     pub fn forget(&mut self, path: &str) {
         self.cache.remove(path);
+        self.order.retain(|p| p != path);
+    }
+
+    /// Drops every texture (the window was hidden).
+    pub fn clear(&mut self) {
+        self.cache.clear();
+        self.order.clear();
+        self.asked.clear();
     }
 }
 
