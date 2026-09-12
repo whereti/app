@@ -2882,7 +2882,7 @@ fn highlight_needles(query: &str) -> Vec<String> {
     query
         .split_whitespace()
         .map(|w| {
-            ["content:", "c:", "loc:", "location:", "place:"].iter().find_map(|p| w.strip_prefix(p)).unwrap_or(w)
+            ["content:", "contains:", "c:", "loc:", "location:", "place:"].iter().find_map(|p| w.strip_prefix(p)).unwrap_or(w)
         })
         .filter(|w| !w.contains(':') && !w.starts_with('!') && !w.contains(['*', '?', '\\', '|', '"']))
         .map(whereti_query::fold)

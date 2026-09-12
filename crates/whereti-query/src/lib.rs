@@ -244,7 +244,7 @@ fn parse_function(prefix: &str, value: &str, quoted: bool, ctx: &DateCtx) -> Opt
         "size" => parse_size(value).map(|(min, max)| Term::Size { min, max }),
         "dm" | "datemodified" => date::parse_range(value, ctx).map(|(min, max)| Term::Modified { min, max }),
         "regex" if !value.is_empty() => Some(Term::Regex(value.to_string())),
-        "c" | "content" if !value.is_empty() => Some(Term::Content(fold(value))),
+        "c" | "content" | "contains" if !value.is_empty() => Some(Term::Content(fold(value))),
         "loc" | "location" | "place" if !value.is_empty() => Some(Term::Place(fold(value))),
         "taken" | "dt" | "datetaken" => date::parse_range(value, ctx).map(|(min, max)| Term::Prop(Prop::Taken { min, max })),
         "width" => parse_count(value, 1).map(|(min, max)| Term::Prop(Prop::Width { min, max })),

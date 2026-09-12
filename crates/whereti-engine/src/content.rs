@@ -629,6 +629,8 @@ impl Content {
         // photo (props `tagged`), so a pass cut short goes on after a restart.
         let mut tagger = if self.tags_ready() { TagWorker::beside_current_exe(&model_path()) } else { None };
         let want_tags = tagger.is_some();
+        // photos' text (OCR): wherever the photo is, when Windows has OCR
+        let ocr_on = sandbox.is_some() && whereti_extract::ocr_available();
         {
             let props = self.props.lock();
             let redo: Vec<u64> = wanted
@@ -637,8 +639,8 @@ impl Content {
                 // read without the model but should be (on), or with it and should not be (off);
                 // photos with no properties yet are only redone when recognition is on
                 .filter(|c| match props.get(c.key) {
-                    Some(p) => p.tagged != want_tags,
-                    None => want_tags,
+                    Some(p) => p.tagged != want_tags || (ocr_on && !p.ocr && !is_raw(&c.path)),
+                    None => want_tags || (ocr_on && !is_raw(&c.path)),
                 })
                 .map(|c| c.key)
                 .collect();
@@ -806,15 +808,17 @@ impl Content {
             if crate::props::has_props(&ext) {
                 let mut p = crate::props::read(Path::new(&c.path), &ext, tz);
                 if c.props_only {
-                    // only the properties were read: keep what the model saw
+                    // only the properties were read: keep what the model saw and the OCR mark
                     if let Some(old) = self.props.lock().get(c.key) {
                         p.tags = old.tags.clone();
                         p.tagged = old.tagged;
+                        p.ocr = old.ocr;
                     }
                     since_commit += 1;
                 } else {
                     p.tags = std::mem::take(&mut seen);
                     p.tagged = want_tags && is_picture(&c.path);
+                    p.ocr = ocr_on && is_picture(&c.path) && !is_raw(&c.path);
                 }
                 self.props.lock().set(c.key, p);
             } else if !c.props_only && !c.meaning_only {
@@ -1125,6 +1129,10 @@ impl Content {
             })
             .collect()
     }
+}
+
+fn is_raw(path: &str) -> bool {
+    whereti_query::kinds::RAW.contains(&ext_of(path).as_str())
 }
 
 fn ext_of(path: &str) -> String {
@@ -1460,7 +1468,9 @@ fn extract(c: &Candidate, sandbox: Option<&Sandbox>, tagger: Option<&mut TagWork
     } else {
         None
     };
-    if c.photo_only {
+    // a RAW photo: where it was taken and what is in it, not its text
+    // (decoding a camera file for OCR costs too much)
+    if c.photo_only && whereti_query::kinds::RAW.contains(&ext.as_str()) {
         return Some(match place {
             Some(text) => (what(Status::Ok), text),
             None => (what(Status::Empty), String::new()),
@@ -1474,7 +1484,11 @@ fn extract(c: &Candidate, sandbox: Option<&Sandbox>, tagger: Option<&mut TagWork
         let sandbox = sandbox?;
         read_tail(path, ZIP_TAIL).and_then(|b| sandbox.extract_bytes(whereti_extract::ZIP_END, b, MAX_CHARS))
     } else if c.size > MAX_DOCUMENT {
-        return Some((what(Status::TooLarge), String::new()));
+        // too large to read its text: a photo still keeps where it was taken
+        return Some(match place {
+            Some(text) => (what(Status::Ok), text),
+            None => (what(Status::TooLarge), String::new()),
+        });
     } else {
         sandbox?.extract_file(path, MAX_CHARS)
     };

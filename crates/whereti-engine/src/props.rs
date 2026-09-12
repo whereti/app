@@ -31,6 +31,8 @@ pub struct Props {
     pub tags: Vec<u16>,
     /// The photo model looked at it (with or without finding anything).
     pub tagged: bool,
+    /// A picture whose text was read (OCR) for the index.
+    pub ocr: bool,
 }
 
 use whereti_query::kinds::{AUDIO_TAGGED as AUDIO_EXTS, RAW, VIDEO_TAGGED as VIDEO_EXTS};
@@ -244,9 +246,11 @@ impl PropStore {
                     let f: Vec<&str> = line.split('\t').collect();
                     // 10 fields since 0.0.25 (the tags: "" not looked at, "x" looked
                     // at and nothing found, else label numbers); 9 before
-                    let (fields, tags) = match f.as_slice() {
-                        [rest @ .., tags] if rest.len() == 9 => (rest, *tags),
-                        rest => (rest, ""),
+                    // 11 fields since 0.0.25 (OCR done: "1")
+                    let (fields, tags, ocr) = match f.as_slice() {
+                        [rest @ .., tags, ocr] if rest.len() == 9 => (rest, *tags, *ocr == "1"),
+                        [rest @ .., tags] if rest.len() == 9 => (rest, *tags, false),
+                        rest => (rest, "", false),
                     };
                     let [key, taken, width, height, duration, camera, artist, album, author] = fields else { continue };
                     let Ok(key) = key.parse() else { continue };
@@ -264,6 +268,7 @@ impl PropStore {
                             author: author.to_string(),
                             tags: tags.split(',').filter_map(|t| t.parse().ok()).collect(),
                             tagged: !tags.is_empty(),
+                            ocr,
                         },
                     );
                 }
@@ -300,11 +305,11 @@ impl PropStore {
         text.push('\n');
         for (k, p) in &self.map {
             if p.is_empty() {
-                text.push_str(&format!("{k}\t0\t0\t0\t0\t\t\t\t\t\n"));
+                text.push_str(&format!("{k}\t0\t0\t0\t0\t\t\t\t\t\t\n"));
                 continue;
             }
             text.push_str(&format!(
-                "{k}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                "{k}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
                 p.taken,
                 p.width,
                 p.height,
@@ -313,7 +318,8 @@ impl PropStore {
                 clean(&p.artist),
                 clean(&p.album),
                 clean(&p.author),
-                if p.tagged && p.tags.is_empty() { "x".to_string() } else { p.tags.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(",") }
+                if p.tagged && p.tags.is_empty() { "x".to_string() } else { p.tags.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(",") },
+                if p.ocr { "1" } else { "" }
             ));
         }
         let tmp = self.path.with_extension("tmp");
@@ -347,7 +353,7 @@ mod tests {
         s.set(1, canon);
         s.set(2, song);
         s.set(3, Props::default());
-        s.set(4, Props { tagged: true, ..Default::default() });
+        s.set(4, Props { tagged: true, ocr: true, ..Default::default() });
         s.save();
         let s = PropStore::load(&dir);
         let ctx = DateCtx { now: exif_minutes("2026:10:24 12:00:00").unwrap(), tz_offset: 0 };
@@ -365,6 +371,7 @@ mod tests {
         assert_eq!(keys("taken:2024"), Vec::<u64>::new());
         assert_eq!(s.get(2).unwrap().tags, vec![3, 17]);
         assert!(s.get(4).unwrap().tagged && !s.get(3).unwrap().tagged);
+        assert!(s.get(4).unwrap().ocr && !s.get(2).unwrap().ocr);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
