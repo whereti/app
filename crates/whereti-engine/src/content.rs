@@ -48,6 +48,11 @@ use crate::system::{self, Background};
 const MAX_DOCUMENT: u64 = 64 << 20;
 /// Of a text file, only the beginning is indexed.
 const TEXT_HEAD: u64 = 8 << 20;
+/// Characters indexed from an Outlook mailbox (its newest messages).
+const MAILBOX_CHARS: usize = 8_000_000;
+/// A mailbox changes whenever Outlook runs: it is read again at most this
+/// often (minutes).
+const MAILBOX_EVERY: u32 = 24 * 60;
 /// Of a ZIP larger than `MAX_DOCUMENT`, its end: the list of its files.
 const ZIP_TAIL: u64 = 16 << 20;
 /// Characters indexed per file.
@@ -696,6 +701,10 @@ impl Content {
         let mut todo: Vec<Candidate> = wanted
             .into_values()
             .filter(|c| known.get(&c.key).is_none_or(|i| i.size != c.size || i.modified != c.modified))
+            // a mailbox that changed: again only once its date moved a day on
+            .filter(|c| {
+                !is_mailbox(&c.path) || known.get(&c.key).is_none_or(|i| c.modified >= i.modified.saturating_add(MAILBOX_EVERY))
+            })
             .chain(props_missing)
             .chain(meaning_missing)
             .collect();
@@ -1048,7 +1057,7 @@ impl Content {
         }
         let known = self.known_keys.read();
         let mut candidates: Vec<Candidate> =
-            files_in(idx, &self.folders(), &[]).into_values().filter(|c| !known.contains(&c.key) && !c.photo_only && !c.media_only).collect();
+            files_in(idx, &self.folders(), &[]).into_values().filter(|c| !known.contains(&c.key) && !c.photo_only && !c.media_only && !is_mailbox(&c.path)).collect();
         drop(known);
         if !filters.clauses.is_empty() {
             let entries: Vec<u32> = candidates
@@ -1129,6 +1138,10 @@ impl Content {
             })
             .collect()
     }
+}
+
+fn is_mailbox(path: &str) -> bool {
+    matches!(ext_of(path).as_str(), "pst" | "ost")
 }
 
 fn is_raw(path: &str) -> bool {
@@ -1328,6 +1341,29 @@ fn files_in(idx: &NameIndex, folders: &[String], pictures: &[String]) -> HashMap
             });
         }
     }
+    // Outlook mailboxes anywhere, AppData included (classic Outlook keeps its
+    // .ost there); never cloud-only ones
+    {
+        let mailboxes = Query {
+            clauses: vec![file(), Clause { negated: false, any_of: vec![Term::Ext(vec!["pst".into(), "ost".into()])] }],
+        };
+        let entries: Vec<u32> = idx.matching(&mailboxes).into_iter().filter(|&e| idx.flags(e) & FLAG_CLOUD == 0).collect();
+        let records = idx.records_of(&entries);
+        for (e, r) in entries.into_iter().zip(records) {
+            let Some(record) = r else { continue };
+            let k = key(idx.volume_of(e).letter(), record);
+            out.entry(k).or_insert_with(|| Candidate {
+                key: k,
+                path: idx.full_path(e),
+                size: idx.size(e),
+                modified: idx.modified(e),
+                photo_only: false,
+                media_only: false,
+                props_only: false,
+                meaning_only: false,
+            });
+        }
+    }
     // music and videos anywhere on the disks (not in programs, caches,
     // hidden or system folders): their properties. Outside the user's own
     // folders only from 1 MB up (games keep thousands of small sounds).
@@ -1479,6 +1515,10 @@ fn extract(c: &Candidate, sandbox: Option<&Sandbox>, tagger: Option<&mut TagWork
     let result = if kind == Kind::Text {
         // Plain text needs no parser: read the head in-process.
         read_head(path, TEXT_HEAD).and_then(|b| whereti_extract::extract(&ext, &b, MAX_CHARS).map_err(SandboxError::Extract))
+    } else if kind == Kind::Mailbox {
+        // Outlook's mailbox, however large: the worker reads it from the open
+        // file, newest messages first, up to a larger budget
+        sandbox?.extract_file(path, MAILBOX_CHARS)
     } else if c.size > MAX_DOCUMENT && ext == "zip" {
         // a large ZIP: its names, from the directory at its end
         let sandbox = sandbox?;

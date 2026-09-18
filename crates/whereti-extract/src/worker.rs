@@ -32,6 +32,10 @@ pub fn serve_stdio() -> i32 {
     if let (Some(model), Some(tokenizer)) = (arg("--embed"), arg("--tokenizer")) {
         return serve_embed(Path::new(&model), Path::new(&tokenizer));
     }
+    if let Some(handle) = arg("--mailbox").and_then(|h| h.parse::<usize>().ok()) {
+        let max = arg("--max").and_then(|m| m.parse().ok()).unwrap_or(1_000_000);
+        return serve_mailbox(handle, max);
+    }
     let ext = arg("--ext").unwrap_or_default();
     let max = arg("--max").and_then(|m| m.parse().ok()).unwrap_or(1_000_000);
 
@@ -92,6 +96,34 @@ fn serve_tags(model: &Path) -> i32 {
         };
         if out.write_all(line.as_bytes()).and_then(|_| out.flush()).is_err() {
             return 0;
+        }
+    }
+}
+
+/// Worker side of `Sandbox::extract_file` for a mailbox: the file comes
+/// as a handle the service opened read-only and let this process inherit.
+fn serve_mailbox(handle: usize, max: usize) -> i32 {
+    use std::os::windows::io::FromRawHandle;
+    // SAFETY: the service passed a valid, inheritable file handle opened for reading
+    let file = unsafe { std::fs::File::from_raw_handle(handle as std::os::windows::io::RawHandle) };
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut out = crate::Out::new(max);
+        crate::mailbox::mailbox(|| file.try_clone(), &mut out).map(|_| out.finish())
+    }))
+    .unwrap_or_else(|_| Err(ExtractError::Damaged("the mailbox reader failed".into())));
+    match result {
+        Ok(e) => {
+            let mut out = std::io::stdout().lock();
+            let _ = out.write_all(if e.truncated { b"T" } else { b"F" });
+            let _ = out.write_all(e.text.as_bytes());
+            let _ = out.flush();
+            0
+        }
+        Err(ExtractError::Unsupported) => EXIT_UNSUPPORTED,
+        Err(ExtractError::Protected) => EXIT_PROTECTED,
+        Err(ExtractError::Damaged(msg)) => {
+            eprint!("{msg}");
+            EXIT_DAMAGED
         }
     }
 }
@@ -190,14 +222,42 @@ impl Sandbox {
     /// extracts its text in the worker.
     pub fn extract_file(&self, path: &Path, max_chars: usize) -> Result<Extracted, SandboxError> {
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_string();
-        if crate::kind_of(&ext).is_none() {
-            return Err(SandboxError::Extract(ExtractError::Unsupported));
+        match crate::kind_of(&ext) {
+            None => return Err(SandboxError::Extract(ExtractError::Unsupported)),
+            // a mailbox can be gigabytes: the worker reads the open file itself
+            Some(crate::Kind::Mailbox) => return self.extract_mailbox(path, max_chars),
+            _ => {}
         }
         let bytes = read_shared(path, self.max_file)?;
         self.extract_bytes(&ext, bytes, max_chars)
     }
 
+    /// A mailbox: opened here read-only (never blocking Outlook), and only
+    /// that handle is inherited by the worker. Up to 5 minutes, whatever
+    /// the usual timeout.
+    fn extract_mailbox(&self, path: &Path, max_chars: usize) -> Result<Extracted, SandboxError> {
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::{SetHandleInformation, HANDLE_FLAG_INHERIT};
+        let file = std::fs::OpenOptions::new().read(true).share_mode(0x1 | 0x2 | 0x4).open(path).map_err(SandboxError::Io)?;
+        let handle = file.as_raw_handle();
+        // SAFETY: a handle we own; only its inherit flag changes
+        if unsafe { SetHandleInformation(handle as _, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) } == 0 {
+            return Err(SandboxError::Failed(format!("cannot share the mailbox: {}", std::io::Error::last_os_error())));
+        }
+        let worker = Sandbox { exe: self.exe.clone(), timeout: self.timeout.max(Duration::from_secs(300)), memory_limit: self.memory_limit, max_file: self.max_file };
+        // the handle goes as an argument; the worker gets no bytes on stdin
+        let result = worker.run(&["--mailbox".to_string(), (handle as usize).to_string(), "--max".to_string(), max_chars.to_string()], Vec::new());
+        drop(file);
+        result
+    }
+
     pub fn extract_bytes(&self, ext: &str, bytes: Vec<u8>, max_chars: usize) -> Result<Extracted, SandboxError> {
+        self.run(&["--ext".to_string(), ext.to_string(), "--max".to_string(), max_chars.to_string()], bytes)
+    }
+
+    /// Runs the worker with `args`, `bytes` on its stdin, inside the job.
+    fn run(&self, args: &[String], bytes: Vec<u8>) -> Result<Extracted, SandboxError> {
         use std::os::windows::io::AsRawHandle;
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -205,7 +265,7 @@ impl Sandbox {
 
         let job = Job::new(self.memory_limit).map_err(|e| SandboxError::Failed(format!("job object: {e}")))?;
         let mut child = Command::new(&self.exe)
-            .args(["--ext", ext, "--max", &max_chars.to_string()])
+            .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

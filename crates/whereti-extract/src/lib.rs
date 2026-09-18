@@ -9,6 +9,7 @@
 
 mod archive;
 mod email;
+mod mailbox;
 pub mod meaning;
 mod ocr;
 pub mod tags;
@@ -84,6 +85,9 @@ pub enum Kind {
     FictionBook,
     /// XPS / OpenXPS: the text of its fixed pages.
     Xps,
+    /// Outlook data file (.pst/.ost): read from an open file, not bytes
+    /// (see worker::Sandbox::extract_file).
+    Mailbox,
 }
 
 pub fn kind_of(ext: &str) -> Option<Kind> {
@@ -96,6 +100,7 @@ pub fn kind_of(ext: &str) -> Option<Kind> {
         "epub" => Kind::Epub,
         "fb2" => Kind::FictionBook,
         "xps" | "oxps" => Kind::Xps,
+        e if mailbox::is_mailbox(e) => Kind::Mailbox,
         "pdf" => Kind::Pdf,
         "rtf" => Kind::Rtf,
         "html" | "htm" | "xhtml" => Kind::Html,
@@ -114,7 +119,7 @@ pub fn kind_of(ext: &str) -> Option<Kind> {
 const DOC_EXTS: &[&str] = &[
     "docx", "docm", "dotx", "dotm", "pptx", "pptm", "ppsx", "ppsm", "potx", "potm", "xlsx", "xlsm", "xlsb", "xls", "xltx",
     "xltm", "ods", "ots", "odt", "ott", "odp", "otp", "pdf", "rtf", "html", "htm", "xhtml", "eml", "msg", "doc", "dot", "ppt",
-    "pps", "pot", "epub", "fb2", "xps", "oxps", "zip", "7z", "rar",
+    "pps", "pot", "epub", "fb2", "xps", "oxps", "zip", "7z", "rar", "pst", "ost",
 ];
 
 /// The end of a ZIP too large to send whole: `extract(ZIP_END, ...)` lists
@@ -190,6 +195,11 @@ pub fn extract(ext: &str, bytes: &[u8], max_chars: usize) -> Result<Extracted, E
         Kind::Epub => epub(bytes, &mut out)?,
         Kind::FictionBook => out.push(&html_to_text(&decode_text(bytes)?)),
         Kind::Xps => xps(bytes, &mut out)?,
+        // a mailbox in memory (tests, small files)
+        Kind::Mailbox => {
+            let bytes = bytes.to_vec();
+            mailbox::mailbox(move || Ok(Cursor::new(bytes.clone())), &mut out)?
+        }
         Kind::Archive => match ext.to_ascii_lowercase().as_str() {
             "zip" => archive::zip(bytes, &mut out)?,
             "7z" => archive::sevenz(bytes, &mut out)?,
