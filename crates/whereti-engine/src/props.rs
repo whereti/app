@@ -45,6 +45,8 @@ const ODF_EXTS: &[&str] = &["odt", "ott", "ods", "ots", "odp", "otp"];
 pub fn has_props(ext: &str) -> bool {
     AUDIO_EXTS.contains(&ext)
         || VIDEO_EXTS.contains(&ext)
+        || OTHER_VIDEO_EXTS.contains(&ext)
+        || ext == "pdf"
         || PHOTO_EXTS.contains(&ext)
         || RAW.contains(&ext)
         || OFFICE_EXTS.contains(&ext)
@@ -79,10 +81,16 @@ fn read_inner(path: &Path, ext: &str, tz_offset: i32) -> Props {
                     (p.width, p.height) = (size.width as u32, size.height as u32);
                 }
             }
-            photo_exif(&bytes, tz_offset, &mut p);
+            photo_exif(&bytes, ext, tz_offset, &mut p);
+        }
+    } else if OTHER_VIDEO_EXTS.contains(&ext) {
+        if let Ok(head) = read_head(path, 2 << 20) {
+            p.duration = video_length(&head, ext).unwrap_or(0);
         }
     } else if AUDIO_EXTS.contains(&ext) || VIDEO_EXTS.contains(&ext) {
         media(path, &mut p);
+    } else if ext == "pdf" {
+        p.author = pdf_author(path).unwrap_or_default();
     } else if OFFICE_EXTS.contains(&ext) {
         p.author = zip_xml_tag(path, "docProps/core.xml", "dc:creator").unwrap_or_default();
     } else if ODF_EXTS.contains(&ext) {
@@ -99,15 +107,61 @@ fn read_head(path: &Path, max: u64) -> std::io::Result<Vec<u8>> {
     Ok(buf)
 }
 
-fn photo_exif(bytes: &[u8], tz_offset: i32, p: &mut Props) {
-    use exif::{In, Tag, Value};
-    let Ok(exif) = exif::Reader::new().continue_on_error(true).read_from_container(&mut std::io::Cursor::new(bytes)).or_else(|e| {
-        e.distill_partial_result(|_| {})
-    }) else {
-        return;
+/// The EXIF blocks of a photo. The usual containers (JPEG, TIFF, HEIF,
+/// PNG, WebP) are read whole; camera files that bend TIFF get help:
+/// Olympus and Panasonic RAW (another magic number), Fujifilm RAF (EXIF in
+/// its embedded JPEG), Canon CR3 (TIFF blocks in its CMT1/CMT2 boxes).
+fn exif_blocks(bytes: &[u8], ext: &str) -> Vec<exif::Exif> {
+    let reader = || {
+        let mut r = exif::Reader::new();
+        r.continue_on_error(true);
+        r
     };
+    let tiff = |data: Vec<u8>| reader().read_raw(data).or_else(|e| e.distill_partial_result(|_| {})).ok();
+    if let Ok(e) = reader().read_from_container(&mut std::io::Cursor::new(bytes)).or_else(|e| e.distill_partial_result(|_| {})) {
+        return vec![e];
+    }
+    match ext {
+        // "IIRO"/"IIRS" (Olympus ORF), "IIU\0" (Panasonic RW2): TIFF with another magic
+        "orf" | "rw2" if bytes.len() > 8 && bytes.starts_with(b"II") => {
+            let mut data = bytes.to_vec();
+            data[2] = 0x2A;
+            data[3] = 0;
+            tiff(data).into_iter().collect()
+        }
+        // RAF: a big-endian offset and length of the embedded JPEG at 84
+        "raf" if bytes.starts_with(b"FUJIFILMCCD-RAW") && bytes.len() > 92 => {
+            let at = u32::from_be_bytes(bytes[84..88].try_into().expect("4 bytes")) as usize;
+            let len = u32::from_be_bytes(bytes[88..92].try_into().expect("4 bytes")) as usize;
+            bytes
+                .get(at..at.saturating_add(len).min(bytes.len()))
+                .and_then(|jpeg| reader().read_from_container(&mut std::io::Cursor::new(jpeg)).ok())
+                .into_iter()
+                .collect()
+        }
+        // CR3: ISO boxes; CMT1 holds IFD0 (camera), CMT2 the EXIF IFD (date)
+        "cr3" => [b"CMT1", b"CMT2"]
+            .iter()
+            .filter_map(|name| {
+                let at = bytes.windows(4).position(|w| w == *name)?;
+                let box_start = at.checked_sub(4)?;
+                let size = u32::from_be_bytes(bytes.get(box_start..at)?.try_into().ok()?) as usize;
+                tiff(bytes.get(at + 4..box_start.saturating_add(size))?.to_vec())
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn photo_exif(bytes: &[u8], ext: &str, tz_offset: i32, p: &mut Props) {
+    use exif::{In, Tag, Value};
+    let blocks = exif_blocks(bytes, ext);
+    if blocks.is_empty() {
+        return;
+    }
+    let field = |tag: Tag| blocks.iter().find_map(|e| e.get_field(tag, In::PRIMARY));
     let text = |tag: Tag| -> Option<String> {
-        let f = exif.get_field(tag, In::PRIMARY)?;
+        let f = field(tag)?;
         match &f.value {
             Value::Ascii(v) => v.first().map(|s| String::from_utf8_lossy(s).trim().trim_end_matches('\0').to_string()),
             _ => None,
@@ -128,10 +182,151 @@ fn photo_exif(bytes: &[u8], tz_offset: i32, p: &mut Props) {
         format!("{make} {model}")
     };
     if p.width == 0 {
-        let num = |tag: Tag| exif.get_field(tag, In::PRIMARY).and_then(|f| f.value.get_uint(0));
+        let num = |tag: Tag| field(tag).and_then(|f| f.value.get_uint(0));
         p.width = num(Tag::PixelXDimension).unwrap_or(0);
         p.height = num(Tag::PixelYDimension).unwrap_or(0);
     }
+}
+
+/// Videos outside the MP4 family whose length whereti reads itself.
+const OTHER_VIDEO_EXTS: &[&str] = &["mkv", "webm", "avi", "wmv", "asf"];
+
+/// A video's length in seconds from its header (first MBs): Matroska /
+/// WebM (Segment Info: Duration x TimecodeScale), AVI (avih: frames x
+/// microseconds per frame), ASF / WMV (File Properties: play duration).
+fn video_length(b: &[u8], ext: &str) -> Option<u32> {
+    let secs = match ext {
+        "mkv" | "webm" => {
+            // TimecodeScale (2A D7 B1), default 1 ms; Duration (44 89) a float
+            let scale = find(b, &[0x2A, 0xD7, 0xB1])
+                .and_then(|at| {
+                    let len = (b.get(at + 3)? & 0x7F) as usize;
+                    let v = b.get(at + 4..at + 4 + len)?;
+                    Some(v.iter().fold(0u64, |acc, &x| acc << 8 | x as u64))
+                })
+                .unwrap_or(1_000_000) as f64;
+            let at = find(b, &[0x44, 0x89])?;
+            let duration = match b.get(at + 2)? {
+                0x84 => f32::from_be_bytes(b.get(at + 3..at + 7)?.try_into().ok()?) as f64,
+                0x88 => f64::from_be_bytes(b.get(at + 3..at + 11)?.try_into().ok()?),
+                _ => return None,
+            };
+            duration * scale / 1e9
+        }
+        "avi" => {
+            let at = find(b, b"avih")?;
+            let us_per_frame = u32::from_le_bytes(b.get(at + 8..at + 12)?.try_into().ok()?) as f64;
+            let frames = u32::from_le_bytes(b.get(at + 24..at + 28)?.try_into().ok()?) as f64;
+            frames * us_per_frame / 1e6
+        }
+        "wmv" | "asf" => {
+            // File Properties Object: GUID 8CABDCA1-A947-11CF-8EE4-00C00C205365
+            const GUID: [u8; 16] = [0xA1, 0xDC, 0xAB, 0x8C, 0x47, 0xA9, 0xCF, 0x11, 0x8E, 0xE4, 0x00, 0xC0, 0x0C, 0x20, 0x53, 0x65];
+            let at = find(b, &GUID)?;
+            let play = u64::from_le_bytes(b.get(at + 64..at + 72)?.try_into().ok()?) as f64; // 100 ns
+            let preroll = u64::from_le_bytes(b.get(at + 80..at + 88)?.try_into().ok()?) as f64; // ms
+            play / 1e7 - preroll / 1e3
+        }
+        _ => return None,
+    };
+    (secs.is_finite() && (1.0..1e7).contains(&secs)).then(|| secs.round() as u32)
+}
+
+fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
+/// A PDF's author from its Info dictionary (`/Author (…)` or `<hex>`) or,
+/// failing that, its XMP (`<dc:creator>…<rdf:li>…`). A byte search in the
+/// first and last MB, no PDF parser (this runs in the service). Encrypted
+/// PDFs keep their strings encrypted: none.
+fn pdf_author(path: &Path) -> Option<String> {
+    use std::io::{Seek, SeekFrom};
+    let mut f = std::fs::File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    let mut head = Vec::new();
+    (&mut f).take(1 << 20).read_to_end(&mut head).ok()?;
+    let mut tail = Vec::new();
+    if len > 1 << 20 {
+        f.seek(SeekFrom::Start(len.saturating_sub(1 << 20).max(1 << 20))).ok()?;
+        f.take(1 << 20).read_to_end(&mut tail).ok()?;
+    }
+    if find(&head, b"/Encrypt").is_some() || find(&tail, b"/Encrypt").is_some() {
+        return None;
+    }
+    for b in [&tail, &head] {
+        if let Some(a) = info_author(b) {
+            return Some(a);
+        }
+    }
+    for b in [&head, &tail] {
+        let at = find(b, b"<dc:creator")?;
+        let li = find(&b[at..], b"<rdf:li")? + at;
+        let start = li + b[li..].iter().position(|&c| c == b'>')? + 1;
+        let end = start + find(&b[start..], b"</rdf:li>")?;
+        let s = String::from_utf8_lossy(&b[start..end]).trim().to_string();
+        if !s.is_empty() && s.len() < 200 {
+            return Some(s);
+        }
+    }
+    None
+}
+
+fn info_author(b: &[u8]) -> Option<String> {
+    let mut at = find(b, b"/Author")? + 7;
+    while b.get(at).is_some_and(|c| c.is_ascii_whitespace()) {
+        at += 1;
+    }
+    let raw: Vec<u8> = match b.get(at)? {
+        b'(' => {
+            // a literal string, with \ escapes and nested parentheses
+            let (mut out, mut depth, mut i) = (Vec::new(), 0, at + 1);
+            while let Some(&c) = b.get(i) {
+                match c {
+                    b'\\' => {
+                        let n = *b.get(i + 1)?;
+                        match n {
+                            b'n' => out.push(b'\n'),
+                            b'r' | b't' | b'b' | b'f' => out.push(b' '),
+                            b'0'..=b'7' => {
+                                let digits: Vec<u8> = b[i + 1..].iter().take(3).take_while(|d| (b'0'..=b'7').contains(d)).copied().collect();
+                                out.push(digits.iter().fold(0u8, |acc, d| acc.wrapping_mul(8).wrapping_add(d - b'0')));
+                                i += digits.len() - 1;
+                            }
+                            other => out.push(other),
+                        }
+                        i += 2;
+                        continue;
+                    }
+                    b'(' => depth += 1,
+                    b')' if depth == 0 => break,
+                    b')' => depth -= 1,
+                    _ => {}
+                }
+                out.push(c);
+                i += 1;
+                if out.len() > 1000 {
+                    return None;
+                }
+            }
+            out
+        }
+        b'<' => {
+            let end = at + find(&b[at..], b">")?;
+            let hex: Vec<u8> = b[at + 1..end].iter().copied().filter(|c| c.is_ascii_hexdigit()).collect();
+            hex.chunks(2).filter_map(|p| u8::from_str_radix(std::str::from_utf8(p).ok()?, 16).ok()).collect()
+        }
+        _ => return None,
+    };
+    // UTF-16BE with a byte-order mark, else PDFDocEncoding (about Latin-1)
+    let s = if raw.starts_with(&[0xFE, 0xFF]) {
+        let units: Vec<u16> = raw[2..].chunks_exact(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect();
+        String::from_utf16_lossy(&units)
+    } else {
+        raw.iter().map(|&c| c as char).collect()
+    };
+    let s = s.trim().to_string();
+    (!s.is_empty()).then_some(s)
 }
 
 /// "2025:08:14 18:30:05" (local time) -> minutes since 1601, local.
@@ -379,5 +574,26 @@ mod tests {
     fn exif_dates() {
         assert_eq!(exif_minutes("0000:00:00 00:00:00"), None);
         assert!(exif_minutes("2025:08:14 18:30:05").is_some());
+    }
+
+    #[test]
+    fn video_lengths_and_pdf_authors() {
+        // Matroska: TimecodeScale 1 ms, Duration 90 500.0 (8-byte float)
+        let mut mkv = vec![0x1A, 0x45, 0xDF, 0xA3, 0x2A, 0xD7, 0xB1, 0x83, 0x0F, 0x42, 0x40, 0x44, 0x89, 0x88];
+        mkv.extend(90_500.0f64.to_be_bytes());
+        assert_eq!(video_length(&mkv, "mkv"), Some(91));
+        // AVI: 40 000 us per frame, 750 frames = 30 s
+        let mut avi = b"RIFF\0\0\0\0AVI LIST\0\0\0\0hdrlavih\x38\0\0\0".to_vec();
+        avi.extend(40_000u32.to_le_bytes());
+        avi.extend([0u8; 12]);
+        avi.extend(750u32.to_le_bytes());
+        avi.extend([0u8; 40]);
+        assert_eq!(video_length(&avi, "avi"), Some(30));
+        assert_eq!(video_length(b"nothing here", "mkv"), None);
+
+        assert_eq!(info_author(br"<< /Author (Ion Popescu) /Title (x) >>").as_deref(), Some("Ion Popescu"));
+        assert_eq!(info_author(br"/Author (A \(B\) C)").as_deref(), Some("A (B) C"));
+        assert_eq!(info_author(b"/Author <FEFF0218007400650066>").as_deref(), Some("\u{0218}tef"));
+        assert_eq!(info_author(b"/Title (x)"), None);
     }
 }

@@ -67,8 +67,9 @@ pub const VIDEO: &[&str] = &[
 
 /// Music whose tags and length whereti reads.
 pub const AUDIO_TAGGED: &[&str] = &["mp3", "flac", "m4a", "m4b", "aac", "ogg", "oga", "opus", "wav", "wma", "aiff", "aif", "ape", "wv", "mpc", "spx"];
-/// Videos whose length whereti reads (the MP4 family).
-pub const VIDEO_TAGGED: &[&str] = &["mp4", "m4v", "mov", "3gp", "3g2"];
+/// Videos whose length whereti reads (the MP4 family by lofty, the others by
+/// their headers).
+pub const VIDEO_TAGGED: &[&str] = &["mp4", "m4v", "mov", "3gp", "3g2", "mkv", "webm", "avi", "wmv", "asf"];
 
 pub const ARCHIVES: &[&str] = &["zip", "7z", "rar", "tar", "gz", "tgz", "bz2", "xz", "zst", "cab", "iso"];
 
