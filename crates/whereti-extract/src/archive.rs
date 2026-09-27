@@ -104,6 +104,82 @@ pub(crate) fn sevenz(bytes: &[u8], out: &mut Out) -> Result<(), ExtractError> {
     Ok(())
 }
 
+/// A 7z seen through its two ends (see `crate::sevenz_ends`): reads as a
+/// file of its real length whose middle is zeros. 7z keeps its list of
+/// names at the end, so it can be read; the files themselves are not.
+struct Ends {
+    len: u64,
+    head: Vec<u8>,
+    tail_start: u64,
+    tail: Vec<u8>,
+    pos: u64,
+}
+
+impl Read for Ends {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.pos >= self.len || buf.is_empty() {
+            return Ok(0);
+        }
+        let n = if self.pos < self.head.len() as u64 {
+            let from = &self.head[self.pos as usize..];
+            let n = from.len().min(buf.len());
+            buf[..n].copy_from_slice(&from[..n]);
+            n
+        } else if self.pos >= self.tail_start {
+            let from = &self.tail[(self.pos - self.tail_start) as usize..];
+            let n = from.len().min(buf.len());
+            buf[..n].copy_from_slice(&from[..n]);
+            n
+        } else {
+            let n = ((self.tail_start - self.pos) as usize).min(buf.len());
+            buf[..n].fill(0);
+            n
+        };
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl std::io::Seek for Ends {
+    fn seek(&mut self, to: std::io::SeekFrom) -> std::io::Result<u64> {
+        let target = match to {
+            std::io::SeekFrom::Start(p) => p as i128,
+            std::io::SeekFrom::End(d) => self.len as i128 + d as i128,
+            std::io::SeekFrom::Current(d) => self.pos as i128 + d as i128,
+        };
+        if target < 0 {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "before the start"));
+        }
+        self.pos = target as u64;
+        Ok(self.pos)
+    }
+}
+
+pub(crate) fn sevenz_end_names(bytes: &[u8], out: &mut Out) -> Result<(), ExtractError> {
+    let bad = || ExtractError::Damaged("not the ends of a 7z".into());
+    let len = u64::from_le_bytes(bytes.get(..8).ok_or_else(bad)?.try_into().map_err(|_| bad())?);
+    let head = bytes.get(8..40).ok_or_else(bad)?.to_vec();
+    let tail = bytes.get(40..).ok_or_else(bad)?.to_vec();
+    let tail_start = len.checked_sub(tail.len() as u64).ok_or_else(bad)?;
+    let ends = Ends { len, head, tail_start, tail, pos: 0 };
+    let reader = sevenz_rust2::ArchiveReader::new(ends, sevenz_rust2::Password::empty()).map_err(|e| {
+        let text = e.to_string();
+        if text.to_lowercase().contains("password") {
+            ExtractError::Protected
+        } else {
+            ExtractError::Damaged(text)
+        }
+    })?;
+    let mut read = 0;
+    for f in reader.archive().files.iter().filter(|f| !f.is_directory()).take(MAX_NAMES) {
+        if out.full() {
+            break;
+        }
+        member(out, f.name(), None, &mut read);
+    }
+    Ok(())
+}
+
 /// RAR (4 and 5): the names only, from the file headers.
 pub(crate) fn rar(bytes: &[u8], out: &mut Out) -> Result<(), ExtractError> {
     let names = if bytes.starts_with(b"Rar!\x1a\x07\x01\x00") {
@@ -360,5 +436,23 @@ mod tests {
         }
         let mut out = Out::new(100);
         let _ = zip_tail_names(b"PK\x05\x06\0\0\0\0\0\0\0\0\xff\xff\xff\xff\0\0\0\0\0\0", &mut out);
+    }
+
+    /// A real large 7z (set WHERETI_BIG7Z): its names from its two ends.
+    #[test]
+    fn the_ends_of_a_large_7z_give_its_names() {
+        use std::io::{Seek, SeekFrom};
+        let Some(path) = std::env::var_os("WHERETI_BIG7Z") else { return };
+        let mut f = std::fs::File::open(&path).unwrap();
+        let len = f.metadata().unwrap().len();
+        let mut head = vec![0u8; 32];
+        f.read_exact(&mut head).unwrap();
+        let tail_len = (16u64 << 20).min(len);
+        f.seek(SeekFrom::Start(len - tail_len)).unwrap();
+        let mut tail = vec![0u8; tail_len as usize];
+        f.read_exact(&mut tail).unwrap();
+        let e = extract(crate::SEVENZ_ENDS, &crate::sevenz_ends(len, &head, &tail), 100_000).unwrap();
+        eprintln!("{} names, first: {:?}", e.text.lines().count(), e.text.lines().next());
+        assert!(e.text.lines().count() > 0);
     }
 }

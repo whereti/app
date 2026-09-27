@@ -1519,6 +1519,14 @@ fn extract(c: &Candidate, sandbox: Option<&Sandbox>, tagger: Option<&mut TagWork
         // Outlook's mailbox, however large: the worker reads it from the open
         // file, newest messages first, up to a larger budget
         sandbox?.extract_file(path, MAILBOX_CHARS)
+    } else if c.size > MAX_DOCUMENT && ext == "7z" {
+        // a large 7z: its names, from its list at the end (and its start header)
+        let sandbox = sandbox?;
+        read_head(path, 32)
+            .and_then(|head| read_tail(path, ZIP_TAIL).map(|tail| (head, tail)))
+            .and_then(|(head, tail)| {
+                sandbox.extract_bytes(whereti_extract::SEVENZ_ENDS, whereti_extract::sevenz_ends(c.size, &head, &tail), MAX_CHARS)
+            })
     } else if c.size > MAX_DOCUMENT && ext == "zip" {
         // a large ZIP: its names, from the directory at its end
         let sandbox = sandbox?;

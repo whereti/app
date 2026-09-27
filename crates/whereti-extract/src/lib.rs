@@ -125,6 +125,21 @@ const DOC_EXTS: &[&str] = &[
 /// The end of a ZIP too large to send whole: `extract(ZIP_END, ...)` lists
 /// its names from there (see archive::zip_tail_names).
 pub const ZIP_END: &str = "zip-end";
+/// The ends of a 7z too large to send whole: `extract(SEVENZ_ENDS, …)` with
+/// `sevenz_ends(len, head, tail)` lists its names.
+pub const SEVENZ_ENDS: &str = "7z-ends";
+
+/// Packs a 7z's start (its 32-byte signature header), its end, and its
+/// length, for `extract(SEVENZ_ENDS, …)`.
+pub fn sevenz_ends(len: u64, head: &[u8], tail: &[u8]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(8 + 32 + tail.len());
+    v.extend_from_slice(&len.to_le_bytes());
+    let mut h = head[..head.len().min(32)].to_vec();
+    h.resize(32, 0);
+    v.extend_from_slice(&h);
+    v.extend_from_slice(tail);
+    v
+}
 
 /// Pictures whose text is read by OCR (HEIC only where its codec is installed).
 /// (Windows decodes them: see whereti_query::kinds; icons are not read.)
@@ -154,6 +169,10 @@ pub fn extract(ext: &str, bytes: &[u8], max_chars: usize) -> Result<Extracted, E
     let mut out = Out::new(max_chars);
     if ext == ZIP_END {
         archive::zip_tail_names(bytes, &mut out)?;
+        return Ok(out.finish());
+    }
+    if ext == SEVENZ_ENDS {
+        archive::sevenz_end_names(bytes, &mut out)?;
         return Ok(out.finish());
     }
     let kind = kind_of(ext).ok_or(ExtractError::Unsupported)?;
