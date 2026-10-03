@@ -1537,12 +1537,51 @@ impl WheretiApp {
         let line_h = image_h + NAME_H + GAP;
         self.grid_cols = cols;
         self.grid_page = ((self.view_height / line_h).floor().max(1.0) as usize) * cols;
-        let lines = self.rows.len().div_ceil(cols);
-        let total = lines as f32 * line_h;
+        // the sections, as in the list: each starts a new line under its header
+        const HEADER_H: f32 = 34.0;
+        let n = self.rows.len();
+        let mut starts: Vec<(usize, Option<String>)> = vec![(0, None)];
+        let mut add = |at: Option<usize>, label: String| {
+            if let Some(at) = at.filter(|&a| a < n) {
+                starts.retain(|(s, _)| *s != at || at == 0);
+                if at == 0 {
+                    starts[0].1 = None; // the list's own header says it
+                } else {
+                    starts.push((at, Some(label)));
+                }
+            }
+        };
+        add(self.close_start, tr("CLOSE MATCHES").to_string());
+        if let Some(s) = self.network_start {
+            let end = self.content_start.unwrap_or(n);
+            add(Some(s), trn!("ON THE NETWORK · {n}|ON THE NETWORK · {n}", end.saturating_sub(s) as u64));
+        }
+        if self.content_start != self.meaning_start {
+            add(self.content_start, self.content_section_label());
+        }
+        add(self.meaning_start, tr("CLOSE IN MEANING").to_string());
+        starts.sort_by_key(|(s, _)| *s);
+        // (top, first row, end row, header)
+        let mut segs: Vec<(f32, usize, usize, Option<String>)> = Vec::new();
+        let mut y = 0.0;
+        for (k, (start, label)) in starts.iter().enumerate() {
+            let end = starts.get(k + 1).map_or(n, |s| s.0);
+            if end <= *start {
+                continue;
+            }
+            segs.push((y, *start, end, label.clone()));
+            y += if label.is_some() { HEADER_H } else { 0.0 } + (end - start).div_ceil(cols) as f32 * line_h;
+        }
+        let total = y;
+        let top_of = |i: usize| -> f32 {
+            segs.iter()
+                .find(|(_, s, e, _)| (*s..*e).contains(&i))
+                .map_or(0.0, |(top, s, _, l)| top + if l.is_some() { HEADER_H } else { 0.0 } + ((i - s) / cols) as f32 * line_h)
+        };
 
         let mut area = egui::ScrollArea::vertical().auto_shrink([false, false]);
         if self.scroll_to_selected && self.view_height > 0.0 && !self.rows.is_empty() {
-            let top = (self.selected.min(self.rows.len() - 1) / cols) as f32 * line_h;
+            let top = top_of(self.selected.min(self.rows.len() - 1));
             let mut off = self.scroll_offset;
             if top < off {
                 off = top;
@@ -1560,14 +1599,27 @@ impl WheretiApp {
         let grid_id = ui.scope_id().with("grid");
         let out = area.show_viewport(ui, |ui, viewport| {
             let (whole, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), total), Sense::hover());
-            let first = (viewport.min.y / line_h).floor().max(0.0) as usize;
-            let last = ((viewport.max.y / line_h).ceil() as usize).min(lines);
-            for line in first..last {
+            for (seg_top, start, end, label) in &segs {
+                let header = if label.is_some() { HEADER_H } else { 0.0 };
+                if let Some(label) = label {
+                    let r = Rect::from_min_size(Pos2::new(whole.left(), whole.top() + seg_top), Vec2::new(whole.width(), HEADER_H));
+                    if r.intersects(viewport.translate(whole.min.to_vec2())) {
+                        paint_section(ui, p, r, label);
+                    }
+                }
+                let body = seg_top + header;
+                let seg_lines = (end - start).div_ceil(cols);
+                let first = ((viewport.min.y - body) / line_h).floor().max(0.0) as usize;
+                let last = (((viewport.max.y - body) / line_h).ceil().max(0.0) as usize).min(seg_lines);
+                for line in first..last {
                 for col in 0..cols {
-                    let i = line * cols + col;
+                    let i = start + line * cols + col;
+                    if i >= *end {
+                        break;
+                    }
                     let Some(row) = rows.get(i) else { break };
                     let tile = Rect::from_min_size(
-                        Pos2::new(whole.left() + col as f32 * (tile_w + GAP), whole.top() + line as f32 * line_h),
+                        Pos2::new(whole.left() + col as f32 * (tile_w + GAP), whole.top() + body + line as f32 * line_h),
                         Vec2::new(tile_w, image_h + NAME_H),
                     );
                     let resp = ui.interact(tile, grid_id.with(i), Sense::click_and_drag());
@@ -1621,6 +1673,7 @@ impl WheretiApp {
                     } else if resp.clicked() {
                         clicked = Some((i, false));
                     }
+                }
                 }
             }
         });
