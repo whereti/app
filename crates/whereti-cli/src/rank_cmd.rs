@@ -150,6 +150,20 @@ pub fn run(args: RankArgs) -> Result<(), String> {
     }
     let mut client = Client::connect(Duration::from_secs(2)).map_err(|e| format!("cannot talk to the whereti service: {e}"))?;
     let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    // files that are gone, or in a folder the index now skips, cannot be
+    // found: counted apart, not as misses
+    let exclusions: Vec<String> = match client.call(&Request::GetConfig).map_err(|e| e.to_string())? {
+        Response::Config(c) => c.exclusions.iter().map(|x| x.trim_end_matches('\\').to_lowercase() + "\\").collect(),
+        _ => Vec::new(),
+    };
+    let findable = |c: &Case| {
+        let lower = c.expected.to_lowercase();
+        std::path::Path::new(&c.expected).exists()
+            && !exclusions.iter().any(|x| lower.starts_with(x.as_str()) || format!("{lower}\\") == *x)
+    };
+    let all = cases.len();
+    let cases: Vec<Case> = cases.into_iter().filter(|c| findable(c)).collect();
+    let skipped = all - cases.len();
     // [one word, two words] x [without use, as the app ranks]
     let mut scores: [[Score; 2]; 2] = Default::default();
     let mut misses: Vec<(usize, &Case, String)> = Vec::new();
@@ -165,7 +179,11 @@ pub fn run(args: RankArgs) -> Result<(), String> {
             misses.push((place - k + 1, c, first));
         }
     }
-    println!("{} searches from {}\n", cases.len(), path.display());
+    println!("{} searches from {}", cases.len(), path.display());
+    if skipped > 0 {
+        println!("({skipped} more not counted: their file is gone or in a skipped folder)");
+    }
+    println!();
     println!("{:<34}{:>6}  {:>6}  {:>6}  {:>6}   MRR", "", "1st", "top 3", "top 10", "missed");
     for (w, label) in [(0, "one word"), (1, "two words")] {
         println!("{}", scores[w][0].line(&format!("{label}, without what you open")));
