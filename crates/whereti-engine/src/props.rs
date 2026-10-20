@@ -197,7 +197,11 @@ const OTHER_VIDEO_EXTS: &[&str] = &["mkv", "webm", "avi", "wmv", "asf"];
 fn video_length(b: &[u8], ext: &str) -> Option<u32> {
     let secs = match ext {
         "mkv" | "webm" => {
+            // inside Segment Info (15 49 A9 66), before the first Cluster:
             // TimecodeScale (2A D7 B1), default 1 ms; Duration (44 89) a float
+            let info = find(b, &[0x15, 0x49, 0xA9, 0x66])?;
+            let end = find(&b[info..], &[0x1F, 0x43, 0xB6, 0x75]).map_or(b.len(), |c| info + c).min(info + 4096);
+            let b = &b[info..end];
             let scale = find(b, &[0x2A, 0xD7, 0xB1])
                 .and_then(|at| {
                     let len = (b.get(at + 3)? & 0x7F) as usize;
@@ -216,7 +220,13 @@ fn video_length(b: &[u8], ext: &str) -> Option<u32> {
         "avi" => {
             let at = find(b, b"avih")?;
             let us_per_frame = u32::from_le_bytes(b.get(at + 8..at + 12)?.try_into().ok()?) as f64;
-            let frames = u32::from_le_bytes(b.get(at + 24..at + 28)?.try_into().ok()?) as f64;
+            let mut frames = u32::from_le_bytes(b.get(at + 24..at + 28)?.try_into().ok()?) as f64;
+            // over 1 GB (OpenDML) avih counts the first part only; dmlh counts all
+            if let Some(d) = find(b, b"dmlh") {
+                if let Some(all) = b.get(d + 8..d + 12).and_then(|v| v.try_into().ok()).map(u32::from_le_bytes) {
+                    frames = frames.max(all as f64);
+                }
+            }
             frames * us_per_frame / 1e6
         }
         "wmv" | "asf" => {
@@ -260,10 +270,10 @@ fn pdf_author(path: &Path) -> Option<String> {
         }
     }
     for b in [&head, &tail] {
-        let at = find(b, b"<dc:creator")?;
-        let li = find(&b[at..], b"<rdf:li")? + at;
-        let start = li + b[li..].iter().position(|&c| c == b'>')? + 1;
-        let end = start + find(&b[start..], b"</rdf:li>")?;
+        let Some(at) = find(b, b"<dc:creator") else { continue };
+        let Some(li) = find(&b[at..], b"<rdf:li").map(|x| x + at) else { continue };
+        let Some(start) = b[li..].iter().position(|&c| c == b'>').map(|x| li + x + 1) else { continue };
+        let Some(end) = find(&b[start..], b"</rdf:li>").map(|x| start + x) else { continue };
         let s = String::from_utf8_lossy(&b[start..end]).trim().to_string();
         if !s.is_empty() && s.len() < 200 {
             return Some(s);
@@ -579,7 +589,7 @@ mod tests {
     #[test]
     fn video_lengths_and_pdf_authors() {
         // Matroska: TimecodeScale 1 ms, Duration 90 500.0 (8-byte float)
-        let mut mkv = vec![0x1A, 0x45, 0xDF, 0xA3, 0x2A, 0xD7, 0xB1, 0x83, 0x0F, 0x42, 0x40, 0x44, 0x89, 0x88];
+        let mut mkv = vec![0x1A, 0x45, 0xDF, 0xA3, 0x15, 0x49, 0xA9, 0x66, 0x2A, 0xD7, 0xB1, 0x83, 0x0F, 0x42, 0x40, 0x44, 0x89, 0x88];
         mkv.extend(90_500.0f64.to_be_bytes());
         assert_eq!(video_length(&mkv, "mkv"), Some(91));
         // AVI: 40 000 us per frame, 750 frames = 30 s

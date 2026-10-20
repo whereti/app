@@ -159,6 +159,8 @@ pub struct WheretiApp {
     thumbs: crate::thumbs::Thumbs,
     /// Tiles per line in the Images grid, as last drawn (for the arrow keys).
     grid_cols: usize,
+    /// The grid's sections as drawn: (first row, end row).
+    grid_segs: Vec<(usize, usize)>,
     /// Text excerpts under content results.
     snippets: crate::snippets::Snippets,
     /// The CJK fonts are loaded (see `setup_fonts`).
@@ -246,6 +248,7 @@ impl WheretiApp {
             file_icons: FileIcons::new(),
             thumbs: crate::thumbs::Thumbs::new(ctx.clone()),
             grid_cols: 1,
+            grid_segs: Vec::new(),
             cjk_fonts: false,
             updater: crate::update::Updater::new(),
             launch: crate::launch::Launch::new(ctx),
@@ -706,14 +709,42 @@ impl WheretiApp {
                 self.selected = self.selected.saturating_sub(1);
             }
         }
-        if down {
-            self.selected = (self.selected + step).min(last);
-        }
-        if up {
-            if self.selected < step && (self.query.trim().is_empty() || self.history_pos.is_some()) {
-                self.recall_older(ctx);
-            } else if self.selected >= step {
-                self.selected -= step;
+        if step > 1 && (down || up) && !self.grid_segs.is_empty() {
+            // the grid: each section starts its own line; keep the column
+            let segs = &self.grid_segs;
+            let k = segs.iter().position(|&(s, e)| (s..e).contains(&self.selected)).unwrap_or(0);
+            let (s, e) = segs[k];
+            let (line, col) = ((self.selected - s) / step, (self.selected - s) % step);
+            if down {
+                if s + (line + 1) * step + col < e {
+                    self.selected += step;
+                } else if s + (line + 1) * step < e {
+                    self.selected = e - 1; // the last line is shorter
+                } else if let Some(&(ns, ne)) = segs.get(k + 1) {
+                    self.selected = (ns + col).min(ne - 1);
+                }
+            }
+            if up {
+                if line > 0 {
+                    self.selected -= step;
+                } else if k > 0 {
+                    let (ps, pe) = segs[k - 1];
+                    let last_line = (pe - ps - 1) / step;
+                    self.selected = (ps + last_line * step + col).min(pe - 1);
+                } else if self.query.trim().is_empty() || self.history_pos.is_some() {
+                    self.recall_older(ctx);
+                }
+            }
+        } else {
+            if down {
+                self.selected = (self.selected + step).min(last);
+            }
+            if up {
+                if self.selected < step && (self.query.trim().is_empty() || self.history_pos.is_some()) {
+                    self.recall_older(ctx);
+                } else if self.selected >= step {
+                    self.selected -= step;
+                }
             }
         }
         if pg_down {
@@ -1573,10 +1604,17 @@ impl WheretiApp {
             y += if label.is_some() { HEADER_H } else { 0.0 } + (end - start).div_ceil(cols) as f32 * line_h;
         }
         let total = y;
+        self.grid_segs = segs.iter().map(|(_, s, e, _)| (*s, *e)).collect();
         let top_of = |i: usize| -> f32 {
-            segs.iter()
-                .find(|(_, s, e, _)| (*s..*e).contains(&i))
-                .map_or(0.0, |(top, s, _, l)| top + if l.is_some() { HEADER_H } else { 0.0 } + ((i - s) / cols) as f32 * line_h)
+            segs.iter().find(|(_, s, e, _)| (*s..*e).contains(&i)).map_or(0.0, |(top, s, _, l)| {
+                let line = (i - s) / cols;
+                // the first line shows its section's header too
+                if line == 0 {
+                    *top
+                } else {
+                    top + if l.is_some() { HEADER_H } else { 0.0 } + line as f32 * line_h
+                }
+            })
         };
 
         let mut area = egui::ScrollArea::vertical().auto_shrink([false, false]);

@@ -100,7 +100,7 @@ pub fn kind_of(ext: &str) -> Option<Kind> {
         "epub" => Kind::Epub,
         "fb2" => Kind::FictionBook,
         "xps" | "oxps" => Kind::Xps,
-        e if mailbox::is_mailbox(e) => Kind::Mailbox,
+        "pst" => Kind::Mailbox,
         "pdf" => Kind::Pdf,
         "rtf" => Kind::Rtf,
         "html" | "htm" | "xhtml" => Kind::Html,
@@ -119,7 +119,7 @@ pub fn kind_of(ext: &str) -> Option<Kind> {
 const DOC_EXTS: &[&str] = &[
     "docx", "docm", "dotx", "dotm", "pptx", "pptm", "ppsx", "ppsm", "potx", "potm", "xlsx", "xlsm", "xlsb", "xls", "xltx",
     "xltm", "ods", "ots", "odt", "ott", "odp", "otp", "pdf", "rtf", "html", "htm", "xhtml", "eml", "msg", "doc", "dot", "ppt",
-    "pps", "pot", "epub", "fb2", "xps", "oxps", "zip", "7z", "rar", "pst", "ost",
+    "pps", "pot", "epub", "fb2", "xps", "oxps", "zip", "7z", "rar", "pst",
 ];
 
 /// The end of a ZIP too large to send whole: `extract(ZIP_END, ...)` lists

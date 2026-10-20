@@ -32,9 +32,15 @@ pub fn serve_stdio() -> i32 {
     if let (Some(model), Some(tokenizer)) = (arg("--embed"), arg("--tokenizer")) {
         return serve_embed(Path::new(&model), Path::new(&tokenizer));
     }
-    if let Some(handle) = arg("--mailbox").and_then(|h| h.parse::<usize>().ok()) {
+    if args.iter().any(|a| a == "--mailbox") {
         let max = arg("--max").and_then(|m| m.parse().ok()).unwrap_or(1_000_000);
-        return serve_mailbox(handle, max);
+        // the file's handle comes first on stdin (put into this process by
+        // the service once it is inside its job)
+        let mut h = [0u8; 8];
+        if std::io::stdin().lock().read_exact(&mut h).is_err() {
+            return EXIT_DAMAGED;
+        }
+        return serve_mailbox(u64::from_le_bytes(h) as usize, max);
     }
     let ext = arg("--ext").unwrap_or_default();
     let max = arg("--max").and_then(|m| m.parse().ok()).unwrap_or(1_000_000);
@@ -104,7 +110,7 @@ fn serve_tags(model: &Path) -> i32 {
 /// as a handle the service opened read-only and let this process inherit.
 fn serve_mailbox(handle: usize, max: usize) -> i32 {
     use std::os::windows::io::FromRawHandle;
-    // SAFETY: the service passed a valid, inheritable file handle opened for reading
+    // SAFETY: the service duplicated a valid file handle, opened for reading, into this process
     let file = unsafe { std::fs::File::from_raw_handle(handle as std::os::windows::io::RawHandle) };
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut out = crate::Out::new(max);
@@ -232,22 +238,17 @@ impl Sandbox {
         self.extract_bytes(&ext, bytes, max_chars)
     }
 
-    /// A mailbox: opened here read-only (never blocking Outlook), and only
-    /// that handle is inherited by the worker. Up to 5 minutes, whatever
-    /// the usual timeout.
+    /// A mailbox: opened here read-only, sharing it with any writer (while
+    /// Outlook has it open, Windows refuses the open: it is tried again
+    /// later). Its handle is duplicated into the worker alone, once the
+    /// worker is in its job; at most 60 s, so Outlook started meanwhile
+    /// waits little.
     fn extract_mailbox(&self, path: &Path, max_chars: usize) -> Result<Extracted, SandboxError> {
         use std::os::windows::fs::OpenOptionsExt;
         use std::os::windows::io::AsRawHandle;
-        use windows_sys::Win32::Foundation::{SetHandleInformation, HANDLE_FLAG_INHERIT};
         let file = std::fs::OpenOptions::new().read(true).share_mode(0x1 | 0x2 | 0x4).open(path).map_err(SandboxError::Io)?;
-        let handle = file.as_raw_handle();
-        // SAFETY: a handle we own; only its inherit flag changes
-        if unsafe { SetHandleInformation(handle as _, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) } == 0 {
-            return Err(SandboxError::Failed(format!("cannot share the mailbox: {}", std::io::Error::last_os_error())));
-        }
-        let worker = Sandbox { exe: self.exe.clone(), timeout: self.timeout.max(Duration::from_secs(300)), memory_limit: self.memory_limit, max_file: self.max_file };
-        // the handle goes as an argument; the worker gets no bytes on stdin
-        let result = worker.run(&["--mailbox".to_string(), (handle as usize).to_string(), "--max".to_string(), max_chars.to_string()], Vec::new());
+        let worker = Sandbox { exe: self.exe.clone(), timeout: Duration::from_secs(60), memory_limit: self.memory_limit, max_file: self.max_file };
+        let result = worker.run_with(&["--mailbox".to_string(), "--max".to_string(), max_chars.to_string()], Vec::new(), Some(file.as_raw_handle()));
         drop(file);
         result
     }
@@ -258,6 +259,12 @@ impl Sandbox {
 
     /// Runs the worker with `args`, `bytes` on its stdin, inside the job.
     fn run(&self, args: &[String], bytes: Vec<u8>) -> Result<Extracted, SandboxError> {
+        self.run_with(args, bytes, None)
+    }
+
+    /// `run`; `give`: a handle duplicated into the worker (and only into it)
+    /// once it is in its job, its value sent first on stdin.
+    fn run_with(&self, args: &[String], bytes: Vec<u8>, give: Option<std::os::windows::io::RawHandle>) -> Result<Extracted, SandboxError> {
         use std::os::windows::io::AsRawHandle;
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -277,6 +284,23 @@ impl Sandbox {
         if let Err(e) = job.assign(child.as_raw_handle()) {
             let _ = child.kill();
             return Err(SandboxError::Failed(format!("job object: {e}")));
+        }
+        let mut bytes = bytes;
+        if let Some(h) = give {
+            use windows_sys::Win32::Foundation::{DuplicateHandle, DUPLICATE_SAME_ACCESS};
+            use windows_sys::Win32::System::Threading::GetCurrentProcess;
+            let mut target = std::ptr::null_mut();
+            // SAFETY: valid handles: ours, the child process we just started
+            let ok = unsafe {
+                DuplicateHandle(GetCurrentProcess(), h as _, child.as_raw_handle() as _, &mut target, 0, 0, DUPLICATE_SAME_ACCESS)
+            };
+            if ok == 0 {
+                let _ = child.kill();
+                return Err(SandboxError::Failed(format!("cannot give the file to the extractor: {}", std::io::Error::last_os_error())));
+            }
+            let mut first = (target as usize as u64).to_le_bytes().to_vec();
+            first.extend_from_slice(&bytes);
+            bytes = first;
         }
 
         let mut stdin = child.stdin.take().unwrap();

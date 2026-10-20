@@ -49,7 +49,7 @@ const MAX_DOCUMENT: u64 = 64 << 20;
 /// Of a text file, only the beginning is indexed.
 const TEXT_HEAD: u64 = 8 << 20;
 /// Characters indexed from an Outlook mailbox (its newest messages).
-const MAILBOX_CHARS: usize = 8_000_000;
+const MAILBOX_CHARS: usize = 4_000_000;
 /// A mailbox changes whenever Outlook runs: it is read again at most this
 /// often (minutes).
 const MAILBOX_EVERY: u32 = 24 * 60;
@@ -640,7 +640,8 @@ impl Content {
             let props = self.props.lock();
             let redo: Vec<u64> = wanted
                 .values()
-                .filter(|c| is_picture(&c.path) && known.contains_key(&c.key))
+                .filter(|c| is_picture(&c.path) && known.contains_key(&c.key) && crate::props::has_props(&ext_of(&c.path)))
+                .filter(|c| !self.crashed.lock().contains(&c.key))
                 // read without the model but should be (on), or with it and should not be (off);
                 // photos with no properties yet are only redone when recognition is on
                 .filter(|c| match props.get(c.key) {
@@ -698,13 +699,12 @@ impl Content {
                 .map(|c| Candidate { props_only: true, media_only: false, photo_only: false, path: c.path.clone(), ..*c })
                 .collect()
         };
+        let now = system::date_ctx().now;
         let mut todo: Vec<Candidate> = wanted
             .into_values()
             .filter(|c| known.get(&c.key).is_none_or(|i| i.size != c.size || i.modified != c.modified))
             // a mailbox that changed: again only once its date moved a day on
-            .filter(|c| {
-                !is_mailbox(&c.path) || known.get(&c.key).is_none_or(|i| c.modified >= i.modified.saturating_add(MAILBOX_EVERY))
-            })
+            .filter(|c| !is_mailbox(&c.path) || known.get(&c.key).is_none_or(|i| now >= i.modified.saturating_add(MAILBOX_EVERY)))
             .chain(props_missing)
             .chain(meaning_missing)
             .collect();
@@ -788,9 +788,11 @@ impl Content {
                 }
                 continue;
             }
-            self.reading(Some(c.key));
+            // the crash marker is set only around what runs in this process
+            // (a sandboxed read cut short by a shutdown is no crash)
+            let mark = |on: bool| self.reading(on.then_some(c.key));
             if c.meaning_only {
-                if let Some((_, text)) = extract(&c, sandbox, None, &mut Vec::new()) {
+                if let Some((_, text)) = extract(&c, sandbox, None, &mut Vec::new(), &mark) {
                     if !self.read_meaning(c.key, &text) {
                         meaning_now = false;
                     }
@@ -798,7 +800,7 @@ impl Content {
                 since_commit += 1;
             } else if !c.props_only {
                 seen.clear();
-                if let Some((what, text)) = extract(&c, sandbox, tagger.as_mut(), &mut seen) {
+                if let Some((what, text)) = extract(&c, sandbox, tagger.as_mut(), &mut seen, &mark) {
                     index.put(c.key, what, &text).map_err(|e| e.to_string())?;
                     known.insert(c.key, what);
                     since_commit += 1;
@@ -815,7 +817,9 @@ impl Content {
             }
             let ext = ext_of(&c.path);
             if crate::props::has_props(&ext) {
+                mark(true);
                 let mut p = crate::props::read(Path::new(&c.path), &ext, tz);
+                mark(false);
                 if c.props_only {
                     // only the properties were read: keep what the model saw and the OCR mark
                     if let Some(old) = self.props.lock().get(c.key) {
@@ -834,7 +838,6 @@ impl Content {
                 // a record reused by another kind of file: no old properties on it
                 self.props.lock().remove(c.key);
             }
-            self.reading(None);
             {
                 let mut s = self.status.lock();
                 s.done = n as u64 + 1;
@@ -1095,7 +1098,7 @@ impl Content {
             for (c, ok) in chunk.iter().zip(allowed) {
                 i += 1;
                 if ok {
-                    if let Some((_, text)) = extract(c, sandbox.as_ref(), None, &mut Vec::new()) {
+                    if let Some((_, text)) = extract(c, sandbox.as_ref(), None, &mut Vec::new(), &|_| {}) {
                         let folded = fold(&text);
                         if plan.needles.iter().all(|w| folded.contains(w.as_str())) {
                             rows.push(Row { path: c.path.clone(), is_dir: false, size: c.size, modified: c.modified, flags: 0 });
@@ -1141,7 +1144,7 @@ impl Content {
 }
 
 fn is_mailbox(path: &str) -> bool {
-    matches!(ext_of(path).as_str(), "pst" | "ost")
+    ext_of(path) == "pst"
 }
 
 fn is_raw(path: &str) -> bool {
@@ -1185,8 +1188,8 @@ struct Candidate {
     path: String,
     size: u64,
     modified: u32,
-    /// A photo in a pictures folder: only where it was taken is read, not
-    /// its text (OCR on every holiday photo would cost hours).
+    /// A photo outside the content folders: where it was taken, what is in
+    /// it and (not for RAW) its text.
     photo_only: bool,
     /// Music or a video: no text, only its properties.
     media_only: bool,
@@ -1341,11 +1344,11 @@ fn files_in(idx: &NameIndex, folders: &[String], pictures: &[String]) -> HashMap
             });
         }
     }
-    // Outlook mailboxes anywhere, AppData included (classic Outlook keeps its
-    // .ost there); never cloud-only ones
+    // Outlook data files (.pst) anywhere, AppData included; never cloud-only
+    // ones (an .ost, the cache of an Exchange account, is not readable)
     {
         let mailboxes = Query {
-            clauses: vec![file(), Clause { negated: false, any_of: vec![Term::Ext(vec!["pst".into(), "ost".into()])] }],
+            clauses: vec![file(), Clause { negated: false, any_of: vec![Term::Ext(vec!["pst".into()])] }],
         };
         let entries: Vec<u32> = idx.matching(&mailboxes).into_iter().filter(|&e| idx.flags(e) & FLAG_CLOUD == 0).collect();
         let records = idx.records_of(&entries);
@@ -1485,8 +1488,15 @@ fn photo_tags(path: &Path, tagger: &mut TagWorker, seen: &mut Vec<u16>) -> Optio
 }
 
 /// Reads one file. `tagger`: recognise what is in photos (when on).
-/// `seen`: the photo model's labels, when it looked at a photo.
-fn extract(c: &Candidate, sandbox: Option<&Sandbox>, tagger: Option<&mut TagWorker>, seen: &mut Vec<u16>) -> Option<(Indexed, String)> {
+/// `seen`: the photo model's labels, when it looked at a photo. `mark`:
+/// called with `true` before and `false` after parsing in this process.
+fn extract(
+    c: &Candidate,
+    sandbox: Option<&Sandbox>,
+    tagger: Option<&mut TagWorker>,
+    seen: &mut Vec<u16>,
+    mark: &dyn Fn(bool),
+) -> Option<(Indexed, String)> {
     let what = |status| Indexed { size: c.size, modified: c.modified, status };
     if c.media_only {
         return Some((what(Status::Empty), String::new()));
@@ -1497,7 +1507,10 @@ fn extract(c: &Candidate, sandbox: Option<&Sandbox>, tagger: Option<&mut TagWork
     // a photo: where it was taken and what is in it
     let place = if kind == Kind::Image {
         let tags = tagger.and_then(|t| photo_tags(path, t, seen));
-        match (place_text(path, &ext), tags) {
+        mark(true);
+        let place = place_text(path, &ext);
+        mark(false);
+        match (place, tags) {
             (Some(p), Some(t)) => Some(format!("{p}\n{t}")),
             (p, t) => p.or(t),
         }
@@ -1505,8 +1518,9 @@ fn extract(c: &Candidate, sandbox: Option<&Sandbox>, tagger: Option<&mut TagWork
         None
     };
     // a RAW photo: where it was taken and what is in it, not its text
-    // (decoding a camera file for OCR costs too much)
-    if c.photo_only && whereti_query::kinds::RAW.contains(&ext.as_str()) {
+    // (decoding a camera file for OCR costs too much); the same for any
+    // photo when the sandbox is missing
+    if c.photo_only && (whereti_query::kinds::RAW.contains(&ext.as_str()) || sandbox.is_none()) {
         return Some(match place {
             Some(text) => (what(Status::Ok), text),
             None => (what(Status::Empty), String::new()),
@@ -1525,7 +1539,8 @@ fn extract(c: &Candidate, sandbox: Option<&Sandbox>, tagger: Option<&mut TagWork
         read_head(path, 32)
             .and_then(|head| read_tail(path, ZIP_TAIL).map(|tail| (head, tail)))
             .and_then(|(head, tail)| {
-                sandbox.extract_bytes(whereti_extract::SEVENZ_ENDS, whereti_extract::sevenz_ends(c.size, &head, &tail), MAX_CHARS)
+                let len = std::fs::metadata(path).map(|m| m.len()).map_err(SandboxError::Io)?;
+                sandbox.extract_bytes(whereti_extract::SEVENZ_ENDS, whereti_extract::sevenz_ends(len, &head, &tail), MAX_CHARS)
             })
     } else if c.size > MAX_DOCUMENT && ext == "zip" {
         // a large ZIP: its names, from the directory at its end

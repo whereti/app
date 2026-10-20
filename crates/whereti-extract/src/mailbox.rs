@@ -2,8 +2,10 @@
 //! read without Outlook, with Microsoft's own reader (outlook-pst).
 //!
 //! A mailbox is often gigabytes, so it is not sent to the sandbox as bytes:
-//! the service opens it read-only and hands the worker that one open file
-//! (an inherited handle); the worker has no other access to the disk.
+//! the service opens it read-only and duplicates that one handle into the
+//! worker (in its job, memory-capped, killed after 60 s). Only `.pst` is
+//! read: Outlook's `.ost` (the cache of an Exchange / Microsoft 365
+//! account) is a format this reader does not open.
 //!
 //! The text is the messages newest first: subject, sender, recipients and
 //! date on their own lines, then the start of the body, until the budget.
@@ -31,10 +33,6 @@ const DISPLAY_TO: u16 = 0x0E04;
 const DELIVERY_TIME: u16 = 0x0E06;
 const BODY: u16 = 0x1000;
 const BODY_HTML: u16 = 0x1013;
-
-pub(crate) fn is_mailbox(ext: &str) -> bool {
-    matches!(ext, "pst" | "ost")
-}
 
 /// `open` gives a fresh reader of the same file each time (the Unicode
 /// format is tried first, then the old ANSI one).
