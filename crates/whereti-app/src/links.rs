@@ -4,7 +4,7 @@
 pub const SITE: &str = "https://whereti.com/";
 pub const PRIVACY: &str = "https://whereti.com/privacy/";
 pub const HELP: &str = "https://whereti.com/faq/";
-pub const SOURCE: &str = "https://github.com/whereti/whereti";
+pub const SOURCE: &str = "https://github.com/whereti/app";
 pub const SUPPORTER: &str = "https://whereti.com/supporter/";
 /// Lemon Squeezy checkouts (Software Hive's store). Placeholders until the
 /// products exist: set them to the "Share" links of the two variants.

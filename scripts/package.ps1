@@ -145,7 +145,7 @@ if ($Release) {
         pub_date  = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
         platforms = [ordered]@{
             "windows-x86_64" = [ordered]@{
-                url    = "https://github.com/whereti/whereti/releases/download/v$version/whereti-setup-$version.exe"
+                url    = "https://github.com/whereti/app/releases/download/v$version/whereti-setup-$version.exe"
                 sha256 = $hash.ToLowerInvariant()
                 size   = (Get-Item $setup).Length
             }

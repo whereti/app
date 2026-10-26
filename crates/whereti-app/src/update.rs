@@ -22,7 +22,7 @@ use parking_lot::Mutex;
 
 pub const ENDPOINT: &str = "https://releases.whereti.com";
 /// Installers are only ever downloaded from here.
-const DOWNLOADS: &str = "https://github.com/whereti/whereti/releases/download/";
+const DOWNLOADS: &str = "https://github.com/whereti/app/releases/download/";
 const PUBLISHER: &str = "Software Hive S.R.L.";
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 const DAY_SECS: u64 = 24 * 3600;

@@ -19,7 +19,7 @@ $out = Join-Path $repoRoot "dist\winget\$Version"
 New-Item -ItemType Directory -Force $out | Out-Null
 $id = "SoftwareHive.whereti"
 $schema = "1.9.0"
-$url = "https://github.com/whereti/whereti/releases/download/v$Version/whereti-setup-$Version.exe"
+$url = "https://github.com/whereti/app/releases/download/v$Version/whereti-setup-$Version.exe"
 
 $manifestVersion = @"
 # yaml-language-server: `$schema=https://aka.ms/winget-manifest.version.$schema.schema.json
@@ -74,7 +74,7 @@ Author: Software Hive S.R.L.
 PackageName: whereti
 PackageUrl: https://whereti.com/
 License: MIT
-LicenseUrl: https://github.com/whereti/whereti/blob/main/LICENSE
+LicenseUrl: https://github.com/whereti/app/blob/main/LICENSE
 Copyright: Copyright (C) 2026 Software Hive S.R.L.
 ShortDescription: Find any file on your PC as you type, by its name or by the words inside it.
 Description: |-
@@ -90,7 +90,7 @@ Tags:
 - find
 - ocr
 - open-source
-ReleaseNotesUrl: https://github.com/whereti/whereti/releases/tag/v$Version
+ReleaseNotesUrl: https://github.com/whereti/app/releases/tag/v$Version
 ManifestType: defaultLocale
 ManifestVersion: $schema
 "@
