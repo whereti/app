@@ -19,10 +19,9 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # the version in rust-toolchain.toml
       - name: Rust
-        run: |
-          rustup toolchain install stable --profile minimal --component clippy
-          rustup default stable
+        run: rustup toolchain install
       # The installer (whereti-setup) packs the release programs and is built
       # by scripts/package.ps1; it is not a default member, so these skip it.
       - name: Tests

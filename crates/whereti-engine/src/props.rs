@@ -330,7 +330,7 @@ fn info_author(b: &[u8]) -> Option<String> {
     };
     // UTF-16BE with a byte-order mark, else PDFDocEncoding (about Latin-1)
     let s = if raw.starts_with(&[0xFE, 0xFF]) {
-        let units: Vec<u16> = raw[2..].chunks_exact(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect();
+        let units: Vec<u16> = raw[2..].as_chunks::<2>().0.iter().map(|c| u16::from_be_bytes([c[0], c[1]])).collect();
         String::from_utf16_lossy(&units)
     } else {
         raw.iter().map(|&c| c as char).collect()

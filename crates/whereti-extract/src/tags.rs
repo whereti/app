@@ -52,7 +52,7 @@ pub fn labels() -> &'static [Vec<&'static str>] {
 fn vectors() -> (usize, usize, Vec<f32>) {
     let n = u32::from_le_bytes(LABEL_VECTORS[4..8].try_into().unwrap()) as usize;
     let d = u32::from_le_bytes(LABEL_VECTORS[8..12].try_into().unwrap()) as usize;
-    let v = LABEL_VECTORS[12..].chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
+    let v = LABEL_VECTORS[12..].as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect();
     (n, d, v)
 }
 

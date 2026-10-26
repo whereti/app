@@ -166,8 +166,8 @@ fn pixels(bitmap: HBITMAP) -> Pixels {
             return None;
         }
         // photos come without alpha (all 0): opaque; icons come premultiplied
-        let opaque = px.chunks_exact(4).all(|p| p[3] == 0);
-        for p in px.chunks_exact_mut(4) {
+        let opaque = px.as_chunks::<4>().0.iter().all(|p| p[3] == 0);
+        for p in px.as_chunks_mut::<4>().0 {
             p.swap(0, 2); // BGRA -> RGBA
             if opaque {
                 p[3] = 255;

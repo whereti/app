@@ -1,0 +1,6 @@
+# The Rust everyone builds with (this PC, CI): the same lints, the same
+# compiler for the installer. Raise it on purpose, fixing what new lints find.
+[toolchain]
+channel = "1.99.1"
+components = ["clippy"]
+profile = "minimal"

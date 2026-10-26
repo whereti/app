@@ -193,7 +193,7 @@ pub fn load(path: &Path) -> io::Result<NameIndex> {
         return Err(bad("hard link table is invalid"));
     }
     let mut map: HashMap<u32, Vec<u32>> = HashMap::new();
-    for pair in links.chunks_exact(2) {
+    for pair in links.as_chunks::<2>().0 {
         map.entry(pair[0]).or_default().push(pair[1]);
     }
     idx.links = map;

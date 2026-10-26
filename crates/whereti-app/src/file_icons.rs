@@ -190,12 +190,12 @@ fn icon_rgba(icon: HICON) -> Option<(Vec<u8>, usize)> {
         let dc = CreateCompatibleDC(None);
         let lines = GetDIBits(dc, ii.hbmColor, 0, h as u32, Some(px.as_mut_ptr() as *mut _), &mut bmi, DIB_RGB_COLORS);
         // Old icons have no alpha channel: take transparency from the mask.
-        let no_alpha = px.chunks_exact(4).all(|p| p[3] == 0);
+        let no_alpha = px.as_chunks::<4>().0.iter().all(|p| p[3] == 0);
         if no_alpha && !ii.hbmMask.is_invalid() {
             let mut mask = vec![0u8; w * h * 4];
             let mut mbmi = bmi;
             GetDIBits(dc, ii.hbmMask, 0, h as u32, Some(mask.as_mut_ptr() as *mut _), &mut mbmi, DIB_RGB_COLORS);
-            for (p, m) in px.chunks_exact_mut(4).zip(mask.chunks_exact(4)) {
+            for (p, m) in px.as_chunks_mut::<4>().0.iter_mut().zip(mask.as_chunks::<4>().0) {
                 p[3] = if m[0] == 0 { 255 } else { 0 };
             }
         }
@@ -204,7 +204,7 @@ fn icon_rgba(icon: HICON) -> Option<(Vec<u8>, usize)> {
         if lines == 0 || w == 0 || w != h {
             return None;
         }
-        for p in px.chunks_exact_mut(4) {
+        for p in px.as_chunks_mut::<4>().0 {
             p.swap(0, 2); // BGRA → RGBA
         }
         Some((px, w))
