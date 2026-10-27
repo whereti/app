@@ -1,6 +1,7 @@
 //! Whole-name wildcard matching: `*` = any run of characters, `?` = one character.
 
-/// Both arguments must already be folded.
+/// Both arguments must already be folded. `?` is one folded character, so
+/// a letter folded to two (ß, æ, œ) needs `??`: `stra??e` finds Straße.
 pub fn glob_match(pattern: &str, name: &str) -> bool {
     let p = pattern.as_bytes();
     let n = name.as_bytes();
