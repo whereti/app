@@ -50,7 +50,20 @@ const DUPES_BUDGET: Duration = Duration::from_secs(6);
 const MAX_LIMIT: u32 = 10_000;
 /// Save once the journal has moved this share of its size since the last save,
 /// so a restart can always replay instead of rescanning.
-const SAVE_AT_JOURNAL_SHARE: f64 = 0.25;
+const SAVE_AT_JOURNAL_SHARE: f64 = 0.25;/// The timers (drive checks, saves, refreshes) are looked at this often.
+const TIMERS_EVERY: Duration = Duration::from_millis(500);
+/// A drive that could not be scanned is tried again after this, then after
+/// twice as long each time, up to RETRY_MAX.
+const RETRY_FIRST: Duration = Duration::from_secs(10);
+const RETRY_MAX: Duration = Duration::from_secs(30 * 60);
+/// A drive let go for a removal that is still there after this was not
+/// removed (the notification that says so was lost): it is followed again.
+const RELEASE_MAX: Duration = Duration::from_secs(60);
+/// After Windows says a removal is done, the drive is looked at again this
+/// soon (gone: left out; back already: followed again).
+const RELEASE_DONE: Duration = Duration::from_secs(5);
+/// After a save failed, the next one is tried this much later.
+const SAVE_RETRY: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -496,19 +509,35 @@ struct Worker {
     removal: Option<Removal>,
     notify: HashMap<char, usize>,
     /// Drives let go for a removal; not opened again until it is done or cancelled.
-    released: HashSet<char>,
+    released: HashMap<char, Released>,
     /// Walked drives: when, how long it took, and what was found.
     walks: HashMap<char, (Instant, Duration, u64)>,
+    /// Drives that could not be scanned: when to try again, and how many
+    /// tries failed. Their old entries stay searchable meanwhile.
+    retry: HashMap<char, (Instant, u32)>,
     last_drive_check: Instant,
-    /// Per volume: journal size, and journal position at the last save.
+    /// Per volume: journal size.
     journal_max: Vec<u64>,
-    saved_usn: Vec<i64>,
+    /// Per drive: the journal and its position at the last save.
+    saved_usn: HashMap<char, (u64, i64)>,
     pool: rayon::ThreadPool,
     dirty: bool,
     last_save: Instant,
+    /// After a failed save, none is tried before this.
+    save_after: Option<Instant>,
     last_refresh: Instant,
     last_reconcile: Instant,
     last_change: Instant,
+    last_timers: Instant,
+}
+
+/// A drive let go for a safe removal.
+struct Released {
+    /// Its removal registration, kept so a cancelled removal is told to us
+    /// (DBT_DEVICEQUERYREMOVEFAILED); undone when it ends.
+    notify: Option<usize>,
+    /// Still there at this time: the removal did not happen, follow it again.
+    until: Instant,
 }
 
 impl Worker {
@@ -523,18 +552,34 @@ impl Worker {
             followers: HashMap::new(),
             removal: None,
             notify: HashMap::new(),
-            released: HashSet::new(),
+            released: HashMap::new(),
             walks: HashMap::new(),
+            retry: HashMap::new(),
             last_drive_check: now,
             journal_max: Vec::new(),
-            saved_usn: Vec::new(),
+            saved_usn: HashMap::new(),
             pool: system::maintenance_pool(),
             dirty: false,
             last_save: now,
+            save_after: None,
             last_refresh: now,
             last_reconcile: now,
             last_change: now,
+            last_timers: now,
         }
+    }
+
+    /// Swaps in a new index. Entry numbers change: what was kept by number
+    /// (the work-folder ranking) is rebuilt.
+    fn set_index(&self, idx: NameIndex) {
+        let mut guard = self.shared.index.write();
+        *guard = Some(idx);
+        self.shared.activity.index_replaced();
+    }
+
+    /// The position of `letter` in the index.
+    fn vol_of(&self, letter: char) -> Option<usize> {
+        self.shared.index.read().as_ref()?.volume_index(letter)
     }
 
     fn log(&self, msg: impl AsRef<str>) {
@@ -546,22 +591,34 @@ impl Worker {
         if self.removal.is_none() {
             self.log("safe removal of external drives is not available (no notification window)");
         }
-        if let Err(e) = self.startup() {
-            self.log(format!("error: {e}"));
+        // Without an index nothing works: try again, less and less often,
+        // serving whatever index we have meanwhile.
+        let mut wait = RETRY_FIRST;
+        while let Err(e) = self.startup() {
+            self.log(format!("error: {e}; tried again in {} s", wait.as_secs()));
             self.shared.set_state(format!("error: {e}"));
-            // Keep serving whatever index we have until asked to stop.
-            while !matches!(rx.recv(), Ok(Msg::Stop) | Err(_)) {}
-            return;
+            let deadline = Instant::now() + wait;
+            while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+                match rx.recv_timeout(left) {
+                    Ok(Msg::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                    Ok(Msg::Release(letter, reply)) => self.release(letter, reply),
+                    Ok(_) => {}
+                    Err(mpsc::RecvTimeoutError::Timeout) => break,
+                }
+            }
+            wait = (wait * 2).min(RETRY_MAX);
         }
         let mut stopping = false;
         while !stopping {
-            match rx.recv_timeout(Duration::from_millis(500)) {
+            // drive checks, saves and open-file refreshes also while files
+            // change all the time
+            if self.last_timers.elapsed() >= TIMERS_EVERY {
+                self.last_timers = Instant::now();
+                self.timers();
+            }
+            match rx.recv_timeout(TIMERS_EVERY) {
                 Ok(Msg::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                Ok(Msg::Reconfigure(paths)) => {
-                    if let Err(e) = self.reconfigure(paths) {
-                        self.log(format!("error: {e}"));
-                    }
-                }
+                Ok(Msg::Reconfigure(paths)) => self.reconfigure(paths),
                 Ok(Msg::Release(letter, reply)) => self.release(letter, reply),
                 Ok(Msg::Reacquire(letter)) => self.reacquire(letter),
                 Ok(Msg::Journal(first)) => {
@@ -587,15 +644,9 @@ impl Worker {
                             Err(_) => break,
                         }
                     }
-                    if let Err(e) = self.apply_msgs(msgs) {
-                        self.log(format!("error: {e}"));
-                    }
+                    self.apply_msgs(msgs);
                 }
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    if let Err(e) = self.timers() {
-                        self.log(format!("error: {e}"));
-                    }
-                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
             }
         }
         if self.dirty {
@@ -669,14 +720,17 @@ impl Worker {
         };
         let mut rescan: Vec<char> =
             present.iter().map(|d| d.letter).filter(|l| !indexed.contains(l)).collect();
-        *self.shared.index.write() = Some(index);
+        self.set_index(index);
         self.reopen();
 
         self.shared.set_state("catching up");
         for v in 0..self.vols.len() {
             let letter = self.letter(v);
             let t = Instant::now();
-            match self.catch_up(v)? {
+            match self.catch_up(v).unwrap_or_else(|e| {
+                self.log(format!("{e} → full rescan"));
+                None
+            }) {
                 Some((records, stats)) => {
                     self.log(format!(
                         "{letter}: replayed {records} journal records → {} files/folders re-read (+{} −{} ~{}) in {} ms",
@@ -694,20 +748,20 @@ impl Worker {
             }
         }
         if !rescan.is_empty() {
-            self.rescan(&rescan)?;
+            self.rescan(&rescan);
         }
         self.follow_all();
         self.shared.set_state("ready");
         self.log(format!("ready in {} ms", t.elapsed().as_millis()));
         if upgrade_defaults {
             self.log("default exclusions updated: generated folders (node_modules, .git, caches…) are left out");
-            self.reconfigure(default_exclusions(self.cfg.include_windows))?;
+            self.reconfigure(default_exclusions(self.cfg.include_windows));
         } else if !add_groups.is_empty() {
             self.log(format!(
                 "default exclusions updated: {} rules for build folders, tool caches and media caches are added",
                 add_groups.len()
             ));
-            self.reconfigure(with_groups)?;
+            self.reconfigure(with_groups);
         }
         let all: String = Exclusions::group_rules().iter().map(|r| format!("{r}\n")).collect();
         let _ = std::fs::write(&groups_marker, all);
@@ -766,12 +820,25 @@ impl Worker {
         Ok(stats)
     }
 
-    fn apply_msgs(&mut self, msgs: Vec<JournalMsg>) -> Result<(), String> {
-        for v in 0..self.vols.len() {
-            let letter = self.letter(v);
-            let mine: Vec<&JournalMsg> = msgs.iter().filter(|m| m.letter == letter).collect();
-            if mine.is_empty() {
-                continue;
+    /// Applies the journal records of every drive in `msgs`. A drive whose
+    /// reader failed, or whose records could not be applied, is rescanned;
+    /// the other drives' records are applied all the same.
+    fn apply_msgs(&mut self, msgs: Vec<JournalMsg>) {
+        let mut by_letter: Vec<(char, Vec<JournalMsg>)> = Vec::new();
+        for m in msgs {
+            match by_letter.iter_mut().find(|(l, _)| *l == m.letter) {
+                Some((_, list)) => list.push(m),
+                None => by_letter.push((m.letter, vec![m])),
+            }
+        }
+        let mut rescan = Vec::new();
+        for (letter, mine) in by_letter {
+            let Some(v) = self.vol_of(letter) else { continue };
+            let journal_id = self.shared.index.read().as_ref().expect("index").volumes()[v].journal_id;
+            // from a reader of a journal the index no longer follows
+            let mine: Vec<JournalMsg> = mine.into_iter().filter(|m| m.journal_id == journal_id).collect();
+            if mine.is_empty() || self.vols[v].is_none() {
+                continue; // or let go for a removal meanwhile
             }
             if let Some(err) = mine.iter().find_map(|m| m.error.as_ref()) {
                 self.followers.remove(&letter);
@@ -781,9 +848,8 @@ impl Worker {
                     self.log(format!("{letter}: disconnected"));
                 }
                 // rescan() also drops the drive when it is gone
-                self.rescan(&[letter])?;
-                self.follow_all();
-                return Ok(()); // volume order may have changed
+                rescan.push(letter);
+                continue;
             }
             let t = Instant::now();
             let mut batch = Batch::default();
@@ -791,8 +857,15 @@ impl Worker {
                 batch.add(&m.changes, &mut self.open[v]);
             }
             let next = mine.iter().map(|m| m.next).max().unwrap_or(0);
-            let journal_id = self.shared.index.read().as_ref().expect("index").volumes()[v].journal_id;
-            let stats = self.apply_batch(v, batch, journal_id, next)?;
+            let stats = match self.apply_batch(v, batch, journal_id, next) {
+                Ok(stats) => stats,
+                Err(e) => {
+                    // its reader moved on: what was not applied is only found by a rescan
+                    self.log(format!("{letter}: {e} → full rescan"));
+                    rescan.push(letter);
+                    continue;
+                }
+            };
             if self.cfg.verbose {
                 self.log(format!(
                     "{letter}: {} journal records → +{} −{} ~{} in {:.1} ms",
@@ -805,21 +878,27 @@ impl Worker {
             }
             if stats.needs_rescan {
                 self.log(format!("{letter}: a folder was moved in from outside the index → full rescan"));
-                self.rescan(&[letter])?;
+                rescan.push(letter);
             }
+        }
+        if !rescan.is_empty() {
+            rescan.sort_unstable();
+            rescan.dedup();
+            self.rescan(&rescan);
         }
         let ratio = self.shared.index.read().as_ref().map_or(0.0, NameIndex::overlay_ratio);
         if ratio > COMPACT_AT {
             self.compact();
         }
-        Ok(())
     }
 
-    fn timers(&mut self) -> Result<(), String> {
+    /// Drive checks, walks, open-file refreshes, saves and the daily check,
+    /// each when it is due. One failing never stops the others.
+    fn timers(&mut self) {
         if self.last_drive_check.elapsed() >= DRIVE_CHECK {
             self.last_drive_check = Instant::now();
-            self.check_drives()?;
-            self.walk_due()?;
+            self.check_drives();
+            self.walk_due();
         }
         if self.last_refresh.elapsed() >= OPEN_REFRESH {
             self.last_refresh = Instant::now();
@@ -830,18 +909,23 @@ impl Worker {
                 let records: Vec<u64> = self.open[v].iter().copied().collect();
                 let info = self.shared.index.read().as_ref().expect("index").volumes()[v];
                 let batch = Batch { records, created: HashSet::new() };
-                self.apply_batch(v, batch, info.journal_id, info.next_usn)?;
+                if let Err(e) = self.apply_batch(v, batch, info.journal_id, info.next_usn) {
+                    self.log(format!("{}: re-reading open files: {e}", info.letter()));
+                }
             }
         }
-        if self.dirty && (self.last_save.elapsed() >= self.cfg.save_every || self.journal_moved_far()) {
-            self.save()?;
+        let may_save = self.save_after.is_none_or(|t| Instant::now() >= t);
+        if self.dirty && may_save && (self.last_save.elapsed() >= self.cfg.save_every || self.journal_moved_far()) {
+            if let Err(e) = self.save() {
+                self.log(format!("error: {e}"));
+                self.save_after = Some(Instant::now() + SAVE_RETRY);
+            }
         }
         if let Some(every) = self.cfg.reconcile_every {
             if self.last_reconcile.elapsed() >= every && self.last_change.elapsed() >= IDLE_FOR_RECONCILE {
-                self.reconcile()?;
+                self.reconcile();
             }
         }
-        Ok(())
     }
 
     /// True when some volume's journal moved more than SAVE_AT_JOURNAL_SHARE
@@ -850,9 +934,12 @@ impl Worker {
         let guard = self.shared.index.read();
         let Some(idx) = guard.as_ref() else { return false };
         idx.volumes().iter().enumerate().any(|(v, info)| {
-            let moved = (info.next_usn - self.saved_usn.get(v).copied().unwrap_or(info.next_usn)).max(0) as f64;
+            let saved = match self.saved_usn.get(&info.letter()) {
+                Some(&(id, usn)) if id == info.journal_id => usn,
+                _ => info.next_usn,
+            };
             let max = self.journal_max.get(v).copied().unwrap_or(0) as f64;
-            max > 0.0 && moved > max * SAVE_AT_JOURNAL_SHARE
+            moved_far(saved, info.next_usn, max)
         })
     }
 
@@ -865,7 +952,7 @@ impl Worker {
             let idx = guard.as_ref().expect("index");
             self.pool.install(|| idx.rebuild_with(Vec::new()))
         };
-        *self.shared.index.write() = Some(fresh);
+        self.set_index(fresh);
         self.dirty = true;
         self.log(format!("compacted the index in {} ms", t.elapsed().as_millis()));
     }
@@ -889,69 +976,109 @@ impl Worker {
         self.shared.activity.save();
         self.dirty = false;
         self.last_save = Instant::now();
-        self.saved_usn = self.shared.index.read().as_ref().expect("index").volumes().iter().map(|v| v.next_usn).collect();
+        self.save_after = None;
+        self.saved_usn = self
+            .shared
+            .index
+            .read()
+            .as_ref()
+            .expect("index")
+            .volumes()
+            .iter()
+            .map(|v| (v.letter(), (v.journal_id, v.next_usn)))
+            .collect();
         self.log(format!("saved the index ({} MB) in {} ms", size >> 20, t.elapsed().as_millis()));
         Ok(())
     }
 
+    /// A drive could not be scanned: try again later, less often each time.
+    fn failed(&mut self, letter: char, e: &str) {
+        let tries = self.retry.get(&letter).map_or(0, |r| r.1) + 1;
+        let wait = retry_wait(tries);
+        self.retry.insert(letter, (Instant::now() + wait, tries));
+        self.log(format!("{e}; {letter}: tried again in {} s", wait.as_secs()));
+    }
+
     /// Scans `letters` again and swaps in an index built from the scans, then
-    /// replays what happened during the scan.
-    fn rescan(&mut self, letters: &[char]) -> Result<(), String> {
+    /// replays what happened during the scan. A drive that cannot be scanned
+    /// keeps its old entries and is tried again later; the others go on.
+    fn rescan(&mut self, letters: &[char]) {
         let _bg = Background::begin();
         let t = Instant::now();
-        let list: String = letters.iter().map(|l| format!("{l}:")).collect::<Vec<_>>().join(" ");
+        let list = letters_text(letters);
         self.shared.set_state(format!("rescanning {list}"));
+        for &l in letters {
+            // its reader follows the old journal position (or another disk)
+            self.stop_reader(l);
+        }
         let present = walk::drives();
         let mut fresh = Vec::new();
         let mut gone = Vec::new();
         for &l in letters {
             match present.iter().find(|d| d.letter == l) {
                 // being removed safely: not opened again meanwhile
-                Some(_) if self.released.contains(&l) => {}
-                Some(d) => fresh.push(self.scan(d)?),
+                Some(_) if self.released.contains_key(&l) => {}
+                Some(d) => match self.scan(d) {
+                    Ok(s) => {
+                        self.retry.remove(&l);
+                        fresh.push(s);
+                    }
+                    Err(e) => self.failed(l, &e),
+                },
                 None => gone.push(l),
             }
         }
-        let rebuilt = {
-            let guard = self.shared.index.read();
-            let idx = guard.as_ref().expect("index");
-            self.pool.install(|| idx.rebuild(fresh, &gone))
-        };
-        *self.shared.index.write() = Some(rebuilt);
-        for l in &gone {
-            self.walks.remove(l);
-            self.released.remove(l);
-        }
-        let open_before = self.open_by_letter();
-        self.reopen();
-        for v in 0..self.vols.len() {
-            let l = self.letter(v);
-            if !letters.contains(&l) {
-                if let Some(o) = open_before.get(&l) {
-                    self.open[v] = o.clone();
-                }
+        let scanned: Vec<char> = fresh.iter().map(|s| s.letter).collect();
+        if !fresh.is_empty() || !gone.is_empty() {
+            let rebuilt = {
+                let guard = self.shared.index.read();
+                let idx = guard.as_ref().expect("index");
+                self.pool.install(|| idx.rebuild(fresh, &gone))
+            };
+            self.set_index(rebuilt);
+            for l in &gone {
+                self.walks.remove(l);
+                self.retry.remove(l);
+                self.unrelease(*l);
             }
-        }
-        for v in 0..self.vols.len() {
-            if letters.contains(&self.letter(v)) {
-                if let Some((_, stats)) = self.catch_up(v)? {
-                    if stats.needs_rescan {
-                        self.log(format!("{}: still inconsistent after a rescan; the next change retries", self.letter(v)));
+            let open_before = self.open_by_letter();
+            self.reopen();
+            for v in 0..self.vols.len() {
+                let l = self.letter(v);
+                if !scanned.contains(&l) {
+                    if let Some(o) = open_before.get(&l) {
+                        self.open[v] = o.clone();
                     }
                 }
             }
+            for v in 0..self.vols.len() {
+                let l = self.letter(v);
+                if !scanned.contains(&l) {
+                    continue;
+                }
+                match self.catch_up(v) {
+                    Ok(Some((_, stats))) if stats.needs_rescan => {
+                        self.log(format!("{l}: still inconsistent after a rescan; the next change retries"));
+                    }
+                    Ok(_) => {}
+                    // its reader starts at the scan's position and replays the same
+                    Err(e) => self.log(e),
+                }
+            }
+            self.dirty = true;
+            if let Some(c) = self.shared.content.get() {
+                c.recheck();
+            }
         }
-        self.dirty = true;
-        if let Some(c) = self.shared.content.get() {
-            c.recheck();
-        }
+        self.follow_all();
         self.shared.set_state("ready");
         self.log(format!("rescanned {list} in {} ms", t.elapsed().as_millis()));
-        Ok(())
     }
 
     /// Rebuilds the whole index with new exclusion paths (from Settings).
-    fn reconfigure(&mut self, paths: Vec<String>) -> Result<(), String> {
+    /// A drive that cannot be scanned now is left out and added back (with
+    /// the new exclusions) when it can be read again.
+    fn reconfigure(&mut self, paths: Vec<String>) {
         let _bg = Background::begin();
         let t = Instant::now();
         self.shared.set_state("reindexing");
@@ -959,19 +1086,38 @@ impl Worker {
             let guard = self.shared.index.read();
             guard.as_ref().expect("index").volumes().iter().map(|v| v.letter()).collect()
         };
+        for &l in &letters {
+            self.stop_reader(l);
+        }
         let mut scans = Vec::new();
-        for d in walk::drives().iter().filter(|d| letters.contains(&d.letter)) {
-            scans.push(self.scan(d)?);
+        let drives: Vec<Drive> = walk::drives()
+            .into_iter()
+            .filter(|d| letters.contains(&d.letter) && !self.released.contains_key(&d.letter))
+            .collect();
+        for d in &drives {
+            match self.scan(d) {
+                Ok(s) => {
+                    self.retry.remove(&d.letter);
+                    scans.push(s);
+                }
+                Err(e) => self.failed(d.letter, &format!("{e}; left out for now")),
+            }
         }
         let (fresh, stats) = self.pool.install(|| build(scans, &Exclusions { paths }));
-        *self.shared.index.write() = Some(fresh);
+        self.set_index(fresh);
         self.reopen();
         // replay what changed during the scans
         for v in 0..self.vols.len() {
-            self.catch_up(v)?;
+            if let Err(e) = self.catch_up(v) {
+                self.log(e);
+            }
         }
+        self.follow_all();
         self.dirty = true;
-        self.save()?;
+        if let Err(e) = self.save() {
+            self.log(format!("error: {e}"));
+            self.save_after = Some(Instant::now() + SAVE_RETRY);
+        }
         if let Some(c) = self.shared.content.get() {
             c.recheck();
         }
@@ -982,11 +1128,10 @@ impl Worker {
             stats.excluded,
             t.elapsed().as_millis()
         ));
-        Ok(())
     }
 
     /// Daily safety net (PLAN.md §7.2): a full rescan replaces the live index.
-    fn reconcile(&mut self) -> Result<(), String> {
+    fn reconcile(&mut self) {
         self.last_reconcile = Instant::now();
         let letters: Vec<char> = {
             let guard = self.shared.index.read();
@@ -994,10 +1139,9 @@ impl Worker {
         };
         let before = self.shared.index.read().as_ref().map_or(0, NameIndex::live_len);
         self.log("daily check: full rescan");
-        self.rescan(&letters)?;
+        self.rescan(&letters);
         let after = self.shared.index.read().as_ref().map_or(0, NameIndex::live_len);
         self.log(format!("daily check done: {before} entries before, {after} after"));
-        Ok(())
     }
 
     /// A journal reader for every NTFS drive that has none yet.
@@ -1006,7 +1150,10 @@ impl Worker {
         for (v, info) in infos.into_iter().enumerate() {
             let letter = info.letter();
             let running = self.followers.get(&letter).is_some_and(|(h, _)| !h.is_finished());
-            if self.vols[v].is_none() || info.journal_id == WALKED || running || self.released.contains(&letter) {
+            // a drive waiting for another scan is not followed: its reader
+            // would fail and ask for a scan at once, again and again
+            let waits = self.released.contains_key(&letter) || self.retry.contains_key(&letter);
+            if self.vols.get(v).is_none_or(Option::is_none) || info.journal_id == WALKED || running || waits {
                 continue;
             }
             let tx = self.tx.clone();
@@ -1021,6 +1168,23 @@ impl Worker {
         }
     }
 
+    /// Stops the journal reader of `letter`, if it has one.
+    fn stop_reader(&mut self, letter: char) {
+        use std::os::windows::io::AsRawHandle;
+        let Some((h, stop)) = self.followers.remove(&letter) else { return };
+        stop.store(true, Ordering::SeqCst);
+        // the reader sleeps in the kernel waiting for the journal: wake it
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !h.is_finished() && Instant::now() < deadline {
+            // SAFETY: the thread's own handle, alive while `h` is.
+            unsafe { windows_sys::Win32::System::IO::CancelSynchronousIo(h.as_raw_handle() as _) };
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if h.is_finished() {
+            let _ = h.join();
+        }
+    }
+
     /// Opens the volumes again after the index's drives changed, and sizes
     /// the per-volume lists to match.
     fn reopen(&mut self) {
@@ -1031,11 +1195,14 @@ impl Worker {
         self.vols = infos
             .iter()
             .map(|i| {
-                if i.journal_id == WALKED || self.released.contains(&i.letter()) {
-                    None
-                } else {
-                    Volume::open(i.letter(), false).ok()
+                if i.journal_id == WALKED || self.released.contains_key(&i.letter()) {
+                    return None;
                 }
+                // another disk under this letter is not read as this one:
+                // the next drive check rescans it
+                Volume::open(i.letter(), false)
+                    .ok()
+                    .filter(|vol| walk::same_volume(vol.ntfs.volume_serial_number as u64, i.serial))
             })
             .collect();
         if let Some(r) = &self.removal {
@@ -1051,36 +1218,39 @@ impl Worker {
             .iter()
             .map(|v| v.as_ref().and_then(|v| v.query_usn_journal().ok()).map_or(0, |j| j.maximum_size))
             .collect();
-        self.saved_usn = infos.iter().map(|v| v.next_usn).collect();
+        // a drive new to the index (or with a new journal) counts from here;
+        // the others keep their position at the last save
+        for i in &infos {
+            let at_save = self.saved_usn.entry(i.letter()).or_insert((i.journal_id, i.next_usn));
+            if at_save.0 != i.journal_id {
+                *at_save = (i.journal_id, i.next_usn);
+            }
+        }
     }
 
-    /// Windows wants to remove `letter`: close the MFT handle and stop the
-    /// journal reader, then answer so the removal can go on.
+    /// Windows wants to remove `letter` (`reply` set: it asks first), or it
+    /// is being removed or gone already (`None`): close the MFT handle and
+    /// stop the journal reader, then answer so the removal can go on.
     fn release(&mut self, letter: char, reply: Option<mpsc::Sender<()>>) {
-        use std::os::windows::io::AsRawHandle;
-        if self.released.insert(letter) {
-            if let Some(n) = self.notify.remove(&letter) {
-                Removal::unwatch(n);
+        let asks = reply.is_some();
+        if let Some(r) = self.released.get_mut(&letter) {
+            if !asks {
+                // the removal is done: look at the drive again soon
+                r.until = r.until.min(Instant::now() + RELEASE_DONE);
             }
+        } else {
+            // The registration stays while the removal is under way, so a
+            // cancelled one is told to us (DBT_DEVICEQUERYREMOVEFAILED).
+            let notify = self.notify.remove(&letter);
+            let until = Instant::now() + if asks { RELEASE_MAX } else { RELEASE_DONE };
+            self.released.insert(letter, Released { notify, until });
             for v in 0..self.vols.len() {
                 if self.letter(v) == letter {
                     self.vols[v] = None;
                     self.open[v].clear();
                 }
             }
-            if let Some((h, stop)) = self.followers.remove(&letter) {
-                stop.store(true, Ordering::SeqCst);
-                // the reader sleeps in the kernel waiting for the journal: wake it
-                let deadline = Instant::now() + Duration::from_secs(3);
-                while !h.is_finished() && Instant::now() < deadline {
-                    // SAFETY: the thread's own handle, alive while `h` is.
-                    unsafe { windows_sys::Win32::System::IO::CancelSynchronousIo(h.as_raw_handle() as _) };
-                    std::thread::sleep(Duration::from_millis(20));
-                }
-                if h.is_finished() {
-                    let _ = h.join();
-                }
-            }
+            self.stop_reader(letter);
             self.log(format!("{letter}: let go for safe removal"));
         }
         if let Some(r) = reply {
@@ -1088,9 +1258,22 @@ impl Worker {
         }
     }
 
-    /// The removal of `letter` was cancelled: follow it again.
+    /// Forgets that `letter` was let go for a removal.
+    fn unrelease(&mut self, letter: char) -> bool {
+        match self.released.remove(&letter) {
+            Some(r) => {
+                if let Some(n) = r.notify {
+                    Removal::unwatch(n);
+                }
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The removal of `letter` was cancelled (or never happened): follow it again.
     fn reacquire(&mut self, letter: char) {
-        if self.released.remove(&letter) {
+        if self.unrelease(letter) {
             let open_before = self.open_by_letter();
             self.reopen();
             for v in 0..self.vols.len() {
@@ -1113,47 +1296,73 @@ impl Worker {
         let s = sync::scan_any(d, self.cfg.threads)?;
         if s.journal_id == WALKED {
             self.walks.insert(d.letter, (Instant::now(), t.elapsed(), walk::fingerprint(&s)));
+        } else {
+            // followed through its journal now: no more walks
+            self.walks.remove(&d.letter);
         }
         Ok(s)
     }
 
     /// Adds drives that appeared and drops drives that are gone.
-    fn check_drives(&mut self) -> Result<(), String> {
+    fn check_drives(&mut self) {
         let present = walk::drives();
-        let indexed: Vec<(char, u64, bool)> = {
+        let indexed: Vec<(char, u64)> = {
             let guard = self.shared.index.read();
-            guard.as_ref().expect("index").volumes().iter().map(|v| (v.letter(), v.serial, v.journal_id == WALKED)).collect()
+            guard.as_ref().expect("index").volumes().iter().map(|v| (v.letter(), v.serial)).collect()
         };
-        let mut changed: Vec<char> = present
-            .iter()
-            .filter(|d| !indexed.iter().any(|(l, _, _)| *l == d.letter))
-            .map(|d| d.letter)
-            .collect();
-        for &(l, serial, walked) in &indexed {
+        let now = Instant::now();
+        // Drives let go for a removal: another disk under that letter is
+        // scanned; the same disk still there after a while was not removed.
+        let mut changed: Vec<char> = Vec::new();
+        let mut back: Vec<char> = Vec::new();
+        for (&l, r) in &self.released {
+            let Some(d) = present.iter().find(|d| d.letter == l) else { continue };
+            match indexed.iter().find(|(il, _)| *il == l) {
+                Some(&(_, serial)) if !walk::same_volume(serial, d.serial) => changed.push(l),
+                None if now >= r.until => changed.push(l),
+                Some(_) if now >= r.until => back.push(l),
+                _ => {}
+            }
+        }
+        for &l in &changed {
+            self.unrelease(l);
+        }
+        for l in back {
+            self.reacquire(l);
+        }
+        let due = |l: char| self.retry.get(&l).is_none_or(|r| now >= r.0);
+        for d in &present {
+            let known = indexed.iter().any(|(l, _)| *l == d.letter);
+            if !known && !self.released.contains_key(&d.letter) && due(d.letter) && !changed.contains(&d.letter) {
+                changed.push(d.letter);
+            }
+        }
+        for &(l, serial) in &indexed {
             match present.iter().find(|d| d.letter == l) {
                 None => changed.push(l),
-                Some(_) if self.released.contains(&l) => {}
-                // another stick under the same letter
-                Some(d) if walked && d.serial != serial => changed.push(l),
+                Some(_) if self.released.contains_key(&l) => {}
+                // another disk under the same letter
+                Some(d) if !walk::same_volume(d.serial, serial) => changed.push(l),
+                // could not be scanned last time: its turn again
+                Some(_) if self.retry.contains_key(&l) && due(l) => changed.push(l),
                 Some(_) => {}
             }
         }
         if changed.is_empty() {
-            return Ok(());
+            return;
         }
-        changed.sort();
+        changed.sort_unstable();
+        changed.dedup();
         self.log(format!("drives changed: {}", letters_text(&changed)));
-        self.rescan(&changed)?;
-        self.follow_all();
-        Ok(())
+        self.rescan(&changed);
     }
 
     /// Walks drives without a journal again when it is their turn, and
     /// rebuilds only if the walk found a change. Small drives (a USB stick)
     /// are walked every minute, big ones less often.
-    fn walk_due(&mut self) -> Result<(), String> {
+    fn walk_due(&mut self) {
         if self.last_change.elapsed() < Duration::from_secs(5) {
-            return Ok(()); // the PC is busy writing files: later
+            return; // the PC is busy writing files: later
         }
         let due: Vec<char> = self
             .walks
@@ -1163,16 +1372,25 @@ impl Worker {
             .collect();
         for letter in due {
             let Some(d) = walk::drives().into_iter().find(|d| d.letter == letter) else { continue };
+            if self.released.contains_key(&letter) || self.retry.contains_key(&letter) {
+                continue;
+            }
             let before = self.walks.get(&letter).map(|w| w.2);
             let _bg = Background::begin();
             let s = match self.scan(&d) {
                 Ok(s) => s,
                 Err(e) => {
                     self.log(e);
+                    // not again at once: at its usual interval
+                    if let Some(w) = self.walks.get_mut(&letter) {
+                        w.0 = Instant::now();
+                    }
                     continue;
                 }
             };
-            if before == Some(walk::fingerprint(&s)) {
+            // a journal turned on since is followed from now on
+            let journal = s.journal_id != WALKED;
+            if !journal && before == Some(walk::fingerprint(&s)) {
                 continue;
             }
             let t = Instant::now();
@@ -1181,13 +1399,16 @@ impl Worker {
                 let idx = guard.as_ref().expect("index");
                 self.pool.install(|| idx.rebuild(vec![s], &[]))
             };
-            *self.shared.index.write() = Some(rebuilt);
+            self.set_index(rebuilt);
             let open_before = self.open_by_letter();
             self.reopen();
             for v in 0..self.vols.len() {
                 if let Some(o) = open_before.get(&self.letter(v)) {
                     self.open[v] = o.clone();
                 }
+            }
+            if journal {
+                self.follow_all();
             }
             self.dirty = true;
             self.last_change = Instant::now();
@@ -1197,7 +1418,6 @@ impl Worker {
             }
             self.log(format!("{letter}: changes found, index updated in {} ms", t.elapsed().as_millis()));
         }
-        Ok(())
     }
 
     fn build_fresh(&mut self) -> Result<NameIndex, String> {
@@ -1230,6 +1450,18 @@ impl Worker {
         ));
         Ok(idx)
     }
+}
+
+/// How long to wait before trying a drive again after `tries` failed scans.
+fn retry_wait(tries: u32) -> Duration {
+    RETRY_FIRST.saturating_mul(1 << tries.saturating_sub(1).min(16)).min(RETRY_MAX)
+}
+
+/// True when a journal of `max` bytes moved from `saved` to `now` by more
+/// than SAVE_AT_JOURNAL_SHARE of its size.
+fn moved_far(saved: i64, now: i64, max: f64) -> bool {
+    let moved = (now - saved).max(0) as f64;
+    max > 0.0 && moved > max * SAVE_AT_JOURNAL_SHARE
 }
 
 /// "C: D:"
@@ -1320,5 +1552,23 @@ mod tests {
         assert!(validate_exclusions(&["Windows".into()]).is_err());
         assert!(validate_exclusions(&[r"\\server\share".into()]).is_err());
         assert!(validate_exclusions(&[String::new()]).is_err());
+    }
+
+    #[test]
+    fn a_failing_drive_is_tried_less_and_less_often() {
+        assert_eq!(retry_wait(1), RETRY_FIRST);
+        assert_eq!(retry_wait(2), RETRY_FIRST * 2);
+        assert_eq!(retry_wait(3), RETRY_FIRST * 4);
+        assert_eq!(retry_wait(40), RETRY_MAX);
+        assert!(retry_wait(1) > DRIVE_CHECK);
+    }
+
+    #[test]
+    fn a_save_is_due_when_the_journal_moved_far_since_the_last_one() {
+        assert!(!moved_far(1000, 1000 + 100, 1000.0));
+        assert!(moved_far(1000, 1000 + 300, 1000.0));
+        // a walked drive has no journal size
+        assert!(!moved_far(0, 1 << 40, 0.0));
+        assert!(!moved_far(5000, 10, 1000.0));
     }
 }

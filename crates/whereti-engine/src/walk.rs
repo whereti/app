@@ -181,6 +181,12 @@ fn walk_tree(root: &str) -> io::Result<MftScan> {
     Ok(scan)
 }
 
+/// Two serial numbers of the same volume. An MFT scan keeps NTFS's 64-bit
+/// serial, `drives()` the 32-bit one Windows shows, which is its low half.
+pub fn same_volume(a: u64, b: u64) -> bool {
+    a as u32 == b as u32
+}
+
 /// A fingerprint of a walk: equal fingerprints mean nothing changed, so the
 /// index is left alone.
 pub fn fingerprint(scan: &VolumeScan) -> u64 {
@@ -232,7 +238,15 @@ mod tests {
     }
 
     #[test]
-    fn a_change_changes_the_fingerprint() {        let root = tree("change");
+    fn serials_of_one_volume_match_in_both_sizes() {
+        assert!(same_volume(0x1122_3344_5566_7788, 0x5566_7788));
+        assert!(same_volume(0x5566_7788, 0x5566_7788));
+        assert!(!same_volume(0x1122_3344_5566_7788, 0x5566_7789));
+    }
+
+    #[test]
+    fn a_change_changes_the_fingerprint() {
+        let root = tree("change");
         let walk = |p: &std::path::Path| VolumeScan {
             letter: 'E',
             serial: 1,

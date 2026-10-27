@@ -11,7 +11,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -55,8 +55,12 @@ pub struct Activity {
     changed: AtomicBool,
     /// Seeded from the index's dates already (once, when nothing was learnt).
     seeded: AtomicBool,
-    /// Per entry: 0-8, for `search_ranked`; and when it was built, for which length.
-    ranking: RwLock<(Arc<Vec<u8>>, Option<Instant>, usize)>,
+    /// Per entry: 0-8, for `search_ranked`; when it was built, and for which
+    /// index (`generation`, length).
+    ranking: RwLock<(Arc<Vec<u8>>, Option<Instant>, (u64, usize))>,
+    /// Counts the indexes swapped in: a rebuilt index numbers its entries
+    /// anew, even when it has as many.
+    generation: AtomicU64,
 }
 
 fn now_minutes() -> u32 {
@@ -97,7 +101,8 @@ impl Activity {
             folders: Mutex::new(folders),
             changed: AtomicBool::new(true),
             seeded: AtomicBool::new(false),
-            ranking: RwLock::new((Arc::new(Vec::new()), None, 0)),
+            ranking: RwLock::new((Arc::new(Vec::new()), None, (0, 0))),
+            generation: AtomicU64::new(0),
         }
     }
 
@@ -212,10 +217,13 @@ impl Activity {
             return Arc::new(Vec::new());
         }
         self.seed(idx);
+        // read before the vector is built: an index swapped in meanwhile
+        // makes this one stale at once
+        let made_for = (self.generation.load(Ordering::SeqCst), idx.len());
         {
             let r = self.ranking.read();
             let fresh = r.1.is_some_and(|t| t.elapsed() < REBUILD_EVERY) || !self.changed.load(Ordering::Relaxed);
-            if r.2 == idx.len() && fresh && r.1.is_some() {
+            if r.2 == made_for && fresh && r.1.is_some() {
                 return r.0.clone();
             }
         }
@@ -245,9 +253,15 @@ impl Activity {
             }
         }
         let vec = Arc::new(vec);
-        *self.ranking.write() = (vec.clone(), Some(Instant::now()), idx.len());
+        *self.ranking.write() = (vec.clone(), Some(Instant::now()), made_for);
         self.changed.store(false, Ordering::Relaxed);
         vec
+    }
+
+    /// A new index was swapped in (call while holding its write lock): the
+    /// ranking, kept by entry number, is built again for it.
+    pub fn index_replaced(&self) {
+        self.generation.fetch_add(1, Ordering::SeqCst);
     }
 
     /// Writes what was learnt (with the index, and when the service stops).

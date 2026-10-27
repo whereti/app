@@ -128,6 +128,11 @@ pub fn read_since(info: &VolumeInfo, vol: &Volume, open: &mut HashSet<u64>) -> R
     if info.next_usn < j.first_usn {
         return Ok(JournalRead::Rescan("too many changes: the journal was overwritten"));
     }
+    if info.next_usn > j.next_usn {
+        // same journal, but the index is ahead of it: the disk was restored
+        // (a VM snapshot, a disk image) and what happened since is unknown
+        return Ok(JournalRead::Rescan("the journal is behind the index (the disk was restored)"));
+    }
     let mut pos = info.next_usn;
     let mut buf = Vec::new();
     let mut batch = Batch::default();
@@ -160,13 +165,15 @@ pub fn scan_volume(letter: char, threads: usize) -> Result<Option<VolumeScan>, S
     // Journal position BEFORE the scan: replay starts here (PLAN.md §4.1).
     let journal = vol.query_usn_journal().ok();
     let scan = mft::scan(&vol, threads).map_err(|e| format!("{letter}: scan failed: {e}"))?;
-    Ok(Some(VolumeScan {
-        letter,
-        serial: vol.ntfs.volume_serial_number as u64,
-        journal_id: journal.map(|j| j.usn_journal_id).unwrap_or(0),
-        next_usn: journal.map(|j| j.next_usn).unwrap_or(0),
-        scan,
-    }))
+    let (journal_id, next_usn) = journal_position(journal.map(|j| (j.usn_journal_id, j.next_usn)));
+    Ok(Some(VolumeScan { letter, serial: vol.ntfs.volume_serial_number as u64, journal_id, next_usn, scan }))
+}
+
+/// Where replay starts for a scanned volume. Without an active journal there
+/// is nothing to follow: the volume is scanned again now and then, like a
+/// walked drive, and no journal is created on the user's disk.
+fn journal_position(journal: Option<(u64, i64)>) -> (u64, i64) {
+    journal.unwrap_or((crate::walk::WALKED, 0))
 }
 
 /// Scans any drive: through the MFT when it is NTFS, else by walking its
@@ -224,6 +231,9 @@ pub fn fixed_drives() -> Vec<char> {
 /// named by letter: their order in the index changes when drives come and go.
 pub struct JournalMsg {
     pub letter: char,
+    /// The journal the reader follows: a message about a journal the index
+    /// no longer follows (the drive was rescanned, or is another disk) is dropped.
+    pub journal_id: u64,
     pub changes: Vec<UsnChange>,
     pub next: i64,
     pub error: Option<String>,
@@ -245,7 +255,7 @@ pub fn follow_journal<M: From<JournalMsg> + Send + 'static>(
     let vol = match Volume::open(letter, false) {
         Ok(vol) => vol,
         Err(e) => {
-            let _ = tx.send(JournalMsg { letter, changes: Vec::new(), next: pos, error: Some(e.to_string()) }.into());
+            let _ = tx.send(JournalMsg { letter, journal_id, changes: Vec::new(), next: pos, error: Some(e.to_string()) }.into());
             return;
         }
     };
@@ -267,16 +277,27 @@ pub fn follow_journal<M: From<JournalMsg> + Send + 'static>(
                 }
                 pos = next.max(pos);
                 if !changes.is_empty()
-                    && tx.send(JournalMsg { letter, changes, next: pos, error: None }.into()).is_err()
+                    && tx.send(JournalMsg { letter, journal_id, changes, next: pos, error: None }.into()).is_err()
                 {
                     return;
                 }
             }
             Err(e) => {
                 let msg = format!("{letter}: journal: {e}");
-                let _ = tx.send(JournalMsg { letter, changes: Vec::new(), next: pos, error: Some(msg) }.into());
+                let _ = tx.send(JournalMsg { letter, journal_id, changes: Vec::new(), next: pos, error: Some(msg) }.into());
                 return;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_volume_without_a_journal_is_scanned_again_like_a_walked_drive() {
+        assert_eq!(journal_position(None), (crate::walk::WALKED, 0));
+        assert_eq!(journal_position(Some((7, 4096))), (7, 4096));
     }
 }
