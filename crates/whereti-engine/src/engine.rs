@@ -616,6 +616,7 @@ impl Worker {
         // Without an index nothing works: try again, less and less often,
         // serving whatever index we have meanwhile.
         let mut wait = RETRY_FIRST;
+        let mut exclusions = None;
         while let Err(e) = self.startup() {
             self.log(format!("error: {e}; tried again in {} s", wait.as_secs()));
             self.shared.set_state(format!("error: {e}"));
@@ -624,11 +625,16 @@ impl Worker {
                 match rx.recv_timeout(left) {
                     Ok(Msg::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
                     Ok(Msg::Release(letter, reply)) => self.release(letter, reply),
+                    // applied once there is an index
+                    Ok(Msg::Reconfigure(paths)) => exclusions = Some(paths),
                     Ok(_) => {}
                     Err(mpsc::RecvTimeoutError::Timeout) => break,
                 }
             }
             wait = (wait * 2).min(RETRY_MAX);
+        }
+        if let Some(paths) = exclusions {
+            let _ = self.tx.send(Msg::Reconfigure(paths));
         }
         let mut stopping = false;
         while !stopping {
@@ -1363,10 +1369,12 @@ impl Worker {
             match present.iter().find(|d| d.letter == l) {
                 None => changed.push(l),
                 Some(_) if self.released.contains_key(&l) => {}
+                // could not be scanned last time: waits its turn
+                Some(_) if !due(l) => {}
                 // another disk under the same letter
                 Some(d) if !walk::same_volume(d.serial, serial) => changed.push(l),
                 // could not be scanned last time: its turn again
-                Some(_) if self.retry.contains_key(&l) && due(l) => changed.push(l),
+                Some(_) if self.retry.contains_key(&l) => changed.push(l),
                 Some(_) => {}
             }
         }
