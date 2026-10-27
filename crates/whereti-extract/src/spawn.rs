@@ -376,8 +376,14 @@ fn worker_desktop() -> io::Result<Vec<u16>> {
     // window station is set back at once. The handles stay open (never
     // closed) so the window station and desktop live as long as we do.
     let station = unsafe {
-        // no name: Windows names it (a name of our own needs more rights)
-        let ws = CreateWindowStationW(std::ptr::null(), 0, GENERIC_ALL, &sa);
+        // no name: Windows names it after the logon session (a name of our
+        // own needs more rights as a user). A service's logon session has
+        // one already, which it may not open like this: then a name of ours.
+        let mut ws = CreateWindowStationW(std::ptr::null(), 0, GENERIC_ALL, &sa);
+        if ws.is_null() {
+            let own: Vec<u16> = format!("whereti-reader-{}", std::process::id()).encode_utf16().chain([0]).collect();
+            ws = CreateWindowStationW(own.as_ptr(), 0, GENERIC_ALL, &sa);
+        }
         if ws.is_null() {
             return Err(os_error("window station"));
         }
