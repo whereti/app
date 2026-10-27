@@ -421,3 +421,31 @@ fn compact_index_survives_a_snapshot_round_trip() {
     assert_same(&loaded, &m, "after reload");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn a_change_in_a_folder_the_rules_leave_out_needs_no_rescan() {
+    let mut m = Model::new(5);
+    let dir = |p: u64, n: &str| Rec { is_dir: true, size: 0, modified: 0, attrs: 0, links: vec![(p, n.into())] };
+    m.recs.insert(400, dir(DOCS, "Catalog.lrdata"));
+    m.recs.insert(401, Rec { is_dir: false, size: 1, modified: 0, attrs: 0, links: vec![(400, "preview.db".into())] });
+    m.recs.insert(402, dir(24, "Local"));
+    m.recs.insert(403, dir(402, "Browser"));
+    m.recs.insert(404, dir(403, "Cache"));
+    let mut e = exclusions();
+    e.paths.push(r"**\*.lrdata".into());
+    e.paths.push(r"**\AppData\Local\*\Cache".into());
+    let mut idx = build(vec![VolumeScan { letter: 'C', serial: 1, journal_id: 1, next_usn: 0, scan: m.scan() }], &e).0;
+    assert!(hits(&idx, "preview").is_empty());
+    // the left-out folders change (their dates move), nothing is created
+    for r in [400, 404] {
+        m.recs.get_mut(&r).unwrap().modified += MINUTE;
+    }
+    let s = idx.apply(0, &[400, 404], &HashSet::new(), &mut m).unwrap();
+    assert!(!s.needs_rescan, "a left-out folder is not one come in from elsewhere");
+    assert!(hits(&idx, "lrdata").is_empty());
+    assert!(hits(&idx, "cache").is_empty());
+    // a folder of the same name somewhere the rule does not reach still asks
+    m.recs.get_mut(&404).unwrap().links[0] = (PROIECTE, "Cache".into());
+    let s = idx.apply(0, &[404], &HashSet::new(), &mut m).unwrap();
+    assert!(s.needs_rescan);
+}

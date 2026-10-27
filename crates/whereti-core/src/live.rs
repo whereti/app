@@ -20,7 +20,7 @@ use whereti_ntfs::mft::{MftEntry, MftScan};
 use whereti_query::fold;
 
 use crate::build::{
-    attr_flags, build, compute_dir_order, ext_id, filetime_to_minutes, place_flags, Exclusions, VolumeScan,
+    attr_flags, build, compute_dir_order, ext_id, filetime_to_minutes, place_flags, Exclusions, Smart, VolumeScan,
 };
 use crate::index::*;
 
@@ -92,7 +92,9 @@ impl NameIndex {
     ) -> io::Result<ApplyStats> {
         let mut stats = ApplyStats::default();
         let mut pass = Pass::default();
-        let rules = Exclusions { paths: self.exclusions.clone() }.for_volume(self.volumes[vol].letter());
+        let exclusions = Exclusions { paths: self.exclusions.clone() };
+        let rules = exclusions.for_volume(self.volumes[vol].letter());
+        let smart: Vec<Smart> = exclusions.smart().into_iter().map(|(_, s)| s).collect();
         let mut ext_ids: HashMap<String, u16> =
             self.exts.iter().enumerate().map(|(i, e)| (e.clone(), i as u16)).collect();
 
@@ -122,7 +124,7 @@ impl NameIndex {
             let (now, later) = if now.is_empty() { (later, Vec::new()) } else { (now, later) };
             for r in now {
                 let st = states[&r].clone();
-                self.apply_record(vol, r, st, created.contains(&r), &rules, &mut ext_ids, &mut stats, &mut pass);
+                self.apply_record(vol, r, st, created.contains(&r), &rules, &smart, &mut ext_ids, &mut stats, &mut pass);
                 stats.records += 1;
             }
             pending = later;
@@ -149,6 +151,7 @@ impl NameIndex {
         state: Option<RecordState>,
         created: bool,
         rules: &[Vec<String>],
+        smart: &[Smart],
         ext_ids: &mut HashMap<String, u16>,
         stats: &mut ApplyStats,
         pass: &mut Pass,
@@ -180,7 +183,13 @@ impl NameIndex {
             .links
             .iter()
             .map(|(p, name)| {
-                let pe = self.live_dir(vol, *p).filter(|&pe| !self.is_excluded_child(pe, name, rules));
+                let pe = self
+                    .live_dir(vol, *p)
+                    .filter(|&pe| !self.is_excluded_child(pe, name, rules))
+                    // a folder not in the index that the build leaves out
+                    // (a `target` beside Cargo.toml, a browser cache): it
+                    // stays out; it is not a folder come in from elsewhere
+                    .filter(|&pe| !(st.is_dir && existing.is_empty() && self.smart_excludes(pe, name, smart)));
                 (pe, name.as_str())
             })
             .collect();
@@ -252,6 +261,67 @@ impl NameIndex {
             Some(p) => !detached && self.parent[e as usize] == p,
         };
         place_ok && self.name(e) == name
+    }
+
+    /// True when a folder `name` in `parent` is left out by one of the rules
+    /// that look around a folder, as the build decides it. Project files
+    /// beside it and markers inside it are looked up on disk.
+    fn smart_excludes(&self, parent: u32, name: &str, smart: &[Smart]) -> bool {
+        if smart.is_empty() {
+            return false;
+        }
+        let name = fold(name);
+        // the names of the folders above, nearest first (the drive's root not included)
+        let above = |n: usize| -> Vec<String> {
+            let mut out = Vec::new();
+            let mut cur = parent;
+            while out.len() < n && self.flags[cur as usize] & FLAG_ROOT == 0 {
+                out.push(fold(self.name(cur)));
+                match self.parent(cur) {
+                    Some(p) => cur = p,
+                    None => break,
+                }
+            }
+            out
+        };
+        // `comps` ends with this folder; `*` matches any one folder
+        let tail = |comps: &[String]| -> bool {
+            let Some((last, up)) = comps.split_last() else { return false };
+            if *last != name {
+                return false;
+            }
+            let have = above(up.len());
+            have.len() == up.len() && up.iter().rev().zip(&have).all(|(c, h)| c == "*" || c == h)
+        };
+        let dir = || {
+            let p = self.full_path(parent);
+            std::path::PathBuf::from(if p.ends_with('\\') { p } else { p + "\\" })
+        };
+        smart.iter().any(|s| match s {
+            Smart::Suffix(sfx) => name.ends_with(sfx.as_str()) && name.len() > sfx.len(),
+            Smart::Tail(comps) => tail(comps),
+            Smart::Under { anchor, tail: comps } => {
+                tail(comps) && above(4096).iter().skip(comps.len() - 1).any(|a| a == anchor)
+            }
+            Smart::Beside { name: want, manifests } => {
+                *want == name
+                    && std::fs::read_dir(dir()).is_ok_and(|entries| {
+                        entries.take(100_000).flatten().any(|e| {
+                            let f = fold(&e.file_name().to_string_lossy());
+                            manifests.iter().any(|m| match m.strip_prefix('*') {
+                                Some(ext) => f.ends_with(ext) && f.len() > ext.len(),
+                                None => f == *m,
+                            })
+                        })
+                    })
+            }
+            Smart::Marker(m) => {
+                let mut p = dir();
+                p.push(&*name);
+                p.push(m);
+                std::fs::symlink_metadata(p).is_ok()
+            }
+        })
     }
 
     /// True when `parent\name` is one of the exclusion paths.

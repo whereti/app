@@ -226,4 +226,15 @@ pub const ENTRIES: &[Entry] = &[
         pt_br: "Cada um é baixado uma vez, do Hugging Face, e funciona só no seu PC. Os dois ficam em Configurações, Pesquisa.",
         ro: "Fiecare se descarcă o singură dată, de pe Hugging Face, și lucrează doar pe PC-ul tău. Le găsești oricând în Setări, Căutare.",
     },
+    Entry {
+        en: "The first reading takes a while: from minutes to a few hours, depending on how many documents you have. It happens only once; after that only new or changed ones are read.",
+        note: "Welcome page, small line under the three steps while the documents are first read, so the user is not worried by a long wait.",
+        de: "Das erste Lesen dauert eine Weile: von Minuten bis zu einigen Stunden, je nachdem, wie viele Dokumente Sie haben. Es geschieht nur einmal; danach werden nur neue oder geänderte gelesen.",
+        es: "La primera lectura tarda un poco: de minutos a unas horas, según cuántos documentos tengas. Ocurre una sola vez; después solo se leen los nuevos o modificados.",
+        fr: "La première lecture prend du temps : de quelques minutes à quelques heures, selon le nombre de vos documents. Elle n'a lieu qu'une fois ; ensuite, seuls les nouveaux ou les modifiés sont lus.",
+        it: "La prima lettura richiede un po' di tempo: da minuti a qualche ora, secondo quanti documenti hai. Avviene una sola volta; poi si leggono solo quelli nuovi o modificati.",
+        pl: "Pierwsze czytanie trochę trwa: od minut do kilku godzin, zależnie od liczby dokumentów. Dzieje się tylko raz; potem czytane są tylko nowe lub zmienione.",
+        pt_br: "A primeira leitura leva um tempo: de minutos a algumas horas, conforme quantos documentos você tem. Acontece só uma vez; depois, só os novos ou alterados são lidos.",
+        ro: "Prima citire durează: de la câteva minute la câteva ore, după câte documente ai. Se face o singură dată; apoi se citesc doar cele noi sau schimbate.",
+    },
 ];

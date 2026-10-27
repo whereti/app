@@ -193,6 +193,8 @@ pub struct CpuMeter {
 
 impl CpuMeter {
     pub fn new() -> CpuMeter {
+        // join the job now, before the readers start, so they are counted
+        family_cpu_100ns();
         CpuMeter { last: None }
     }
 
@@ -205,7 +207,7 @@ impl CpuMeter {
             return 0.0;
         }
         // kernel time includes idle time; all in 100 ns units
-        let now = (ft(idle), ft(kernel) + ft(user), process_cpu_ms() * 10_000);
+        let now = (ft(idle), ft(kernel) + ft(user), family_cpu_100ns());
         let Some(prev) = self.last.replace(now) else { return 0.0 };
         let total = now.1.saturating_sub(prev.1);
         if total == 0 {
@@ -215,6 +217,45 @@ impl CpuMeter {
         let ours = now.2.saturating_sub(prev.2);
         busy.saturating_sub(ours) as f32 / total as f32
     }
+}
+
+/// The CPU time of this process and of every process it started (the
+/// document readers, the image and meaning models), in 100 ns units: they
+/// are our work, not the user's, so they must not make us pause.
+fn family_cpu_100ns() -> u64 {
+    use std::sync::OnceLock;
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectBasicAccountingInformation, QueryInformationJobObject,
+        JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+    };
+    // One job holding this process: what it starts joins it, and its count
+    // keeps the time of those that have ended. It sets no limits.
+    static FAMILY: OnceLock<usize> = OnceLock::new();
+    let job = *FAMILY.get_or_init(|| unsafe {
+        // SAFETY: a new unnamed job; the handle is kept for the process's life.
+        let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        if job.is_null() || AssignProcessToJobObject(job, GetCurrentProcess()) == 0 {
+            return 0;
+        }
+        job as usize
+    });
+    if job != 0 {
+        // SAFETY: valid job handle and an out-structure of its size.
+        unsafe {
+            let mut info: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = std::mem::zeroed();
+            let ok = QueryInformationJobObject(
+                job as _,
+                JobObjectBasicAccountingInformation,
+                &mut info as *mut _ as *mut _,
+                std::mem::size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                std::ptr::null_mut(),
+            );
+            if ok != 0 {
+                return (info.TotalUserTime + info.TotalKernelTime) as u64;
+            }
+        }
+    }
+    process_cpu_ms() * 10_000
 }
 
 impl Default for CpuMeter {
@@ -250,4 +291,22 @@ pub fn maintenance_pool() -> rayon::ThreadPool {
         .start_handler(|_| std::mem::forget(Background::begin()))
         .build()
         .expect("maintenance pool")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_child_s_cpu_counts_as_ours() {
+        let before = family_cpu_100ns();
+        // a child that keeps one core busy for about a second
+        let ok = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command", "$t=[Diagnostics.Stopwatch]::StartNew(); while($t.ElapsedMilliseconds -lt 1000){}"])
+            .status()
+            .is_ok_and(|s| s.success());
+        assert!(ok);
+        let child_ms = (family_cpu_100ns() - before) / 10_000;
+        assert!(child_ms >= 700, "only {child_ms} ms counted");
+    }
 }

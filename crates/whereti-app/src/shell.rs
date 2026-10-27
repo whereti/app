@@ -153,8 +153,29 @@ pub fn set_autostart(on: bool) -> Result<(), String> {
 /// Appends a line to `%TEMP%\wt-ui-trace.txt` when `WT_UI_TRACE` is set
 /// (diagnostics only; nothing is written otherwise).
 /// (busy, away): a full-screen app or presentation runs / the screen is
-/// locked or the screen saver is on.
+/// locked, the screen saver is on or nobody has touched the PC for a while.
 pub fn user_state() -> (bool, bool) {
+    let (busy, away) = notification_state();
+    (busy, away || (!busy && idle_for() >= AWAY_AFTER))
+}
+
+/// No key or mouse movement for this long: the user is away.
+const AWAY_AFTER: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// Time since the last key press or mouse movement in this session.
+fn idle_for() -> std::time::Duration {
+    use windows_sys::Win32::System::SystemInformation::GetTickCount;
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
+    let mut info = LASTINPUTINFO { cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32, dwTime: 0 };
+    // SAFETY: an out-structure with its size set.
+    if unsafe { GetLastInputInfo(&mut info) } == 0 {
+        return std::time::Duration::ZERO;
+    }
+    let now = unsafe { GetTickCount() };
+    std::time::Duration::from_millis(now.wrapping_sub(info.dwTime) as u64)
+}
+
+fn notification_state() -> (bool, bool) {
     use windows_sys::Win32::UI::Shell::{
         SHQueryUserNotificationState, QUNS_BUSY, QUNS_NOT_PRESENT, QUNS_PRESENTATION_MODE, QUNS_RUNNING_D3D_FULL_SCREEN,
     };

@@ -120,6 +120,18 @@ pub fn show(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
                         step_row(ui, p, 2, &content_step, tr("Reading the documents"), &content_detail, false);
                         step_row(ui, p, 3, &ready_step, tr("Ready to search"), &ready_detail, true);
                     });
+                // the first reading can be long: say so, and that it is once
+                if !content_ready {
+                    ui.add_space(6.0);
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(tr("The first reading takes a while: from minutes to a few hours, depending on how many documents you have. It happens only once; after that only new or changed ones are read."))
+                                .size(12.5)
+                                .color(p.text3),
+                        )
+                        .wrap(),
+                    );
+                }
                 ui.add_space(10.0);
 
                 // ---- the two optional downloads: offered once, never started unasked
