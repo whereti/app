@@ -148,6 +148,12 @@ pub struct WheretiApp {
     pub(crate) accent: Color32,
     styled_theme: Option<Theme>,
     pub(crate) hwnd: Option<windows::Win32::Foundation::HWND>,
+    /// Started with --hidden and not yet put away: eframe shows the window
+    /// after its first frame whatever it was created as, so it is cloaked
+    /// until hidden again (see `keep_hidden_at_start`).
+    hide_at_start: bool,
+    start_frames: u32,
+    start_shown: bool,
     pub(crate) page: Page,
     pub(crate) settings: SettingsState,
     pub(crate) requests: Arc<Requests>,
@@ -235,6 +241,9 @@ impl WheretiApp {
             focus_search: visible,
             search_id: None,
             visible,
+            hide_at_start: !visible,
+            start_frames: 0,
+            start_shown: false,
             quitting: false,
             tz: shell::tz_offset(),
             accent,
@@ -329,7 +338,39 @@ impl WheretiApp {
         self.message = Some((msg.into(), Instant::now()));
     }
 
+    /// A --hidden start: cloak the window before eframe shows it, hide it,
+    /// and uncloak it once hidden, so it never appears.
+    fn keep_hidden_at_start(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
+        if !self.hide_at_start {
+            return;
+        }
+        let Some(hwnd) = self.hwnd.or_else(|| crate::win::hwnd(frame)) else {
+            ctx.request_repaint();
+            return;
+        };
+        self.hwnd = Some(hwnd);
+        crate::win::cloak(hwnd, true);
+        self.start_frames += 1;
+        if crate::win::is_shown(hwnd) {
+            self.start_shown = true;
+            ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+            ctx.request_repaint();
+        } else if self.start_shown || self.start_frames > 30 {
+            // shown once by eframe and hidden again (or it never showed it)
+            crate::win::cloak(hwnd, false);
+            self.hide_at_start = false;
+        } else {
+            ctx.request_repaint();
+        }
+    }
+
     fn show(&mut self, ctx: &egui::Context) {
+        if self.hide_at_start {
+            self.hide_at_start = false;
+            if let Some(hwnd) = self.hwnd {
+                crate::win::cloak(hwnd, false);
+            }
+        }
         ctx.send_viewport_cmd(ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
         ctx.send_viewport_cmd(ViewportCommand::Focus);
@@ -1990,7 +2031,8 @@ impl WheretiApp {
 
 impl eframe::App for WheretiApp {
     /// Runs even while the window is hidden (tray, hotkey, second launch).
-    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        self.keep_hidden_at_start(ctx, frame);
         if Requests::take(&self.requests.quit) {
             self.quitting = true;
             ctx.send_viewport_cmd(ViewportCommand::Close);

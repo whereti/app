@@ -20,6 +20,23 @@ pub fn hwnd(frame: &eframe::Frame) -> Option<HWND> {
     }
 }
 
+/// Cloaked, a window is drawn nowhere and has no taskbar button, even while
+/// Windows thinks it is shown.
+pub fn cloak(hwnd: HWND, on: bool) {
+    use windows::Win32::Graphics::Dwm::DWMWA_CLOAK;
+    let value = windows::core::BOOL::from(on);
+    // SAFETY: a valid window and a BOOL-sized value, as DWMWA_CLOAK expects.
+    unsafe {
+        let _ = DwmSetWindowAttribute(hwnd, DWMWA_CLOAK, (&value as *const windows::core::BOOL).cast(), std::mem::size_of_val(&value) as u32);
+    }
+}
+
+/// Is the window shown (as Windows sees it, cloaked or not)?
+pub fn is_shown(hwnd: HWND) -> bool {
+    // SAFETY: only reads the window's state.
+    unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(hwnd).as_bool() }
+}
+
 fn colorref(c: Color32) -> COLORREF {
     COLORREF(c.r() as u32 | (c.g() as u32) << 8 | (c.b() as u32) << 16)
 }
