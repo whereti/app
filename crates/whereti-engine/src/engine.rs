@@ -17,7 +17,9 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use parking_lot::{Mutex, RwLock};
-use whereti_core::{build, snapshot, ApplyStats, Exclusions, NameIndex, SearchOptions, SortBy, VolumeScan, DEFAULT_GROUPS};
+use whereti_core::{
+    build, snapshot, ApplyStats, Exclusions, NameIndex, SearchOptions, SearchResults, SortBy, VolumeScan, DEFAULT_GROUPS,
+};
 use whereti_ipc::{
     Caller, ConfigReply, Request, Response, Row, SearchReply, Sort, StatusReply, VolumeStatus, PROTOCOL_VERSION,
 };
@@ -50,7 +52,10 @@ const DUPES_BUDGET: Duration = Duration::from_secs(6);
 const MAX_LIMIT: u32 = 10_000;
 /// Save once the journal has moved this share of its size since the last save,
 /// so a restart can always replay instead of rescanning.
-const SAVE_AT_JOURNAL_SHARE: f64 = 0.25;/// The timers (drive checks, saves, refreshes) are looked at this often.
+const SAVE_AT_JOURNAL_SHARE: f64 = 0.25;
+/// FileInfo looks at the paths of at most this many files of that name.
+const FILE_INFO_CANDIDATES: usize = 20_000;
+/// The timers (drive checks, saves, refreshes) are looked at this often.
 const TIMERS_EVERY: Duration = Duration::from_millis(500);
 /// A drive that could not be scanned is tried again after this, then after
 /// twice as long each time, up to RETRY_MAX.
@@ -290,11 +295,9 @@ impl Engine {
                         positive.iter().flat_map(|c| self.content.entries_with_props(idx, std::slice::from_ref(c))).collect();
                     let wide = SearchOptions { limit: opts.limit + excluded.len().min(10_000), ..opts };
                     let mut res = idx.search_ranked(&rest, &wide, &r.usage, self.shared.activity.ranking(idx));
-                    let before = res.hits.len();
-                    res.hits.retain(|h| !excluded.contains(h));
-                    res.total = res.total.saturating_sub(before - res.hits.len());
-                    res.hits.truncate(opts.limit);
-                    res.close = res.close.min(res.hits.len());
+                    let keep: Vec<bool> = res.hits.iter().map(|h| !excluded.contains(h)).collect();
+                    drop_hits(&mut res, &keep);
+                    cut_hits(&mut res, opts.limit);
                     res
                 } else {
                     let within = self.content.entries_with_props(idx, &prop_clauses);
@@ -308,25 +311,17 @@ impl Engine {
                 let res = loop {
                     let mut res = run(SearchOptions { limit: depth, ..opts });
                     let shown = listable(idx, &res.hits, caller);
-                    let exact = res.hits.len() - res.close;
-                    let gone_exact = shown[..exact].iter().filter(|ok| !**ok).count();
-                    if shown.iter().any(|ok| !ok) {
-                        let gone_close = shown[exact..].iter().filter(|ok| !**ok).count();
-                        let mut keep = shown.iter();
-                        res.hits.retain(|_| *keep.next().unwrap_or(&false));
-                        res.total = res.total.saturating_sub(gone_exact);
-                        res.close -= gone_close;
-                    }
-                    let kept_exact = exact - gone_exact;
+                    let gone_exact = drop_hits(&mut res, &shown);
+                    let kept_exact = res.hits.len() - res.close;
                     let more = res.total > kept_exact && kept_exact < want && depth < want * 16 && depth < 100_000;
                     if !more {
+                        if gone_exact > 0 {
+                            // the matches not looked at may be someone else's
+                            // too: count only those the caller may see
+                            res.total = kept_exact;
+                        }
                         // the exact matches first, the close ones after, `want` in all
-                        let close: Vec<u32> = res.hits[kept_exact..].to_vec();
-                        res.hits.truncate(kept_exact.min(want));
-                        let room = want.saturating_sub(res.hits.len());
-                        let close: Vec<u32> = close.into_iter().take(room).collect();
-                        res.close = close.len();
-                        res.hits.extend(close);
+                        cut_hits(&mut res, want);
                         break res;
                     }
                     depth *= 4;
@@ -358,6 +353,20 @@ impl Engine {
                     None => (Vec::new(), Vec::new()),
                 };
                 let skipped = guard.as_ref().map(|i| i.skipped()).unwrap_or_default();
+                drop(guard);
+                let mut content_folders = self.content.folders();
+                // what is set for everyone, but not other people's folder
+                // names: someone who cannot change it sees only what they may list
+                let (exclusions, skipped) = if caller.is_admin() {
+                    (exclusions, skipped)
+                } else {
+                    let ok = caller_sees(caller, &exclusions);
+                    let exclusions: Vec<String> = exclusions.into_iter().zip(ok).filter_map(|(p, ok)| ok.then_some(p)).collect();
+                    let skipped = skipped.into_iter().filter(|(r, _)| exclusions.contains(r)).collect();
+                    let ok = caller_sees(caller, &content_folders);
+                    content_folders = content_folders.into_iter().zip(ok).filter_map(|(p, ok)| ok.then_some(p)).collect();
+                    (exclusions, skipped)
+                };
                 Response::Config(ConfigReply {
                     volumes,
                     exclusions,
@@ -367,7 +376,7 @@ impl Engine {
                         .iter()
                         .map(|(id, rules)| (id.to_string(), rules.iter().map(|r| r.to_string()).collect()))
                         .collect(),
-                    content_folders: self.content.folders(),
+                    content_folders,
                     default_content_folders: content::default_folders(),
                 })
             }
@@ -417,7 +426,14 @@ impl Engine {
                     let q = whereti_query::Query {
                         clauses: vec![whereti_query::Clause { negated: false, any_of: vec![whereti_query::Term::Text(whereti_query::fold(name))] }],
                     };
-                    idx.matching(&q).into_iter().find(|&e| idx.full_path(e).eq_ignore_ascii_case(&path)).and_then(|e| {
+                    // the whole name first (cheap): a one-letter name is in
+                    // millions of others; then the path of a bounded few
+                    idx.matching(&q)
+                        .into_iter()
+                        .filter(|&e| idx.name(e).eq_ignore_ascii_case(name))
+                        .take(FILE_INFO_CANDIDATES)
+                        .find(|&e| idx.full_path(e).eq_ignore_ascii_case(&path))
+                        .and_then(|e| {
                         let record = idx.records_of(&[e]).into_iter().next().flatten()?;
                         Some(whereti_content::key(idx.volume_of(e).letter(), record))
                     })
@@ -481,7 +497,13 @@ impl Engine {
                     private_bytes: system::process_private_bytes(),
                     last_change_secs: self.shared.last_change.lock().map(|t| t.elapsed().as_secs()),
                     open_files: self.shared.open_files.load(Ordering::Relaxed),
-                    recent_log: self.shared.log.recent(),
+                    // log lines name folders of every account: only an
+                    // administrator sees them whole
+                    recent_log: if caller.is_admin() {
+                        self.shared.log.recent()
+                    } else {
+                        self.shared.log.recent().iter().map(|l| hide_paths(l)).collect()
+                    },
                     content: self.content.status(),
                     // the folders people work in, only those this caller may see
                     work_folders: self.shared.activity.is_on().then(|| {
@@ -1452,6 +1474,44 @@ impl Worker {
     }
 }
 
+/// For each path (`C:\Folder`, or a rule like `\node_modules` that names no
+/// one's folder): may the caller see it?
+fn caller_sees(caller: &dyn Caller, paths: &[String]) -> Vec<bool> {
+    let on_drive: Vec<String> = paths.iter().filter(|p| p.as_bytes().get(1) == Some(&b':')).cloned().collect();
+    let mut ok = caller.can_list(&on_drive).into_iter();
+    paths.iter().map(|p| if p.as_bytes().get(1) == Some(&b':') { ok.next().unwrap_or(false) } else { true }).collect()
+}
+
+/// A log line without the paths in it: "content folders changed: C:\Users\ana"
+/// -> "content folders changed: …".
+fn hide_paths(line: &str) -> String {
+    let Some(slash) = line.find('\\') else { return line.to_string() };
+    // from the start of the word the path begins in ("C:\…", "\\?\…")
+    let start = line[..slash].rfind(' ').map_or(0, |s| s + 1);
+    format!("{}…", &line[..start])
+}
+
+/// Drops the hits where `keep` is false. `total` counts exact matches only,
+/// so it loses the exact ones that go. Returns how many exact ones went.
+fn drop_hits(res: &mut SearchResults, keep: &[bool]) -> usize {
+    let exact = res.hits.len() - res.close;
+    let gone_exact = keep[..exact].iter().filter(|k| !**k).count();
+    let gone_close = keep[exact..].iter().filter(|k| !**k).count();
+    let mut it = keep.iter();
+    res.hits.retain(|_| *it.next().unwrap_or(&false));
+    res.total = res.total.saturating_sub(gone_exact);
+    res.close -= gone_close;
+    gone_exact
+}
+
+/// Keeps the first `limit` hits (the exact ones come first, the close ones
+/// after), and counts the close ones left.
+fn cut_hits(res: &mut SearchResults, limit: usize) {
+    let cut = res.hits.len().saturating_sub(limit);
+    res.hits.truncate(limit);
+    res.close = res.close.saturating_sub(cut);
+}
+
 /// How long to wait before trying a drive again after `tries` failed scans.
 fn retry_wait(tries: u32) -> Duration {
     RETRY_FIRST.saturating_mul(1 << tries.saturating_sub(1).min(16)).min(RETRY_MAX)
@@ -1552,6 +1612,53 @@ mod tests {
         assert!(validate_exclusions(&["Windows".into()]).is_err());
         assert!(validate_exclusions(&[r"\\server\share".into()]).is_err());
         assert!(validate_exclusions(&[String::new()]).is_err());
+    }
+
+    fn results(hits: &[u32], close: usize, total: usize) -> SearchResults {
+        SearchResults { total, hits: hits.to_vec(), warnings: Vec::new(), close }
+    }
+
+    #[test]
+    fn dropped_hits_keep_exact_and_close_ones_apart() {
+        // 4 exact (of 10), 2 close; one exact and one close go
+        let mut r = results(&[1, 2, 3, 4, 5, 6], 2, 10);
+        let gone = drop_hits(&mut r, &[true, false, true, true, true, false]);
+        assert_eq!(gone, 1);
+        assert_eq!(r.hits, [1, 3, 4, 5]);
+        assert_eq!((r.total, r.close), (9, 1));
+        // cut to 3: the close one goes first
+        cut_hits(&mut r, 3);
+        assert_eq!(r.hits, [1, 3, 4]);
+        assert_eq!(r.close, 0);
+        // cut that keeps some close ones: exact hits are never called close
+        let mut r = results(&[1, 2, 3, 4, 5], 3, 2);
+        cut_hits(&mut r, 4);
+        assert_eq!((r.hits.len(), r.close), (4, 2));
+        let mut r = results(&[1, 2, 3], 0, 3);
+        cut_hits(&mut r, 2);
+        assert_eq!((r.hits.len(), r.close), (2, 0));
+    }
+
+    #[test]
+    fn log_lines_lose_their_paths() {
+        assert_eq!(hide_paths(r"12:00  content folders changed by a client: C:\Users\ana · D:\Work"), "12:00  content folders changed by a client: …");
+        assert_eq!(hide_paths(r"exclusions changed: \node_modules"), "exclusions changed: …");
+        assert_eq!(hide_paths("C: D: rescanned in 5 ms"), "C: D: rescanned in 5 ms");
+    }
+
+    #[test]
+    fn only_folders_the_caller_may_list_are_shown() {
+        struct OnlyD;
+        impl Caller for OnlyD {
+            fn can_read(&self, p: &[String]) -> Vec<bool> {
+                vec![false; p.len()]
+            }
+            fn can_list(&self, dirs: &[String]) -> Vec<bool> {
+                dirs.iter().map(|d| d.starts_with('D')).collect()
+            }
+        }
+        let paths = vec![r"C:\Users\ana".to_string(), r"\node_modules".into(), r"D:\Work".into()];
+        assert_eq!(caller_sees(&OnlyD, &paths), [false, true, true]);
     }
 
     #[test]
