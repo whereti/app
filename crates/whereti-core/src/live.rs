@@ -193,7 +193,7 @@ impl NameIndex {
                     // stays where it is is left as it is until compaction)
                     .filter(|&pe| {
                         let stays = existing.iter().any(|&e| self.parent(e) == Some(pe) && self.name(e) == name);
-                        !(st.is_dir && !stays && self.smart_excludes(pe, name, smart))
+                        !(st.is_dir && !stays && self.smart_excludes(pe, name, smart, existing.is_empty() && !created))
                     });
                 (pe, name.as_str())
             })
@@ -271,7 +271,10 @@ impl NameIndex {
     /// True when a folder `name` in `parent` is left out by one of the rules
     /// that look around a folder, as the build decides it. Project files
     /// beside it and markers inside it are looked up on disk.
-    fn smart_excludes(&self, parent: u32, name: &str, smart: &[Smart]) -> bool {
+    /// `unseen`: the folder is not in the index at all. A `target` (or `bin`,
+    /// `obj`…) never seen was left out by the build beside its project file,
+    /// which may be gone by now (a project being deleted): no disk check then.
+    fn smart_excludes(&self, parent: u32, name: &str, smart: &[Smart], unseen: bool) -> bool {
         if smart.is_empty() {
             return false;
         }
@@ -311,7 +314,7 @@ impl NameIndex {
             }
             Smart::Beside { name: want, manifests } => {
                 *want == name
-                    && std::fs::read_dir(dir()).is_ok_and(|entries| {
+                    && (unseen || std::fs::read_dir(dir()).is_ok_and(|entries| {
                         entries.take(100_000).flatten().any(|e| {
                             let f = fold(&e.file_name().to_string_lossy());
                             manifests.iter().any(|m| match m.strip_prefix('*') {
@@ -319,7 +322,7 @@ impl NameIndex {
                                 None => f == *m,
                             })
                         })
-                    })
+                    }))
             }
             Smart::Marker(m) => {
                 let mut p = dir();

@@ -464,3 +464,27 @@ fn a_folder_renamed_into_a_left_out_name_leaves_the_index() {
     assert!(!s.needs_rescan);
     assert!(hits(&idx, "inside").is_empty(), "as a fresh build would");
 }
+
+#[test]
+fn a_build_folder_left_out_stays_out_while_its_project_is_deleted() {
+    let mut m = Model::new(8);
+    // a project on disk only in the model: its Cargo.toml is not on the real disk,
+    // so only the index tells the folder was left out
+    m.recs.insert(420, Rec { is_dir: true, size: 0, modified: 0, attrs: 0, links: vec![(PROIECTE, "app".into())] });
+    m.recs.insert(421, Rec { is_dir: false, size: 1, modified: 0, attrs: 0, links: vec![(420, "Cargo.toml".into())] });
+    m.recs.insert(422, Rec { is_dir: true, size: 0, modified: 0, attrs: 0, links: vec![(420, "target".into())] });
+    m.recs.insert(423, Rec { is_dir: false, size: 1, modified: 0, attrs: 0, links: vec![(422, "app.exe".into())] });
+    let mut e = exclusions();
+    e.paths.push(r"**\target <Cargo.toml>".into());
+    let mut idx = build(vec![VolumeScan { letter: 'C', serial: 1, journal_id: 1, next_usn: 0, scan: m.scan() }], &e).0;
+    assert!(hits(&idx, "app.exe").is_empty());
+    // Cargo.toml goes first, then target changes as it is emptied
+    m.recs.remove(&421);
+    m.recs.get_mut(&422).unwrap().modified += MINUTE;
+    let s = idx.apply(0, &[421, 422], &HashSet::new(), &mut m).unwrap();
+    assert!(!s.needs_rescan);
+    // a new folder of that name, made now, is the user's: indexed
+    m.recs.insert(424, Rec { is_dir: true, size: 0, modified: 0, attrs: 0, links: vec![(DOCS, "target".into())] });
+    idx.apply(0, &[424], &HashSet::from([424]), &mut m).unwrap();
+    assert_eq!(hits(&idx, "target").len(), 1);
+}
