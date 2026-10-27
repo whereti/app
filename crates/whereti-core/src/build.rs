@@ -1,6 +1,6 @@
 //! Builds the compact index from MFT scans, applying exclusions (PLAN.md §5).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use rayon::prelude::*;
 use whereti_ntfs::mft::MftScan;
@@ -34,6 +34,15 @@ pub(crate) const ANY_DEPTH: &str = "**";
 /// Paths left out of the name index. `C:\Windows` applies to drive C only;
 /// `\System Volume Information` (no letter) applies to every volume;
 /// `**\node_modules` leaves out every `node_modules`, at any depth.
+///
+/// Folders that are generated can also be told by what is around them, so
+/// a name that people use too (`build`, `target`, `Library`) is left out only
+/// where a tool made it:
+/// - `**\go\pkg\mod`: that path, ending anywhere;
+/// - `**\*.lrdata`: folders whose name ends so;
+/// - `**\target <Cargo.toml>`: `target` beside a `Cargo.toml` (`|` between
+///   several, `*.csproj` for any of a kind);
+/// - `**\<CACHEDIR.TAG>`: a folder holding that file or folder.
 #[derive(Debug, Clone, Default)]
 pub struct Exclusions {
     pub paths: Vec<String>,
@@ -55,13 +64,189 @@ pub const GENERATED_DIRS: &[&str] = &[
     ".terraform", ".serverless",
 ];
 
+/// The folders left out by default because they are generated, in groups
+/// the app shows (and lets people take back) in Settings, Search. Only rules
+/// that cannot catch a person's own folder: a tool's marker, a build folder
+/// next to its project file, a tool's own path or a name no one else uses.
+pub const DEFAULT_GROUPS: &[(&str, &[&str])] = &[
+    (
+        // what programmers' tools generate
+        "dev",
+        &[
+            r"**\target <Cargo.toml>",
+            r"**\build <build.gradle|build.gradle.kts|settings.gradle|CMakeLists.txt|pubspec.yaml|meson.build>",
+            r"**\bin <*.csproj|*.fsproj|*.vbproj|*.vcxproj>",
+            r"**\obj <*.csproj|*.fsproj|*.vbproj|*.vcxproj>",
+            r"**\dist <package.json|pyproject.toml|setup.py>",
+            r"**\.output <package.json>",
+            r"**\out <package.json>",
+            r"**\vendor <go.mod|composer.json|Gemfile>",
+            r"**\Pods <Podfile>",
+            r"**\.build <Package.swift>",
+            r"**\_build <mix.exs|dune-project>",
+            r"**\deps <mix.exs>",
+            r"**\zig-cache <build.zig>",
+            r"**\.zig-cache <build.zig>",
+        ],
+    ),
+    (
+        // caches and environments that mark themselves, and toolchains'
+        // download stores
+        "caches",
+        &[
+            r"**\<CACHEDIR.TAG>",
+            r"**\<pyvenv.cfg>",
+            r"**\<conda-meta>",
+            r"**\go\pkg\mod",
+            r"**\AppData\Local\go-build",
+            r"**\.cargo\registry",
+            r"**\.cargo\git",
+            r"**\.rustup\toolchains",
+            r"**\AppData\Local\pip\cache",
+            r"**\AppData\Local\npm-cache",
+            r"**\AppData\Local\Yarn\Cache",
+            r"**\AppData\Local\pnpm\store",
+            r"**\AppData\Local\NuGet\v3-cache",
+            r"**\AppData\Local\ms-playwright",
+            r"**\AppData\Local\electron\Cache",
+            r"**\.android\cache",
+            r"**\.vscode\extensions",
+            r"**\.cursor\extensions",
+        ],
+    ),
+    (
+        // previews and render caches of photo, video and audio programs
+        "media",
+        &[
+            r"**\*.lrdata",
+            r"**\Adobe\Common\Media Cache Files",
+            r"**\Adobe\Common\Media Cache",
+            r"**\Adobe Premiere Pro Video Previews",
+            r"**\Adobe Premiere Pro Audio Previews",
+            r"**\Adobe After Effects Disk Cache",
+            r"**\CacheClip",
+            r"**\CaptureOne\Cache",
+        ],
+    ),
+    (
+        // what game engines generate inside a project
+        "games",
+        &[
+            r"**\Library <ProjectSettings>",
+            r"**\Temp <ProjectSettings>",
+            r"**\Intermediate <*.uproject|*.uplugin>",
+            r"**\DerivedDataCache <*.uproject>",
+            r"**\.godot <project.godot>",
+        ],
+    ),
+];
+
+/// A rule that looks around a folder, not only at its path (see `Exclusions`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Smart {
+    /// Folded components; the last one is the folder.
+    Tail(Vec<String>),
+    /// Folded name ending, with its dot (`.lrdata`).
+    Suffix(String),
+    /// A folder `name` beside one of `manifests` (folded; `*.ext` = any of a kind).
+    Beside { name: String, manifests: Vec<String> },
+    /// A folder holding a file or folder with this folded name.
+    Marker(String),
+}
+
+impl Smart {
+    /// Parses the text after `**\`. `None` for a plain name (or nonsense).
+    pub(crate) fn parse(rest: &str) -> Option<Smart> {
+        let rest = rest.trim();
+        if let Some(marker) = rest.strip_prefix('<').and_then(|r| r.strip_suffix('>')) {
+            let m = marker.trim();
+            return (!m.is_empty() && !m.contains(['\\', '*', '|'])).then(|| Smart::Marker(fold(m)));
+        }
+        if let Some((name, list)) = rest.split_once(" <") {
+            let list = list.strip_suffix('>')?;
+            let manifests: Vec<String> = list.split('|').map(str::trim).filter(|m| !m.is_empty()).map(fold).collect();
+            let name = name.trim();
+            let ok = !name.is_empty()
+                && !name.contains(['\\', '*'])
+                && !manifests.is_empty()
+                && manifests.iter().all(|m| !m.contains('\\') && (!m.contains('*') || (m.starts_with("*.") && m.len() > 2 && !m[1..].contains('*'))));
+            return ok.then(|| Smart::Beside { name: fold(name), manifests });
+        }
+        if let Some(suffix) = rest.strip_prefix('*') {
+            let ok = suffix.starts_with('.') && suffix.len() > 1 && !suffix.contains(['\\', '*', '<']);
+            return ok.then(|| Smart::Suffix(fold(suffix)));
+        }
+        if rest.contains('\\') {
+            let comps: Vec<String> = rest.split('\\').map(str::trim).map(fold).collect();
+            let ok = comps.len() >= 2 && comps.iter().all(|c| !c.is_empty() && !c.contains(['*', '<', '>']));
+            return ok.then_some(Smart::Tail(comps));
+        }
+        None
+    }
+}
+
+/// A folded name test that allocates only for non-ASCII names.
+fn name_is(name: &str, folded_target: &str, buf: &mut String) -> bool {
+    if name.is_ascii() {
+        name.eq_ignore_ascii_case(folded_target)
+    } else {
+        buf.clear();
+        whereti_query::fold_into(name, buf);
+        buf == folded_target
+    }
+}
+
+/// `name` folded into `buf` (ASCII lowercased without a second pass).
+fn folded<'a>(name: &str, buf: &'a mut String) -> &'a str {
+    buf.clear();
+    if name.is_ascii() {
+        buf.extend(name.chars().map(|c| c.to_ascii_lowercase()));
+    } else {
+        whereti_query::fold_into(name, buf);
+    }
+    buf.as_str()
+}
+
 impl Exclusions {
     /// The defaults from PLAN.md §5. `windows_dir` is `%SystemRoot%`
     /// (e.g. `C:\Windows`); pass `None` to keep it in the index.
     pub fn defaults(windows_dir: Option<&str>) -> Self {
         let mut e = Self::system_defaults(windows_dir);
         e.paths.extend(GENERATED_DIRS.iter().map(|d| format!("**\\{d}")));
+        e.paths.extend(Self::group_rules());
         e
+    }
+
+    /// Every rule of `DEFAULT_GROUPS`, in order.
+    pub fn group_rules() -> Vec<String> {
+        DEFAULT_GROUPS.iter().flat_map(|(_, rules)| rules.iter().map(|r| r.to_string())).collect()
+    }
+
+    /// The defaults of whereti 0.0.2 to 0.9.2: system paths and generated
+    /// folder names, without `DEFAULT_GROUPS`.
+    pub fn defaults_v2(windows_dir: Option<&str>) -> Self {
+        let mut e = Self::system_defaults(windows_dir);
+        e.paths.extend(GENERATED_DIRS.iter().map(|d| format!("**\\{d}")));
+        e
+    }
+
+    /// Whether `rule` is one whereti understands (a path or a `**\` rule).
+    pub fn is_valid_any_depth(rule: &str) -> bool {
+        match rule.strip_prefix("**\\") {
+            Some(rest) if !rest.is_empty() => {
+                Smart::parse(rest).is_some() || !rest.contains(['\\', '*', '<', '>', '|'])
+            }
+            _ => false,
+        }
+    }
+
+    /// The rules that look around a folder, with their place in `paths`.
+    pub(crate) fn smart(&self) -> Vec<(usize, Smart)> {
+        self.paths
+            .iter()
+            .enumerate()
+            .filter_map(|(i, p)| p.replace('/', "\\").strip_prefix("**\\").and_then(Smart::parse).map(|s| (i, s)))
+            .collect()
     }
 
     /// The defaults before generated folders were left out (whereti ≤ 0.0.1
@@ -91,13 +276,19 @@ impl Exclusions {
 
     /// Rules for one volume, each as folded path components.
     /// `**\name` rules come out as `["**", name]`: that name anywhere.
+    /// The rules that look around a folder are not here (see `smart`).
     pub(crate) fn for_volume(&self, letter: char) -> Vec<Vec<String>> {
+        self.for_volume_ids(letter).into_iter().map(|(_, r)| r).collect()
+    }
+
+    /// `for_volume`, each rule with its place in `paths`.
+    pub(crate) fn for_volume_ids(&self, letter: char) -> Vec<(usize, Vec<String>)> {
         let mut out = Vec::new();
-        for p in &self.paths {
+        for (id, p) in self.paths.iter().enumerate() {
             let p = p.replace('/', "\\");
             if let Some(name) = p.strip_prefix("**\\") {
-                if !name.is_empty() && !name.contains('\\') {
-                    out.push(vec![ANY_DEPTH.to_string(), fold(name)]);
+                if !name.is_empty() && !name.contains(['\\', '*', '<', '>', '|']) {
+                    out.push((id, vec![ANY_DEPTH.to_string(), fold(name)]));
                 }
                 continue;
             }
@@ -109,7 +300,7 @@ impl Exclusions {
             };
             let comps: Vec<String> = rest.split('\\').filter(|c| !c.is_empty()).map(fold).collect();
             if !comps.is_empty() {
-                out.push(comps);
+                out.push((id, comps));
             }
         }
         out
@@ -133,9 +324,11 @@ pub fn build(volumes: Vec<VolumeScan>, exclusions: &Exclusions) -> (NameIndex, B
     };
     let mut ext_ids: HashMap<String, u16> = HashMap::new();
     let mut stats = BuildStats::default();
+    let mut counts = vec![0u64; exclusions.paths.len()];
     for vs in volumes {
-        add_volume(&mut idx, &mut ext_ids, vs, exclusions, &mut stats);
+        add_volume(&mut idx, &mut ext_ids, vs, exclusions, &mut stats, &mut counts);
     }
+    idx.skipped = crate::index::SkipCounts(exclusions.paths.iter().cloned().zip(counts).collect());
     idx.name_rank = compute_name_rank(&idx);
     idx.dir_order = compute_dir_order(&idx);
     mark_noise(&mut idx);
@@ -149,6 +342,7 @@ fn add_volume(
     vs: VolumeScan,
     exclusions: &Exclusions,
     stats: &mut BuildStats,
+    counts: &mut [u64],
 ) {
     let scan = &vs.scan;
     let n = scan.entries.len();
@@ -168,36 +362,99 @@ fn add_volume(
     };
     let root = if (ROOT_RECORD as usize) < max_rec { rec_first[ROOT_RECORD as usize] } else { NO_PARENT };
 
-    // 1. Seeds: NTFS metadata files and resolved exclusion paths.
+    // 1. Seeds: NTFS metadata files and resolved exclusion paths. `rule`
+    // remembers which exclusion left an entry out (its place + 1), for the
+    // counts Settings shows.
     let mut state = vec![0u8; n]; // 0 = unknown, 1 = excluded, 2 = kept
+    let mut rule = vec![0u32; n];
     for (i, e) in scan.entries.iter().enumerate() {
         if e.record < FIRST_USER_RECORD && e.record != ROOT_RECORD {
             state[i] = 1;
         }
     }
+    let seed = |state: &mut [u8], rule: &mut [u32], i: usize, id: usize| {
+        if i as u32 != root && state[i] != 1 {
+            state[i] = 1;
+            rule[i] = id as u32 + 1;
+        }
+    };
     let rules = vs_rules(exclusions, vs.letter);
-    let (anywhere, paths): (Vec<_>, Vec<_>) = rules.into_iter().partition(|r| r[0] == ANY_DEPTH);
+    let (anywhere, paths): (Vec<_>, Vec<_>) = rules.into_iter().partition(|(_, r)| r[0] == ANY_DEPTH);
     if root != NO_PARENT {
         state[root as usize] = 2;
-        for i in resolve_paths(scan, root, &paths, &parent_of) {
-            state[i as usize] = 1;
+        for (i, id) in resolve_paths(scan, root, &paths, &parent_of) {
+            seed(&mut state, &mut rule, i as usize, id);
         }
     }
     // `**\name`: every file or folder with that name, at any depth.
     if !anywhere.is_empty() {
-        let names: Vec<&str> = anywhere.iter().map(|r| r[1].as_str()).collect();
         let mut folded = String::new();
         for (i, e) in scan.entries.iter().enumerate() {
             let name = scan.name(e);
-            let hit = if name.is_ascii() {
-                names.iter().any(|n| n.eq_ignore_ascii_case(name))
-            } else {
-                folded.clear();
-                whereti_query::fold_into(name, &mut folded);
-                names.contains(&folded.as_str())
-            };
-            if hit && i as u32 != root {
-                state[i] = 1;
+            if let Some((id, _)) = anywhere.iter().find(|(_, r)| name_is(name, &r[1], &mut folded)) {
+                seed(&mut state, &mut rule, i, *id);
+            }
+        }
+    }
+    // Rules that look around a folder.
+    let smart = exclusions.smart();
+    if !smart.is_empty() {
+        let mut buf = String::new();
+        let mut up = String::new();
+        // folders holding a marker, and the project files beside each folder
+        let mut beside: HashSet<(u32, usize)> = HashSet::new();
+        for (i, e) in scan.entries.iter().enumerate() {
+            let p = parent_of(i);
+            if p == NO_PARENT {
+                continue;
+            }
+            let name = folded(scan.name(e), &mut buf);
+            for (k, (id, s)) in smart.iter().enumerate() {
+                match s {
+                    Smart::Marker(m) if name == m => seed(&mut state, &mut rule, p as usize, *id),
+                    Smart::Beside { manifests, .. } => {
+                        let hit = manifests.iter().any(|m| match m.strip_prefix('*') {
+                            Some(ext) => name.ends_with(ext) && name.len() > ext.len(),
+                            None => name == m,
+                        });
+                        if hit {
+                            beside.insert((p, k));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        for (i, e) in scan.entries.iter().enumerate() {
+            if !e.is_dir {
+                continue;
+            }
+            let p = parent_of(i);
+            let name = folded(scan.name(e), &mut buf).to_string();
+            for (k, (id, s)) in smart.iter().enumerate() {
+                let hit = match s {
+                    Smart::Suffix(sfx) => name.ends_with(sfx.as_str()) && name.len() > sfx.len(),
+                    Smart::Beside { name: want, .. } => p != NO_PARENT && name == *want && beside.contains(&(p, k)),
+                    Smart::Tail(comps) => {
+                        name == comps[comps.len() - 1] && {
+                            // the folders above, nearest first, must match too
+                            let mut cur = p;
+                            comps[..comps.len() - 1].iter().rev().all(|c| {
+                                if cur == NO_PARENT || cur == root {
+                                    return false;
+                                }
+                                let ok = folded(scan.name(&scan.entries[cur as usize]), &mut up) == c;
+                                cur = parent_of(cur as usize);
+                                ok
+                            })
+                        }
+                    }
+                    Smart::Marker(_) => false,
+                };
+                if hit {
+                    seed(&mut state, &mut rule, i, *id);
+                    break;
+                }
             }
         }
     }
@@ -209,19 +466,27 @@ fn add_volume(
         }
         chain.clear();
         let mut cur = i as u32;
-        let decided = loop {
+        let (decided, by) = loop {
             if state[cur as usize] != 0 {
-                break state[cur as usize];
+                break (state[cur as usize], rule[cur as usize]);
             }
             chain.push(cur);
             let p = parent_of(cur as usize);
             if p == NO_PARENT || p == cur || chain.len() > 4096 {
-                break 2; // orphan or cycle: keep it
+                break (2, 0); // orphan or cycle: keep it
             }
             cur = p;
         };
         for &c in &chain {
             state[c as usize] = decided;
+            rule[c as usize] = by;
+        }
+    }
+    for i in 0..n {
+        if state[i] == 1 && rule[i] > 0 {
+            if let Some(c) = counts.get_mut(rule[i] as usize - 1) {
+                *c += 1;
+            }
         }
     }
 
@@ -316,17 +581,17 @@ fn add_volume(
     });
 }
 
-fn vs_rules(exclusions: &Exclusions, letter: char) -> Vec<Vec<String>> {
-    exclusions.for_volume(letter)
+fn vs_rules(exclusions: &Exclusions, letter: char) -> Vec<(usize, Vec<String>)> {
+    exclusions.for_volume_ids(letter)
 }
 
 /// Finds the entries named by exclusion rules, one tree level per pass.
 fn resolve_paths(
     scan: &MftScan,
     root: u32,
-    rules: &[Vec<String>],
+    rules: &[(usize, Vec<String>)],
     parent_of: &dyn Fn(usize) -> u32,
-) -> Vec<u32> {
+) -> Vec<(u32, usize)> {
     let mut found = Vec::new();
     // (rule, depth reached) -> entry matched so far
     let mut frontier: Vec<(usize, u32)> = (0..rules.len()).map(|r| (r, root)).collect();
@@ -343,9 +608,10 @@ fn resolve_paths(
             folded.clear();
             whereti_query::fold_into(scan.name(e), &mut folded);
             for &r in rs {
-                if rules[r][depth] == folded {
-                    if depth + 1 == rules[r].len() {
-                        found.push(i as u32);
+                let (id, comps) = &rules[r];
+                if comps[depth] == folded {
+                    if depth + 1 == comps.len() {
+                        found.push((i as u32, *id));
                     } else if e.is_dir {
                         next.push((r, i as u32));
                     }

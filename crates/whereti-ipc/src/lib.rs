@@ -106,6 +106,13 @@ pub struct ConfigReply {
     pub exclusions: Vec<String>,
     /// The exclusions a fresh install uses.
     pub default_exclusions: Vec<String>,
+    /// How many files and folders each exclusion left out at the last build.
+    #[serde(default)]
+    pub skipped: Vec<(String, u64)>,
+    /// The generated-folder rules by group (id, rules), which Settings lets
+    /// people take back a group at a time.
+    #[serde(default)]
+    pub groups: Vec<(String, Vec<String>)>,
     /// Folders indexed by content.
     pub content_folders: Vec<String>,
     pub default_content_folders: Vec<String>,

@@ -17,7 +17,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use parking_lot::{Mutex, RwLock};
-use whereti_core::{build, snapshot, ApplyStats, Exclusions, NameIndex, SearchOptions, SortBy, VolumeScan};
+use whereti_core::{build, snapshot, ApplyStats, Exclusions, NameIndex, SearchOptions, SortBy, VolumeScan, DEFAULT_GROUPS};
 use whereti_ipc::{
     Caller, ConfigReply, Request, Response, Row, SearchReply, Sort, StatusReply, VolumeStatus, PROTOCOL_VERSION,
 };
@@ -300,10 +300,16 @@ impl Engine {
                     Some(idx) => (idx.volumes().iter().map(|v| v.letter()).collect(), idx.exclusions().to_vec()),
                     None => (Vec::new(), Vec::new()),
                 };
+                let skipped = guard.as_ref().map(|i| i.skipped().to_vec()).unwrap_or_default();
                 Response::Config(ConfigReply {
                     volumes,
                     exclusions,
                     default_exclusions: default_exclusions(false),
+                    skipped,
+                    groups: DEFAULT_GROUPS
+                        .iter()
+                        .map(|(id, rules)| (id.to_string(), rules.iter().map(|r| r.to_string()).collect()))
+                        .collect(),
                     content_folders: self.content.folders(),
                     default_content_folders: content::default_folders(),
                 })
@@ -555,13 +561,14 @@ impl Worker {
         let t = Instant::now();
         self.shared.set_state("loading");
         let index = match snapshot::load(&self.cfg.index_path) {
-            Ok(idx) => {
+            Ok(mut idx) => {
                 self.log(format!(
                     "loaded {} entries from {} in {} ms",
                     idx.len(),
                     self.cfg.index_path.display(),
                     t.elapsed().as_millis()
                 ));
+                idx.set_skipped(load_skipped(&self.cfg.index_path));
                 idx
             }
             Err(e) => {
@@ -579,6 +586,17 @@ impl Worker {
             Exclusions::previous_defaults(windows.as_deref()).paths.iter().map(|p| p.to_lowercase()).collect();
         let has: HashSet<String> = index.exclusions().iter().map(|p| p.to_lowercase()).collect();
         let upgrade_defaults = has == old;
+        // Once per install (whereti 0.9.3): the generated folders told by
+        // what is around them join the exclusions, next to whatever the user
+        // set. Taken back in Settings, they stay out of it.
+        let groups_marker = self.cfg.index_path.with_extension("defaults");
+        let add_groups: Vec<String> = if upgrade_defaults || groups_marker.exists() {
+            Vec::new()
+        } else {
+            Exclusions::group_rules().into_iter().filter(|r| !has.contains(&r.to_lowercase())).collect()
+        };
+        let mut with_groups = index.exclusions().to_vec();
+        with_groups.extend(add_groups.iter().cloned());
         // Drives that are gone (an external disk unplugged while the PC was
         // off) leave the index; drives that are new get scanned below.
         let present = walk::drives();
@@ -626,7 +644,14 @@ impl Worker {
         if upgrade_defaults {
             self.log("default exclusions updated: generated folders (node_modules, .git, caches…) are left out");
             self.reconfigure(default_exclusions(self.cfg.include_windows))?;
+        } else if !add_groups.is_empty() {
+            self.log(format!(
+                "default exclusions updated: {} rules for build folders, tool caches and media caches are added",
+                add_groups.len()
+            ));
+            self.reconfigure(with_groups)?;
         }
+        let _ = std::fs::write(&groups_marker, "3\n");
         Ok(())
     }
 
@@ -797,7 +822,9 @@ impl Worker {
         }
         let size = {
             let guard = self.shared.index.read();
-            snapshot::save(guard.as_ref().expect("index"), &self.cfg.index_path)
+            let idx = guard.as_ref().expect("index");
+            save_skipped(&self.cfg.index_path, idx.skipped());
+            snapshot::save(idx, &self.cfg.index_path)
                 .map_err(|e| format!("cannot save {}: {e}", self.cfg.index_path.display()))?
         };
         self.shared.activity.save();
@@ -1157,6 +1184,27 @@ fn system_drive() -> char {
 }
 
 /// The exclusions of a fresh install (PLAN.md §5).
+/// What each exclusion left out, kept beside the index (`<index>.skipped`,
+/// one `count<TAB>rule` per line): an index loaded from disk does not carry it.
+fn save_skipped(index_path: &std::path::Path, counts: &[(String, u64)]) {
+    if counts.is_empty() {
+        return;
+    }
+    let text: String = counts.iter().map(|(r, n)| format!("{n}\t{r}\n")).collect();
+    let _ = std::fs::write(index_path.with_extension("skipped"), text);
+}
+
+fn load_skipped(index_path: &std::path::Path) -> Vec<(String, u64)> {
+    std::fs::read_to_string(index_path.with_extension("skipped"))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| {
+            let (n, r) = l.split_once('\t')?;
+            Some((r.to_string(), n.parse().ok()?))
+        })
+        .collect()
+}
+
 fn default_exclusions(include_windows: bool) -> Vec<String> {
     let windows = (!include_windows).then(|| std::env::var("SystemRoot").ok()).flatten();
     Exclusions::defaults(windows.as_deref()).paths
@@ -1173,7 +1221,7 @@ fn validate_exclusions(paths: &[String]) -> Result<Vec<String>, String> {
         let p = p.trim().replace('/', "\\");
         let p = p.trim_end_matches(SEP as char).to_string();
         let b = p.as_bytes();
-        let any_depth = p.strip_prefix("**\\").is_some_and(|n| !n.is_empty() && !n.contains('\\'));
+        let any_depth = Exclusions::is_valid_any_depth(&p);
         let ok = p.len() < 1024
             && (any_depth
                 || (b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == SEP)

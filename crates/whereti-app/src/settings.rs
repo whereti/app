@@ -583,18 +583,54 @@ fn search(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
                 }
             }
         }
+        ui.add_space(12.0);
+        line(ui, p);
+        // generated folders, a group at a time: on = left out
+        let groups: Vec<(String, Vec<String>)> = app.settings.config.as_ref().map(|c| c.groups.clone()).unwrap_or_default();
+        let skipped: Vec<(String, u64)> = app.settings.config.as_ref().map(|c| c.skipped.clone()).unwrap_or_default();
+        for (id, rules) in &groups {
+            let Some((title, desc)) = group_text(id) else { continue };
+            let has = |list: &[String], r: &String| list.iter().any(|x| x.eq_ignore_ascii_case(r));
+            let mut on = rules.iter().all(|r| has(&app.settings.exclusions, r));
+            let left_out: u64 = skipped
+                .iter()
+                .filter(|(r, _)| rules.iter().any(|g| g.eq_ignore_ascii_case(r)))
+                .map(|(_, n)| *n)
+                .sum();
+            let status = if !on {
+                tr("Searched, like any folder.").to_string()
+            } else if left_out > 0 {
+                crate::trn!("{n} file or folder left out|{n} files and folders left out", left_out)
+            } else {
+                tr("Left out when there are any.").to_string()
+            };
+            let text = format!("{desc} {status}");
+            row(ui, p, title, &text, |ui| {
+                if toggle(ui, p, &mut on, title).clicked() {
+                    if on {
+                        for r in rules {
+                            if !has(&app.settings.exclusions, r) {
+                                app.settings.exclusions.push(r.clone());
+                            }
+                        }
+                    } else {
+                        app.settings.exclusions.retain(|x| !rules.iter().any(|r| r.eq_ignore_ascii_case(x)));
+                    }
+                    changed = true;
+                }
+            });
+        }
         if changed {
             // applied at once: the service rebuilds its index in a few seconds
             app.searcher.set_exclusions(app.settings.exclusions.clone());
         }
-        ui.add_space(12.0);
         line(ui, p);
         ui.add_space(10.0);
         ui.horizontal_wrapped(|ui| {
             let (r, _) = ui.allocate_exact_size(Vec2::new(16.0, 16.0), Sense::hover());
             crate::icons::paint(ui.painter(), r, crate::icons::Icon::Lock, p.text3);
             ui.label(
-                egui::RichText::new(tr("Windows, program files and temporary or cache folders are skipped automatically."))
+                egui::RichText::new(tr("Windows itself, the Recycle Bin and folders like node_modules or .git are always left out. Program files and temporary folders are searched, but come last."))
                 .size(12.0)
                 .color(p.text3),
             );
@@ -1111,6 +1147,26 @@ pub(crate) fn photo_tags_line(state: &str) -> Option<String> {
         return Some(crate::trf!("Could not download the model: {e}", e = e.trim()));
     }
     (state == "on").then(|| tr("On. Photos are read in the background, like documents.").to_string())
+}
+
+/// The title and the description of a group of generated folders.
+fn group_text(id: &str) -> Option<(&'static str, &'static str)> {
+    Some(match id {
+        "dev" => (
+            tr("Build folders of programming projects"),
+            tr("Folders like target, bin or dist, only next to the project file of the tool that rebuilds them."),
+        ),
+        "caches" => (
+            tr("Tool caches and environments"),
+            tr("Caches that mark themselves, Python environments, and the package stores of Go, Rust, npm and others."),
+        ),
+        "media" => (
+            tr("Photo and video previews"),
+            tr("Lightroom previews and the render caches of Premiere, After Effects and DaVinci Resolve."),
+        ),
+        "games" => (tr("Game engine caches"), tr("What Unity, Unreal and Godot generate inside a project.")),
+        _ => return None,
+    })
 }
 
 /// Title and description on the left, the control on the right.

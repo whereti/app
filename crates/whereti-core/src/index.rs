@@ -62,6 +62,19 @@ impl VolumeInfo {
     }
 }
 
+/// How many entries each exclusion rule left out at the last build, by rule
+/// text. Kept in memory only (the service saves it beside the index); it
+/// never makes two indexes different.
+#[derive(Debug, Default, Clone)]
+pub struct SkipCounts(pub Vec<(String, u64)>);
+
+impl PartialEq for SkipCounts {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+impl Eq for SkipCounts {}
+
 /// All indexed names of all volumes.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct NameIndex {
@@ -97,6 +110,8 @@ pub struct NameIndex {
     pub(crate) links: HashMap<u32, Vec<u32>>,
     /// Exclusion paths the index was built with.
     pub(crate) exclusions: Vec<String>,
+    /// What each of them left out at the last build.
+    pub(crate) skipped: SkipCounts,
 
     // ---- live overlay (empty in a compact index) ----
     /// Names of renamed / added entries.
@@ -129,6 +144,17 @@ impl NameIndex {
 
     pub fn exclusions(&self) -> &[String] {
         &self.exclusions
+    }
+
+    /// What each exclusion left out at the last build (empty for an index
+    /// loaded from disk until `set_skipped`).
+    pub fn skipped(&self) -> &[(String, u64)] {
+        &self.skipped.0
+    }
+
+    /// The counts saved beside an index loaded from disk.
+    pub fn set_skipped(&mut self, counts: Vec<(String, u64)>) {
+        self.skipped = SkipCounts(counts);
     }
 
     /// True when there is no live-update overlay to fold in.

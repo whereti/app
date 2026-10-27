@@ -483,3 +483,93 @@ fn files_a_program_makes_are_not_work() {
     let work: Vec<&str> = (0..idx.len() as u32).filter(|&i| idx.is_work_file(i)).map(|i| idx.name(i)).collect();
     assert_eq!(work, ["Plan.docx", "main.rs"]);
 }
+
+#[test]
+fn generated_folders_are_told_by_what_is_around_them() {
+    let c = scan(vec![
+        d(5, 5, "."),
+        // Rust: target beside Cargo.toml goes; a "target" of one's own stays
+        d(20, 5, "proj"),
+        f(21, 20, "Cargo.toml"),
+        d(22, 20, "target"),
+        d(23, 22, "debug"),
+        f(24, 23, "gone_app.exe"),
+        d(25, 5, "sales"),
+        d(26, 25, "target"),
+        f(27, 26, "keep_target_2026.xlsx"),
+        // a cache that marks itself
+        d(30, 5, "blobs"),
+        f(31, 30, "CACHEDIR.TAG"),
+        f(32, 30, "gone_blob.bin"),
+        // Go's module store, and Go code of one's own
+        d(40, 5, "go"),
+        d(41, 40, "pkg"),
+        d(42, 41, "mod"),
+        f(43, 42, "gone_mod.go"),
+        d(44, 40, "src"),
+        f(45, 44, "keep_main.go"),
+        // Lightroom previews beside the catalog
+        d(50, 5, "Pictures"),
+        f(51, 50, "keep_Catalog.lrcat"),
+        d(52, 50, "Catalog Previews.lrdata"),
+        f(53, 52, "gone_preview.lrprev"),
+        // .NET: bin beside a project file; a bin of one's own stays
+        d(60, 5, "app"),
+        f(61, 60, "App.csproj"),
+        d(62, 60, "bin"),
+        f(63, 62, "gone_App.dll"),
+        d(64, 5, "tools"),
+        d(65, 64, "bin"),
+        f(66, 65, "keep_tool.exe"),
+        // Unity: Library inside a project; a Library of books stays
+        d(70, 5, "game"),
+        d(71, 70, "ProjectSettings"),
+        d(72, 70, "Library"),
+        f(73, 72, "gone_asset.bin"),
+        d(74, 5, "Library"),
+        f(75, 74, "keep_book.pdf"),
+    ]);
+    let vols = vec![VolumeScan { letter: 'E', serial: 3, journal_id: 1, next_usn: 1, scan: c }];
+    let ex = Exclusions::defaults(None);
+    let idx = build(vols, &ex).0;
+    assert_eq!(find(&idx, "gone_"), Vec::<String>::new());
+    let mut kept = find(&idx, "keep_");
+    kept.sort();
+    assert_eq!(
+        kept,
+        [
+            r"E:\Library\keep_book.pdf",
+            r"E:\Pictures\keep_Catalog.lrcat",
+            r"E:\go\src\keep_main.go",
+            r"E:\sales\target\keep_target_2026.xlsx",
+            r"E:\tools\bin\keep_tool.exe",
+        ]
+    );
+    // what each rule left out, for Settings: target, debug and the program
+    let count = |rule: &str| idx.skipped().iter().find(|(r, _)| r == rule).map(|(_, n)| *n);
+    assert_eq!(count(r"**\target <Cargo.toml>"), Some(3));
+    assert_eq!(count(r"**\<CACHEDIR.TAG>"), Some(3));
+    assert_eq!(count(r"**\go\pkg\mod"), Some(2));
+    assert_eq!(count(r"**\*.lrdata"), Some(2));
+}
+
+#[test]
+fn rules_that_look_around_parse_strictly() {
+    use crate::build::Smart;
+    assert_eq!(Smart::parse("<CACHEDIR.TAG>"), Some(Smart::Marker("cachedir.tag".into())));
+    assert_eq!(Smart::parse("*.lrdata"), Some(Smart::Suffix(".lrdata".into())));
+    assert_eq!(Smart::parse(r"go\pkg\mod"), Some(Smart::Tail(vec!["go".into(), "pkg".into(), "mod".into()])));
+    assert_eq!(
+        Smart::parse("bin <*.csproj|App.sln>"),
+        Some(Smart::Beside { name: "bin".into(), manifests: vec!["*.csproj".into(), "app.sln".into()] })
+    );
+    for bad in ["node_modules", "*", "*lrdata", "<>", "bin <>", "bin <a*b>", r"a\\b", r"a\*", "<a|b>"] {
+        assert_eq!(Smart::parse(bad), None, "{bad}");
+    }
+    for ok in [r"**\node_modules", r"**\<pyvenv.cfg>", r"**\target <Cargo.toml>", r"**\go\pkg\mod"] {
+        assert!(Exclusions::is_valid_any_depth(ok), "{ok}");
+    }
+    for bad in [r"**\", r"**\a*b", r"**\bin <>"] {
+        assert!(!Exclusions::is_valid_any_depth(bad), "{bad}");
+    }
+}
