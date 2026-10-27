@@ -142,6 +142,13 @@ impl Vectors {
         }
     }
 
+    /// Keeps only the documents `keep` says yes to.
+    pub fn retain(&mut self, keep: impl Fn(u64) -> bool) {
+        let before = self.map.len();
+        self.map.retain(|k, _| keep(*k));
+        self.dirty |= self.map.len() != before;
+    }
+
     pub fn clear(&mut self) {
         self.map.clear();
         self.dirty = true;

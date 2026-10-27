@@ -628,6 +628,13 @@ impl PropStore {
         }
     }
 
+    /// Keeps only the files `keep` says yes to.
+    pub fn retain(&mut self, keep: impl Fn(u64) -> bool) {
+        let before = self.map.len();
+        self.map.retain(|k, _| keep(*k));
+        self.dirty |= self.map.len() != before;
+    }
+
     /// Writes `props.txt` if anything changed.
     pub fn save(&mut self) {
         if !self.dirty {

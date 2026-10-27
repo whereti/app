@@ -29,7 +29,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use parking_lot::{Condvar, Mutex, RwLock};
@@ -78,11 +78,33 @@ const BUSY_CPU: f32 = 0.70;
 /// How often a paused indexer looks again.
 const PAUSE_CHECK: Duration = Duration::from_secs(5);
 
-/// Content hits considered per search, before filters.
+/// Content hits considered per search, before filters; deeper (up to
+/// `MAX_SEARCH_DEPTH`) while filters and permissions leave too few.
 const SEARCH_DEPTH: usize = 500;
+const MAX_SEARCH_DEPTH: usize = 20_000;
+/// Rounds started by changes seen in the journal: at most this often (a
+/// file written all the time, such as a game's settings, would otherwise
+/// plan a round every check).
+const DIRTY_GAP: Duration = Duration::from_secs(60);
+/// A model that failed (search by meaning, photo tags) is tried again
+/// after this long, with one small question first.
+const MODEL_RETRY: Duration = Duration::from_secs(60 * 60);
+/// Properties and vectors are written at most this often while indexing
+/// (and at the end of a round, before a pause and at stop). Lost ones are
+/// read again: they are kept per file.
+const SIDE_SAVE_EVERY: Duration = Duration::from_secs(5 * 60);
+/// A CPU busy for this long (a program at idle priority, a miner) no
+/// longer stops the indexing: it goes on, slowly.
+const BUSY_MAX: Duration = Duration::from_secs(15 * 60);
+/// How many recent hints are kept (one per user session, every 5 s).
+const HINTS_KEPT: usize = 16;
+/// Opening the content index failed: tried again this often.
+const REOPEN_EVERY: Duration = Duration::from_secs(60);
 
 pub struct Content {
-    index: Option<ContentIndex>,
+    /// Set once the index is open (it is opened again later when it could
+    /// not be at start).
+    index: OnceLock<ContentIndex>,
     status: Mutex<ContentStatus>,
     folders: RwLock<Vec<String>>,
     /// Set to ask for a new round now (folders changed).
@@ -91,14 +113,15 @@ pub struct Content {
     stop: AtomicBool,
     /// A change to a document in the content folders was seen.
     dirty: AtomicBool,
-    /// Keys in the index, as of the last round (to notice deletions).
-    known_keys: RwLock<HashSet<u64>>,
+    /// Keys in the index with the size and date indexed, as of the last
+    /// round (to notice deletions and real changes).
+    known_keys: RwLock<HashMap<u64, (u64, u32)>>,
     exts: HashSet<&'static str>,
-    /// Last hint from a user session: (when, busy, away).
-    hint: Mutex<Option<(Instant, bool, bool)>>,
-    /// Content hashes for grouping identical copies: path -> (size,
-    /// modified, hash), so a file is read again only after it changes.
-    hashes: Mutex<HashMap<String, (u64, u32, u64)>>,
+    /// Recent hints from the user sessions: (when, busy, away).
+    hints: Mutex<Vec<(Instant, bool, bool)>>,
+    /// Content hashes for grouping identical copies, so a file is read
+    /// again only after it changes.
+    hashes: HashCache,
     /// The users' Pictures folders, as of the last round (photos there are
     /// read for where they were taken).
     pictures: RwLock<Vec<String>>,
@@ -119,6 +142,23 @@ pub struct Content {
     meaning_state: Mutex<String>,
     vectors: Mutex<crate::meaning::Vectors>,
     model: Mutex<crate::meaning::Model>,
+    /// When the meaning model / the photo model last failed: not used for
+    /// indexing until `MODEL_RETRY` has passed and a question works.
+    meaning_failed: Mutex<Option<Instant>>,
+    tags_failed: Mutex<Option<Instant>>,
+    /// A model download is under way (one at a time).
+    meaning_downloading: AtomicBool,
+    tags_downloading: AtomicBool,
+    /// Music and videos (no text: not counted as documents).
+    media_keys: Mutex<HashSet<u64>>,
+    /// Files whose reading failed once in a way that may pass (a timeout
+    /// on a busy PC): read once more in a later round before it counts.
+    failed_once: Mutex<HashMap<u64, (u64, u32)>>,
+    /// Documents that need the sandbox while it is missing: not planned
+    /// again until it is back.
+    no_sandbox: Mutex<HashMap<u64, (u64, u32)>>,
+    /// A background thread hashes documents to group copies.
+    hashing: Arc<AtomicBool>,
 }
 
 /// The photo model (PLAN.md §55): CLIP ViT-B/32's image half, int8, from
@@ -174,14 +214,17 @@ fn model_ready() -> bool {
 
 impl Content {
     pub fn open(dir: &Path, log: &dyn Fn(String)) -> Arc<Content> {
-        let index = match ContentIndex::open(dir) {
-            Ok(i) => Some(i),
-            Err(e) => {
-                log(format!("content index unavailable ({}): {e}", dir.display()));
-                None
+        let index = OnceLock::new();
+        let mut known = HashMap::new();
+        match ContentIndex::open(dir) {
+            Ok(i) => {
+                // what is indexed already, for changes seen before the first round
+                known = i.known().map(|k| known_sizes(&k)).unwrap_or_default();
+                let _ = index.set(i);
             }
-        };
-        let state = if index.is_some() { "starting" } else { "error: the content index cannot be opened" };
+            Err(e) => log(format!("content index unavailable ({}): {e}; tried again later", dir.display())),
+        }
+        let state = if index.get().is_some() { "starting" } else { "error: the content index cannot be opened" };
         Arc::new(Content {
             index,
             status: Mutex::new(ContentStatus { state: state.into(), ..Default::default() }),
@@ -190,10 +233,10 @@ impl Content {
             wake_cv: Condvar::new(),
             stop: AtomicBool::new(false),
             dirty: AtomicBool::new(false),
-            known_keys: RwLock::new(HashSet::new()),
+            known_keys: RwLock::new(known),
             exts: whereti_extract::extensions().into_iter().collect(),
-            hint: Mutex::new(None),
-            hashes: Mutex::new(HashMap::new()),
+            hints: Mutex::new(Vec::new()),
+            hashes: Arc::new(Mutex::new(HashMap::new())),
             tags_on: AtomicBool::new(std::fs::read_to_string(dir.join("photo-tags.txt")).is_ok_and(|s| s.trim() == "on")),
             tags_state: Mutex::new("off".into()),
             pictures: RwLock::new(picture_folders()),
@@ -204,15 +247,36 @@ impl Content {
             meaning_state: Mutex::new("off".into()),
             vectors: Mutex::new(crate::meaning::Vectors::load(dir)),
             model: Mutex::new(crate::meaning::Model::new()),
+            meaning_failed: Mutex::new(None),
+            tags_failed: Mutex::new(None),
+            meaning_downloading: AtomicBool::new(false),
+            tags_downloading: AtomicBool::new(false),
+            media_keys: Mutex::new(HashSet::new()),
+            failed_once: Mutex::new(HashMap::new()),
+            no_sandbox: Mutex::new(HashMap::new()),
+            hashing: Arc::new(AtomicBool::new(false)),
         })
     }
 
-    pub fn hint(&self, busy: bool, away: bool) {
-        *self.hint.lock() = Some((Instant::now(), busy, away));
+    fn index(&self) -> Option<&ContentIndex> {
+        self.index.get()
     }
 
-    fn recent_hint(&self) -> Option<(bool, bool)> {
-        self.hint.lock().filter(|h| h.0.elapsed() < HINT_VALID).map(|h| (h.1, h.2))
+    /// A hint from one user session (each repeats its own every 5 s; there
+    /// may be several, e.g. a locked one and the one at the screen).
+    pub fn hint(&self, busy: bool, away: bool) {
+        let mut hints = self.hints.lock();
+        hints.retain(|h| h.0.elapsed() < HINT_VALID);
+        if hints.len() >= HINTS_KEPT {
+            hints.remove(0);
+        }
+        hints.push((Instant::now(), busy, away));
+    }
+
+    /// (busy, away) from the recent hints: busy when any session says so
+    /// (a game in full screen), away only when every one does.
+    fn recent_hint(&self) -> (bool, bool) {
+        combine_hints(&self.hints.lock())
     }
 
     /// Why indexing should wait now, if it should (PLAN.md §6.6).
@@ -220,7 +284,7 @@ impl Content {
         if system::on_battery() {
             return Some("battery");
         }
-        if self.recent_hint().is_some_and(|(busy, _)| busy) {
+        if self.recent_hint().0 {
             return Some("fullscreen");
         }
         if cpu.busy() > BUSY_CPU {
@@ -232,7 +296,7 @@ impl Content {
     /// Called after each journal batch with the records it touched: is any
     /// of them a document in the content folders (or one we indexed)?
     pub(crate) fn note_changes(&self, idx: &NameIndex, vol: usize, records: &[u64]) {
-        if self.dirty.load(Ordering::Relaxed) || self.index.is_none() || vol >= idx.volumes().len() {
+        if self.dirty.load(Ordering::Relaxed) || self.index().is_none() || vol >= idx.volumes().len() {
             return;
         }
         // a photo added to Pictures counts too
@@ -245,14 +309,31 @@ impl Content {
             .collect();
         let letter = idx.volumes()[vol].letter();
         let known = self.known_keys.read();
+        let now = system::date_ctx().now;
         for &r in records {
-            if known.contains(&key(letter, r)) {
+            let entry = idx.live_entry_of(vol, r);
+            if let Some(&(size, modified)) = known.get(&key(letter, r)) {
+                if let Some(e) = entry.filter(|&e| !idx.is_dir(e)) {
+                    // the same size and date: only read, renamed or its attributes set
+                    if idx.size(e) == size && idx.modified(e) == modified {
+                        continue;
+                    }
+                    // a mailbox is read again only once its date moved a day on
+                    if is_mailbox(idx.name(e)) && now < modified.saturating_add(MAILBOX_EVERY) {
+                        continue;
+                    }
+                }
+                // changed, or gone: plan again
                 self.dirty.store(true, Ordering::Relaxed);
                 return;
             }
-            let Some(e) = idx.live_entry_of(vol, r) else { continue };
+            let Some(e) = entry else { continue };
             let is_dir = idx.is_dir(e);
             if !is_dir {
+                // hidden, system, cloud-only and noise files are never indexed
+                if idx.flags(e) & SKIP != 0 {
+                    continue;
+                }
                 let name = idx.name(e);
                 let ext = name.rsplit_once('.').map(|(_, x)| x.to_ascii_lowercase()).unwrap_or_default();
                 let photo_or_media = CAMERA_EXTS.contains(&ext.as_str())
@@ -297,6 +378,8 @@ impl Content {
         std::fs::write(self.dir.join("meaning.txt"), if on { "on\n" } else { "off\n" })
             .map_err(|e| format!("cannot save the setting: {e}"))?;
         self.meaning_on.store(on, Ordering::SeqCst);
+        // turned on or off by the user: a model that failed is tried again
+        *self.meaning_failed.lock() = None;
         if on {
             self.ensure_meaning_model();
         } else {
@@ -314,6 +397,50 @@ impl Content {
         self.meaning_on.load(Ordering::SeqCst) && crate::meaning::model_ready()
     }
 
+    /// The meaning model failed (onnxruntime missing, a damaged model, no
+    /// answer): documents are not read for their meaning for a while.
+    fn meaning_failure(&self, e: &str) {
+        *self.meaning_failed.lock() = Some(Instant::now());
+        *self.meaning_state.lock() = format!("error: {e}");
+    }
+
+    /// The meaning model answered: it works (again).
+    fn meaning_works(&self) {
+        if self.meaning_failed.lock().take().is_some() {
+            self.dirty.store(true, Ordering::Relaxed);
+        }
+        let mut st = self.meaning_state.lock();
+        if st.starts_with("error") && self.meaning_on.load(Ordering::SeqCst) {
+            *st = "on".into();
+        }
+    }
+
+    /// May the indexing use the meaning model now? After a failure, only
+    /// once `MODEL_RETRY` has passed and one small question works.
+    fn meaning_usable(&self) -> bool {
+        if !self.meaning_ready() {
+            return false;
+        }
+        let failed = *self.meaning_failed.lock();
+        match failed {
+            None => true,
+            Some(t) if t.elapsed() < MODEL_RETRY => false,
+            Some(_) => {
+                let answer = self.model.lock().embed("passage: whereti");
+                match answer {
+                    Ok(_) => {
+                        self.meaning_works();
+                        true
+                    }
+                    Err(e) => {
+                        self.meaning_failure(&e);
+                        false
+                    }
+                }
+            }
+        }
+    }
+
     /// Downloads the text model if it is missing (once, in the background).
     fn ensure_meaning_model(self: &Arc<Self>) {
         let total = crate::meaning::total_size();
@@ -321,15 +448,13 @@ impl Content {
             *self.meaning_state.lock() = "on".into();
             return;
         }
-        {
-            let mut st = self.meaning_state.lock();
-            if st.starts_with("downloading") {
-                return;
-            }
-            *st = format!("downloading:0/{total}");
+        *self.meaning_state.lock() = format!("downloading:0/{total}");
+        // turned off and on again during a download: that one goes on
+        if self.meaning_downloading.swap(true, Ordering::SeqCst) {
+            return;
         }
         let me = self.clone();
-        let _ = std::thread::Builder::new().name("meaning-model".into()).spawn(move || {
+        let spawned = std::thread::Builder::new().name("meaning-model".into()).spawn(move || {
             let _bg = Background::begin();
             let result = (|| -> Result<(), String> {
                 let agent = format!("whereti/{}", env!("CARGO_PKG_VERSION"));
@@ -343,7 +468,7 @@ impl Content {
                     let mut last = 0u64;
                     let urls = [crate::meaning::url(f), format!("{MODELS_COPY}{}", f.name)];
                     let bytes = fetch_model(&urls, &agent, f.size, f.sha256, &mut |done| {
-                        if done.abs_diff(last) >= 1 << 20 || done == f.size {
+                        if (done.abs_diff(last) >= 1 << 20 || done == f.size) && me.meaning_on.load(Ordering::SeqCst) {
                             last = done;
                             *me.meaning_state.lock() = format!("downloading:{}/{total}", before + done);
                         }
@@ -357,13 +482,23 @@ impl Content {
                 }
                 Ok(())
             })();
-            *me.meaning_state.lock() = match result {
-                Ok(()) => "on".into(),
-                Err(e) => format!("error: {e}"),
-            };
+            {
+                // turned off meanwhile: off it stays
+                let mut st = me.meaning_state.lock();
+                *st = match result {
+                    _ if !me.meaning_on.load(Ordering::SeqCst) => "off".into(),
+                    Ok(()) => "on".into(),
+                    Err(e) => format!("error: {e}"),
+                };
+                me.meaning_downloading.store(false, Ordering::SeqCst);
+            }
             me.dirty.store(true, Ordering::Relaxed);
             me.poke();
         });
+        if spawned.is_err() {
+            self.meaning_downloading.store(false, Ordering::SeqCst);
+            *self.meaning_state.lock() = "error: cannot start the download".into();
+        }
     }
 
     /// The vectors of one document's text (its first pieces).
@@ -371,13 +506,17 @@ impl Content {
     fn read_meaning(&self, key: u64, text: &str) -> bool {
         let mut vectors = Vec::new();
         for piece in whereti_extract::meaning::pieces(text, crate::meaning::PIECES) {
-            match self.model.lock().embed(&format!("passage: {piece}")) {
+            let answer = self.model.lock().embed(&format!("passage: {piece}"));
+            match answer {
                 Ok(v) => vectors.push(v),
                 Err(e) => {
-                    *self.meaning_state.lock() = format!("error: {e}");
+                    self.meaning_failure(&e);
                     return false;
                 }
             }
+        }
+        if !vectors.is_empty() {
+            self.meaning_works();
         }
         // kept even when empty (no text): such a document is not read again
         self.vectors.lock().set(key, vectors);
@@ -394,7 +533,10 @@ impl Content {
         let question = crate::meaning::question(&words)?;
         // never wait long behind the indexing for the model
         let mut model = self.model.try_lock_for(Duration::from_secs(3))?;
-        model.embed(&format!("query: {question}")).ok()
+        let v = model.embed(&format!("query: {question}")).ok()?;
+        drop(model);
+        self.meaning_works();
+        Some(v)
     }
 
     /// Notes the file being read in-process (a crash then names it).
@@ -411,33 +553,40 @@ impl Content {
     pub fn search_meaning(&self, idx: &NameIndex, query: &Query, q: &[i8], limit: usize, caller: &dyn Caller) -> ContentReply {
         let t = Instant::now();
         let (_, filters) = split_query(query);
-        let hits = self.vectors.lock().closest(q, 200);
-        let entries: Vec<u32> = hits
-            .iter()
-            .filter_map(|(k, _)| {
-                let (letter, record) = split_key(*k);
-                idx.volume_index(letter).and_then(|v| idx.live_entry_of(v, record))
-            })
-            .collect();
+        // every document above the bar, best first; filtered a part at a
+        // time until enough are left
+        let hits = self.vectors.lock().closest(q, MAX_SEARCH_DEPTH);
         let (prop_clauses, filters) = crate::props::split(&filters);
-        let mut kept = idx.filter(&filters, &entries);
-        if !prop_clauses.is_empty() {
-            let with: HashSet<u32> = self.entries_with_props(idx, &prop_clauses).into_iter().collect();
-            kept.retain(|e| with.contains(e));
+        let with: Option<HashSet<u32>> =
+            (!prop_clauses.is_empty()).then(|| self.entries_with_props(idx, &prop_clauses).into_iter().collect());
+        let mut rows: Vec<Row> = Vec::new();
+        for part in hits.chunks(SEARCH_DEPTH / 2) {
+            if rows.len() >= limit {
+                break;
+            }
+            let entries: Vec<u32> = part
+                .iter()
+                .filter_map(|(k, _)| {
+                    let (letter, record) = split_key(*k);
+                    idx.volume_index(letter).and_then(|v| idx.live_entry_of(v, record))
+                })
+                .collect();
+            let kept: HashSet<u32> =
+                idx.filter(&filters, &entries).into_iter().filter(|e| with.as_ref().is_none_or(|w| w.contains(e))).collect();
+            // in the order of `hits`
+            let ordered: Vec<u32> = entries.into_iter().filter(|e| kept.contains(e)).collect();
+            let paths: Vec<String> = ordered.iter().map(|&e| idx.full_path(e)).collect();
+            let allowed = caller.can_read(&paths);
+            rows.extend(
+                ordered
+                    .iter()
+                    .zip(paths)
+                    .zip(allowed)
+                    .filter(|(_, ok)| *ok)
+                    .map(|((&e, path), _)| Row { path, is_dir: false, size: idx.size(e), modified: idx.modified(e), flags: idx.flags(e) }),
+            );
         }
-        // in the order of `hits`
-        let kept: HashSet<u32> = kept.into_iter().collect();
-        let ordered: Vec<u32> = entries.into_iter().filter(|e| kept.contains(e)).collect();
-        let paths: Vec<String> = ordered.iter().map(|&e| idx.full_path(e)).collect();
-        let allowed = caller.can_read(&paths);
-        let rows: Vec<Row> = ordered
-            .iter()
-            .zip(paths)
-            .zip(allowed)
-            .filter(|(_, ok)| *ok)
-            .take(limit)
-            .map(|((&e, path), _)| Row { path, is_dir: false, size: idx.size(e), modified: idx.modified(e), flags: idx.flags(e) })
-            .collect();
+        rows.truncate(limit);
         ContentReply { total: rows.len() as u64, copies: vec![Vec::new(); rows.len()], rows, micros: t.elapsed().as_micros() as u64, note: None }
     }
 
@@ -448,6 +597,7 @@ impl Content {
         std::fs::write(self.dir.join("photo-tags.txt"), if on { "on\n" } else { "off\n" })
             .map_err(|e| format!("cannot save the setting: {e}"))?;
         self.tags_on.store(on, Ordering::SeqCst);
+        *self.tags_failed.lock() = None;
         if on {
             self.ensure_model();
         } else {
@@ -463,28 +613,74 @@ impl Content {
         self.tags_on.load(Ordering::SeqCst) && model_ready()
     }
 
+    /// The photo model's worker for this round, when it may be used: after
+    /// a failure, only once `MODEL_RETRY` has passed and it tags one of
+    /// `photos` (a few are tried; one may be unreadable).
+    fn tagger_for_round<'a>(&self, photos: impl Iterator<Item = &'a Candidate>) -> Option<TagWorker> {
+        if !self.tags_ready() {
+            return None;
+        }
+        let mut tagger = TagWorker::beside_current_exe(&model_path())?;
+        let failed = *self.tags_failed.lock();
+        match failed {
+            None => return Some(tagger),
+            Some(t) if t.elapsed() < MODEL_RETRY => return None,
+            Some(_) => {}
+        }
+        for c in photos.filter(|c| c.size <= MAX_TAGGED).take(3) {
+            let Ok(bytes) = read_shared(Path::new(&c.path), MAX_TAGGED) else { continue };
+            return match tagger.tags(&bytes) {
+                Ok(_) => {
+                    self.tags_works();
+                    Some(tagger)
+                }
+                Err(e) => {
+                    self.tags_failure(&e);
+                    None
+                }
+            };
+        }
+        // nothing to try it on: later
+        *self.tags_failed.lock() = Some(Instant::now());
+        None
+    }
+
+    fn tags_failure(&self, e: &str) {
+        *self.tags_failed.lock() = Some(Instant::now());
+        *self.tags_state.lock() = format!("error: {e}");
+    }
+
+    fn tags_works(&self) {
+        self.tags_failed.lock().take();
+        let mut st = self.tags_state.lock();
+        if st.starts_with("error") && self.tags_on.load(Ordering::SeqCst) {
+            *st = "on".into();
+        }
+    }
+
     /// Downloads the model if it is missing (once, in the background).
     fn ensure_model(self: &Arc<Self>) {
         if model_ready() {
             *self.tags_state.lock() = "on".into();
             return;
         }
-        {
-            let mut st = self.tags_state.lock();
-            if st.starts_with("downloading") {
-                return;
-            }
-            *st = format!("downloading:0/{MODEL_SIZE}");
+        *self.tags_state.lock() = format!("downloading:0/{MODEL_SIZE}");
+        // turned off and on again during a download: that one goes on
+        if self.tags_downloading.swap(true, Ordering::SeqCst) {
+            return;
         }
         let me = self.clone();
-        let _ = std::thread::Builder::new().name("photo-model".into()).spawn(move || {
+        let spawned = std::thread::Builder::new().name("photo-model".into()).spawn(move || {
             let _bg = Background::begin();
             let result = (|| -> Result<(), String> {
+                if model_ready() {
+                    return Ok(());
+                }
                 let agent = format!("whereti/{}", env!("CARGO_PKG_VERSION"));
                 let mut last = 0u64;
                 let urls = [MODEL_URL.to_string(), format!("{MODELS_COPY}{MODEL_FILE}")];
                 let bytes = fetch_model(&urls, &agent, MODEL_SIZE, MODEL_SHA256, &mut |done| {
-                    if done.abs_diff(last) >= 1 << 20 || done == MODEL_SIZE {
+                    if (done.abs_diff(last) >= 1 << 20 || done == MODEL_SIZE) && me.tags_on.load(Ordering::SeqCst) {
                         last = done;
                         *me.tags_state.lock() = format!("downloading:{done}/{MODEL_SIZE}");
                     }
@@ -497,13 +693,23 @@ impl Content {
                 std::fs::rename(&part, &path).map_err(|e| e.to_string())?;
                 Ok(())
             })();
-            *me.tags_state.lock() = match result {
-                Ok(()) => "on".into(),
-                Err(e) => format!("error: {e}"),
-            };
+            {
+                // turned off meanwhile: off it stays
+                let mut st = me.tags_state.lock();
+                *st = match result {
+                    _ if !me.tags_on.load(Ordering::SeqCst) => "off".into(),
+                    Ok(()) => "on".into(),
+                    Err(e) => format!("error: {e}"),
+                };
+                me.tags_downloading.store(false, Ordering::SeqCst);
+            }
             me.dirty.store(true, Ordering::Relaxed);
             me.poke();
         });
+        if spawned.is_err() {
+            self.tags_downloading.store(false, Ordering::SeqCst);
+            *self.tags_state.lock() = "error: cannot start the download".into();
+        }
     }
 
     pub fn folders(&self) -> Vec<String> {
@@ -538,12 +744,32 @@ impl Content {
 
     /// Runs on its own thread until `stop()`.
     pub(crate) fn run(self: Arc<Content>, shared: Arc<Shared>) {
-        let Some(index) = self.index.as_ref() else { return };
         let _bg = Background::begin();
         // The name index must be ready first: it says which files exist.
         while !self.stopping() && !(shared.state.lock().as_str() == "ready" && shared.index.read().is_some()) {
             std::thread::sleep(Duration::from_millis(500));
         }
+        // The content index could not be opened at start (a file locked for
+        // a moment): tried again now and then, never removed for it.
+        while self.index().is_none() && !self.stopping() {
+            match ContentIndex::open(&self.dir) {
+                Ok(i) => {
+                    *self.known_keys.write() = i.known().map(|k| known_sizes(&k)).unwrap_or_default();
+                    let _ = self.index.set(i);
+                    shared.log.log("content: the content index could be opened now");
+                    self.set_state("starting");
+                }
+                Err(e) => {
+                    self.set_state(&format!("error: the content index cannot be opened ({e})"));
+                    let mut wake = self.wake.lock();
+                    if !*wake {
+                        self.wake_cv.wait_for(&mut wake, REOPEN_EVERY);
+                    }
+                    *wake = false;
+                }
+            }
+        }
+        let Some(index) = self.index() else { return };
         let mut known = match index.known() {
             Ok(k) => k,
             Err(e) => {
@@ -551,6 +777,7 @@ impl Content {
                 return;
             }
         };
+        *self.known_keys.write() = known_sizes(&known);
         // Once, when OCR arrives: documents that gave no text before (scanned
         // PDFs) are read again. Forgetting them makes the next round redo them.
         let ocr_marker = self.dir.join("ocr-1");
@@ -589,20 +816,27 @@ impl Content {
             }
         }
         self.update_counts(index, &known);
-        let sandbox = Sandbox::beside_current_exe().map(|mut s| {
-            s.timeout = Duration::from_secs(30);
-            s.max_file = MAX_DOCUMENT;
-            s
-        });
+        let mut sandbox = new_sandbox();
         if sandbox.is_none() {
             shared.log.log("content: whereti-extract.exe is missing next to the service; only text files are indexed");
         }
         let mut forced = true;
         let mut last_round = Instant::now();
         while !self.stopping() {
-            let dirty = self.dirty.swap(false, Ordering::Relaxed);
+            // changes seen in the journal: a round, at most every DIRTY_GAP
+            let dirty = self.dirty.load(Ordering::Relaxed) && last_round.elapsed() >= DIRTY_GAP;
             if forced || dirty || last_round.elapsed() >= SAFETY_ROUND {
+                // what changes from now on asks for the next round
+                self.dirty.store(false, Ordering::Relaxed);
                 last_round = Instant::now();
+                // the extractor back (reinstalled, out of quarantine): what waited for it, now
+                if sandbox.is_none() {
+                    sandbox = new_sandbox();
+                    if sandbox.is_some() {
+                        shared.log.log("content: whereti-extract.exe is back; the documents that waited for it are read");
+                        self.no_sandbox.lock().clear();
+                    }
+                }
                 match self.round(index, &shared, &mut known, sandbox.as_ref()) {
                     Ok(()) => {
                         if ocr_pass && self.status.lock().queued == 0 && !ocr_marker.exists() {
@@ -617,7 +851,7 @@ impl Content {
                         self.set_state(&format!("error: {e}"));
                     }
                 }
-                *self.known_keys.write() = known.keys().copied().collect();
+                *self.known_keys.write() = known_sizes(&known);
             }
             // Wait for the next check.
             let mut wake = self.wake.lock();
@@ -628,6 +862,13 @@ impl Content {
             forced = std::mem::take(&mut *wake);
         }
         let _ = index.commit();
+        self.save_side();
+    }
+
+    /// Writes the properties and the vectors (what changed).
+    fn save_side(&self) {
+        self.props.lock().save();
+        self.vectors.lock().save();
     }
 
     fn round(
@@ -649,12 +890,16 @@ impl Content {
             let Some(idx) = guard.as_ref() else { return Ok(()) };
             files_in(idx, &folders, &pictures)
         };
-        // recognition turned on (model ready) or off: the photos again
+        // music and videos: no text, not counted as documents
+        *self.media_keys.lock() = wanted.values().filter(|c| c.media_only).map(|c| c.key).collect();
+        let crashed = self.crashed.lock().clone();
         // Recognition on: photos not looked at yet by the model are read again;
         // off: photos that carry tags are read again without them. Kept per
         // photo (props `tagged`), so a pass cut short goes on after a restart.
-        let mut tagger = if self.tags_ready() { TagWorker::beside_current_exe(&model_path()) } else { None };
-        let want_tags = tagger.is_some();
+        // While the model fails, the photos wait for it (nothing is read again).
+        let want_tags = self.tags_ready();
+        let mut tagger = self.tagger_for_round(wanted.values().filter(|c| is_picture(&c.path) && !crashed.contains(&c.key)));
+        let can_tag = tagger.is_some();
         // photos' text (OCR): wherever the photo is, when Windows has OCR
         let ocr_on = sandbox.is_some() && whereti_extract::ocr_available();
         {
@@ -662,12 +907,12 @@ impl Content {
             let redo: Vec<u64> = wanted
                 .values()
                 .filter(|c| is_picture(&c.path) && known.contains_key(&c.key) && crate::props::has_props(&ext_of(&c.path)))
-                .filter(|c| !self.crashed.lock().contains(&c.key))
+                .filter(|c| !crashed.contains(&c.key))
                 // read without the model but should be (on), or with it and should not be (off);
                 // photos with no properties yet are only redone when recognition is on
                 .filter(|c| match props.get(c.key) {
-                    Some(p) => p.tagged != want_tags || (ocr_on && !p.ocr && !is_raw(&c.path)),
-                    None => want_tags || (ocr_on && !is_raw(&c.path)),
+                    Some(p) => (p.tagged != want_tags && (can_tag || !want_tags)) || (ocr_on && !p.ocr && !is_raw(&c.path)),
+                    None => (want_tags && can_tag) || (ocr_on && !is_raw(&c.path)),
                 })
                 .map(|c| c.key)
                 .collect();
@@ -686,11 +931,13 @@ impl Content {
         for k in &removed {
             index.remove(*k);
             known.remove(k);
-            self.props.lock().remove(*k);
-            self.vectors.lock().remove(*k);
         }
-        // search by meaning turned on: the documents already indexed, again for it
-        let mut meaning_now = self.meaning_ready();
+        // properties and vectors of files gone (or of files never recorded)
+        self.props.lock().retain(|k| wanted.contains_key(&k));
+        self.vectors.lock().retain(|k| wanted.contains_key(&k));
+        // search by meaning turned on: the documents already indexed, again
+        // for it; not while the model fails (they would be read for nothing)
+        let mut meaning_now = self.meaning_usable();
         let meaning_missing: Vec<Candidate> = if meaning_now {
             let vectors = self.vectors.lock();
             wanted
@@ -698,6 +945,7 @@ impl Content {
                 .filter(|c| {
                     !c.photo_only
                         && !c.media_only
+                        && !crashed.contains(&c.key)
                         && known.get(&c.key).is_some_and(|i| i.size == c.size && i.modified == c.modified && i.status == Status::Ok)
                         && !vectors.contains(c.key)
                         && !is_picture(&c.path)
@@ -715,22 +963,25 @@ impl Content {
                 .filter(|c| {
                     known.get(&c.key).is_some_and(|i| i.size == c.size && i.modified == c.modified)
                         && !store.contains(c.key)
+                        && !crashed.contains(&c.key)
                         && crate::props::has_props(&ext_of(&c.path))
                 })
                 .map(|c| Candidate { props_only: true, media_only: false, photo_only: false, path: c.path.clone(), ..*c })
                 .collect()
         };
         let now = system::date_ctx().now;
+        // documents that need the missing extractor, unchanged since: they wait for it
+        let waiting: HashMap<u64, (u64, u32)> = if sandbox.is_none() { self.no_sandbox.lock().clone() } else { HashMap::new() };
         let mut todo: Vec<Candidate> = wanted
             .into_values()
             .filter(|c| known.get(&c.key).is_none_or(|i| i.size != c.size || i.modified != c.modified))
             // a mailbox that changed: again only once its date moved a day on
             .filter(|c| !is_mailbox(&c.path) || known.get(&c.key).is_none_or(|i| now >= i.modified.saturating_add(MAILBOX_EVERY)))
+            .filter(|c| waiting.get(&c.key) != Some(&(c.size, c.modified)))
             .chain(props_missing)
             .chain(meaning_missing)
             .collect();
         let tz = system::date_ctx().tz_offset;
-        let mut seen: Vec<u16> = Vec::new();
         // The newest files first: what the user works on becomes searchable first.
         todo.sort_unstable_by_key(|c| std::cmp::Reverse(c.modified));
         if !removed.is_empty() || !todo.is_empty() {
@@ -747,12 +998,17 @@ impl Content {
             s.done = 0;
             s.state = if todo.is_empty() { "ready".into() } else { "indexing".into() };
         }
-        let (mut since_commit, mut last_commit) = (0usize, Instant::now());
+        let (mut since_commit, mut last_commit, mut last_side_save) = (0usize, Instant::now(), Instant::now());
         let total = todo.len();
         let mut indexed = 0usize;
         let mut cpu = system::CpuMeter::new();
         let mut last_cpu_check = Instant::now();
         let mut paused_for: Option<&'static str> = None;
+        // the CPU busy since (for BUSY_MAX), and going on slowly despite it
+        let (mut busy_since, mut slow): (Option<Instant>, bool) = (None, false);
+        // the photo model: worked in this round; failures in a row; photos it
+        // failed on before it worked (they are then taken as looked at)
+        let (mut tags_worked, mut tag_fails, mut unsure): (bool, u32, Vec<u64>) = (false, 0, Vec::new());
         'files: for (n, c) in todo.into_iter().enumerate() {
             if self.stopping() || *self.wake.lock() {
                 break; // stop, or folders changed: plan again
@@ -760,16 +1016,33 @@ impl Content {
             // Wait while the user games, presents, is on battery or the CPU is busy.
             loop {
                 // the CPU is measured over at least a second
-                let reason = if last_cpu_check.elapsed() >= Duration::from_secs(1) || paused_for.is_some() {
+                let measured = last_cpu_check.elapsed() >= Duration::from_secs(1) || paused_for.is_some();
+                let mut reason = if measured {
                     last_cpu_check = Instant::now();
                     self.pause_reason(&mut cpu)
                 } else if system::on_battery() {
                     Some("battery")
-                } else if self.recent_hint().is_some_and(|(busy, _)| busy) {
+                } else if self.recent_hint().0 {
                     Some("fullscreen")
                 } else {
                     None
                 };
+                if measured {
+                    match reason {
+                        // busy for long (a program at idle priority, a miner): on, slowly
+                        Some("busy") => {
+                            if busy_since.get_or_insert_with(Instant::now).elapsed() >= BUSY_MAX {
+                                if !slow {
+                                    shared.log.log("content: the CPU stays busy; indexing goes on slowly");
+                                }
+                                slow = true;
+                                reason = None;
+                            }
+                        }
+                        None => (busy_since, slow) = (None, false),
+                        Some(_) => {}
+                    }
+                }
                 match reason {
                     None => {
                         if let Some(r) = paused_for.take() {
@@ -783,6 +1056,7 @@ impl Content {
                             if paused_for.is_none() {
                                 // make the work done so far searchable before waiting
                                 index.commit().map_err(|e| e.to_string())?;
+                                self.save_side();
                                 since_commit = 0;
                             }
                             shared.log.log(format!("content: paused ({r})"));
@@ -800,33 +1074,57 @@ impl Content {
                 }
             }
             let started = Instant::now();
-            // a file that once crashed a parser is not read in-process again
-            if self.crashed.lock().contains(&c.key) {
-                if !c.props_only && !c.meaning_only {
-                    let what = Indexed { size: c.size, modified: c.modified, status: Status::Failed };
-                    index.put(c.key, what, "").map_err(|e| e.to_string())?;
-                    known.insert(c.key, what);
-                }
-                continue;
-            }
-            // the crash marker is set only around what runs in this process
-            // (a sandboxed read cut short by a shutdown is no crash)
-            let mark = |on: bool| self.reading(on.then_some(c.key));
-            if c.meaning_only {
-                if let Some((_, text)) = extract(&c, sandbox, None, &mut Vec::new(), &mark) {
-                    if !self.read_meaning(c.key, &text) {
-                        meaning_now = false;
+            let mut looked = Looked::No;
+            // the file's work; `false`: nothing was read (no rest after it)
+            let worked = 'file: {
+                // a file that once crashed a parser is not read in-process again
+                if crashed.contains(&c.key) {
+                    if !c.props_only && !c.meaning_only {
+                        let what = Indexed { size: c.size, modified: c.modified, status: Status::Failed };
+                        index.put(c.key, what, "").map_err(|e| e.to_string())?;
+                        known.insert(c.key, what);
                     }
+                    break 'file false;
                 }
-                since_commit += 1;
-            } else if !c.props_only {
-                seen.clear();
-                if let Some((what, text)) = extract(&c, sandbox, tagger.as_mut(), &mut seen, &mark) {
+                // the crash marker is set only around what runs in this process
+                // (a sandboxed read cut short by a shutdown is no crash)
+                let mark = |on: bool| self.reading(on.then_some(c.key));
+                if c.meaning_only {
+                    // the model failed meanwhile: not read for nothing
+                    if !meaning_now {
+                        break 'file false;
+                    }
+                    if let Ok((_, text)) = extract(&c, sandbox, None, &mut Looked::No, &mark) {
+                        if !self.read_meaning(c.key, &text) {
+                            meaning_now = false;
+                        }
+                    }
+                    since_commit += 1;
+                } else if !c.props_only {
+                    let read = match extract(&c, sandbox, tagger.as_mut(), &mut looked, &mark) {
+                        Ok(r) => r,
+                        // gone, locked, no access: in a later round (nothing is kept of it)
+                        Err(Skip::Later) => break 'file true,
+                        Err(Skip::NoSandbox) => {
+                            self.no_sandbox.lock().insert(c.key, (c.size, c.modified));
+                            break 'file false;
+                        }
+                        // may pass (a timeout on a busy PC): once more in a later round
+                        Err(Skip::Transient) => {
+                            let mut once = self.failed_once.lock();
+                            if once.remove(&c.key) != Some((c.size, c.modified)) {
+                                once.insert(c.key, (c.size, c.modified));
+                                break 'file true;
+                            }
+                            (Indexed { size: c.size, modified: c.modified, status: Status::Failed }, String::new())
+                        }
+                    };
+                    let (what, text) = read;
                     index.put(c.key, what, &text).map_err(|e| e.to_string())?;
                     known.insert(c.key, what);
                     since_commit += 1;
                     indexed += 1;
-                    if meaning_now && !c.photo_only && !c.media_only && !is_picture(&c.path) {
+                    if meaning_now && what.status == Status::Ok && !c.photo_only && !c.media_only && !is_picture(&c.path) {
                         if !self.read_meaning(c.key, &text) {
                             meaning_now = false; // the model failed: not for the rest of this round
                         }
@@ -835,30 +1133,61 @@ impl Content {
                         self.vectors.lock().remove(c.key);
                     }
                 }
-            }
-            let ext = ext_of(&c.path);
-            if crate::props::has_props(&ext) {
-                mark(true);
-                let mut p = crate::props::read(Path::new(&c.path), &ext, tz);
-                mark(false);
-                if c.props_only {
-                    // only the properties were read: keep what the model saw and the OCR mark
-                    if let Some(old) = self.props.lock().get(c.key) {
-                        p.tags = old.tags.clone();
-                        p.tagged = old.tagged;
-                        p.ocr = old.ocr;
+                let ext = ext_of(&c.path);
+                if crate::props::has_props(&ext) {
+                    mark(true);
+                    let mut p = crate::props::read(Path::new(&c.path), &ext, tz);
+                    mark(false);
+                    if c.props_only || c.meaning_only {
+                        // only the properties were read: keep what the model saw and the OCR mark
+                        if let Some(old) = self.props.lock().get(c.key) {
+                            p.tags = old.tags.clone();
+                            p.tagged = old.tagged;
+                            p.ocr = old.ocr;
+                        }
+                        since_commit += 1;
+                    } else {
+                        // tagged only when the model looked at it
+                        match std::mem::replace(&mut looked, Looked::No) {
+                            Looked::Tags(tags) => {
+                                p.tags = tags;
+                                p.tagged = true;
+                                if !tags_worked {
+                                    // the photos it failed on before: it works, so they could not be read
+                                    let mut store = self.props.lock();
+                                    for k in unsure.drain(..) {
+                                        if let Some(mut q) = store.get(k).cloned() {
+                                            q.tagged = true;
+                                            store.set(k, q);
+                                        }
+                                    }
+                                }
+                                (tags_worked, tag_fails) = (true, 0);
+                            }
+                            Looked::Failed(e) => {
+                                tag_fails += 1;
+                                if tag_fails >= 3 {
+                                    // failing in a row: the model, not the photos
+                                    shared.log.log(format!("content: the photo model fails ({e}); tried again later"));
+                                    self.tags_failure(&e);
+                                    tagger = None;
+                                } else if tags_worked {
+                                    p.tagged = true;
+                                } else {
+                                    unsure.push(c.key);
+                                }
+                            }
+                            Looked::No => {}
+                        }
+                        p.ocr = ocr_on && is_picture(&c.path) && !is_raw(&c.path);
                     }
-                    since_commit += 1;
-                } else {
-                    p.tags = std::mem::take(&mut seen);
-                    p.tagged = want_tags && is_picture(&c.path);
-                    p.ocr = ocr_on && is_picture(&c.path) && !is_raw(&c.path);
+                    self.props.lock().set(c.key, p);
+                } else if !c.props_only && !c.meaning_only {
+                    // a record reused by another kind of file: no old properties on it
+                    self.props.lock().remove(c.key);
                 }
-                self.props.lock().set(c.key, p);
-            } else if !c.props_only && !c.meaning_only {
-                // a record reused by another kind of file: no old properties on it
-                self.props.lock().remove(c.key);
-            }
+                true
+            };
             {
                 let mut s = self.status.lock();
                 s.done = n as u64 + 1;
@@ -866,21 +1195,35 @@ impl Content {
             }
             if since_commit >= COMMIT_EVERY_DOCS || (since_commit > 0 && last_commit.elapsed() >= COMMIT_EVERY) {
                 index.commit().map_err(|e| e.to_string())?;
-                self.props.lock().save();
-                self.vectors.lock().save();
+                if last_side_save.elapsed() >= SIDE_SAVE_EVERY {
+                    self.save_side();
+                    last_side_save = Instant::now();
+                }
                 self.update_counts(index, known);
                 since_commit = 0;
                 last_commit = Instant::now();
             }
+            if !worked {
+                continue;
+            }
             // Rest at least as long as the file took; a quarter of that
-            // while nobody is at the PC (locked, screen saver).
-            let away = self.recent_hint().is_some_and(|(_, away)| away);
-            let rest = if away { started.elapsed() / 4 } else { started.elapsed() };
-            std::thread::sleep(rest.max(Duration::from_millis(5)));
+            // while nobody is at the PC (locked, screen saver), four times
+            // that while the CPU stays busy. A stop or a new plan ends it.
+            let took = started.elapsed();
+            let rest = if slow {
+                took * 4
+            } else if self.recent_hint().1 {
+                took / 4
+            } else {
+                took
+            };
+            let mut wake = self.wake.lock();
+            if !*wake && !self.stopping() {
+                self.wake_cv.wait_for(&mut wake, rest.max(Duration::from_millis(5)));
+            }
         }
         index.commit().map_err(|e| e.to_string())?;
-        self.props.lock().save();
-        self.vectors.lock().save();
+        self.save_side();
         self.update_counts(index, known);
         if indexed > 0 || !removed.is_empty() {
             shared.log.log(format!(
@@ -899,8 +1242,10 @@ impl Content {
 
     fn update_counts(&self, index: &ContentIndex, known: &HashMap<u64, Indexed>) {
         let failed = known.values().filter(|i| matches!(i.status, Status::Failed | Status::Protected | Status::TooLarge)).count();
+        // music and videos are in the index (for their properties), not documents
+        let media = self.media_keys.lock().iter().filter(|k| known.contains_key(k)).count() as u64;
         let mut s = self.status.lock();
-        s.files = index.docs();
+        s.files = index.docs().saturating_sub(media);
         s.failed = failed as u64;
         s.disk_bytes = index.disk_bytes();
     }
@@ -919,51 +1264,60 @@ impl Content {
         caller: &dyn Caller,
     ) -> ContentReply {
         let t = Instant::now();
-        let Some(index) = self.index.as_ref() else { return ContentReply::default() };
+        let Some(index) = self.index() else { return ContentReply::default() };
         let (words, filters) = split_query(query);
         if words.trim().is_empty() {
             return ContentReply::default();
         }
-        let hits = match index.search(&words, SEARCH_DEPTH) {
-            Ok(h) => h,
-            Err(e) => return ContentReply { note: Some(format!("content search failed: {e}")), ..Default::default() },
-        };
-        let mut entries = Vec::with_capacity(hits.keys.len());
-        let mut text_score: HashMap<u32, f32> = HashMap::new();
-        for (k, score) in &hits.keys {
-            let (letter, record) = split_key(*k);
-            if let Some(e) = idx.volume_index(letter).and_then(|v| idx.live_entry_of(v, record)) {
-                if !entries.contains(&e) {
-                    entries.push(e);
-                    text_score.insert(e, *score);
+        let (prop_clauses, filters) = crate::props::split(&filters);
+        let with: Option<HashSet<u32>> =
+            (!prop_clauses.is_empty()).then(|| self.entries_with_props(idx, &prop_clauses).into_iter().collect());
+        let w = idx.weigher_with(active);
+        // The best hits, filtered and checked for the caller as they come;
+        // deeper while too few are left (filters, other users' documents).
+        let mut found: Vec<(f32, u32, String)> = Vec::new();
+        let mut seen: HashSet<u32> = HashSet::new();
+        let (mut depth, mut looked) = (SEARCH_DEPTH, 0usize);
+        loop {
+            let hits = match index.search(&words, depth) {
+                Ok(h) => h,
+                Err(e) => return ContentReply { note: Some(format!("content search failed: {e}")), ..Default::default() },
+            };
+            let mut entries = Vec::new();
+            let mut text_score: HashMap<u32, f32> = HashMap::new();
+            for (k, score) in hits.keys.iter().skip(looked) {
+                let (letter, record) = split_key(*k);
+                if let Some(e) = idx.volume_index(letter).and_then(|v| idx.live_entry_of(v, record)) {
+                    if seen.insert(e) {
+                        entries.push(e);
+                        text_score.insert(e, *score);
+                    }
                 }
             }
-        }
-        let (prop_clauses, filters) = crate::props::split(&filters);
-        let mut entries = idx.filter(&filters, &entries);
-        if !prop_clauses.is_empty() {
-            let with: HashSet<u32> = self.entries_with_props(idx, &prop_clauses).into_iter().collect();
-            entries.retain(|e| with.contains(e));
-        }
-        let paths: Vec<String> = entries.iter().map(|&e| idx.full_path(e)).collect();
-        let allowed = caller.can_read(&paths);
-        let w = idx.weigher_with(active);
-        let mut found: Vec<(f32, u32, String)> = entries
-            .iter()
-            .zip(paths)
-            .zip(allowed)
-            .filter(|(_, ok)| *ok)
-            .map(|((&e, path), _)| {
+            looked = hits.keys.len();
+            let mut entries = idx.filter(&filters, &entries);
+            if let Some(with) = &with {
+                entries.retain(|e| with.contains(e));
+            }
+            let paths: Vec<String> = entries.iter().map(|&e| idx.full_path(e)).collect();
+            let allowed = caller.can_read(&paths);
+            found.extend(entries.iter().zip(paths).zip(allowed).filter(|(_, ok)| *ok).map(|((&e, path), _)| {
                 let used = usage.iter().find(|(p, _)| p.eq_ignore_ascii_case(&path)).map(|u| u.1);
                 let score = text_score.get(&e).copied().unwrap_or(0.0) * weight(idx.importance(e, &w), idx.flags(e), used);
                 (score, e, path)
-            })
-            .collect();
+            }));
+            // all of them seen, or enough for the page (with some to spare:
+            // copies become one row), or as deep as a search goes
+            let all_seen = hits.keys.len() < depth;
+            if all_seen || found.len() >= limit.saturating_mul(2).max(limit.saturating_add(10)) || depth >= MAX_SEARCH_DEPTH {
+                break;
+            }
+            depth = (depth * 4).min(MAX_SEARCH_DEPTH);
+        }
         found.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.2.cmp(&b.2)));
-        // when some hits were not the caller's, the full count would say how
-        // many of someone else's documents hold the words: count only theirs
-        let all_theirs = found.len() == hits.keys.len();
         let groups = self.group_copies(idx, &found);
+        // only what this caller may read and the filters keep: never a count
+        // that says how many of someone else's documents hold the words
         let visible = groups.len() as u64;
         let mut rows = Vec::new();
         let mut copies = Vec::new();
@@ -976,13 +1330,7 @@ impl Content {
         let note = (status.state != "ready").then(|| {
             format!("content index: {} - {} documents so far, {} waiting", status.state, status.files, status.queued)
         });
-        ContentReply {
-            rows,
-            copies,
-            total: if hits.keys.len() < SEARCH_DEPTH || !all_theirs { visible } else { hits.total as u64 },
-            micros: t.elapsed().as_micros() as u64,
-            note,
-        }
+        ContentReply { rows, copies, total: visible, micros: t.elapsed().as_micros() as u64, note }
     }
 }
 
@@ -1001,6 +1349,14 @@ fn weight(importance: u8, flags: u16, used: Option<u8>) -> f32 {
 
 /// Files above this size are never read to group copies.
 const MAX_HASHED: u64 = 64 * 1024 * 1024;
+/// Time a search may spend reading files to group copies (the name index
+/// is locked meanwhile); the rest are read in the background, for the
+/// next search.
+const HASH_BUDGET: Duration = Duration::from_millis(150);
+
+/// Remembered content hashes: path -> (size, last write and change time,
+/// hash).
+type HashCache = Arc<Mutex<HashMap<String, (u64, crate::dupes::Stamp, u64)>>>;
 
 impl Content {
     /// Groups the found documents that are the same file in several places
@@ -1014,12 +1370,21 @@ impl Content {
                 by_size.entry(size).or_default().push(k);
             }
         }
+        let deadline = Instant::now() + HASH_BUDGET;
+        let mut later: Vec<(String, u64)> = Vec::new();
         let mut copy_of: HashMap<usize, usize> = HashMap::new();
-        for same_size in by_size.values().filter(|v| v.len() > 1) {
+        for (&size, same_size) in by_size.iter().filter(|(_, v)| v.len() > 1) {
             let mut first_with: HashMap<u64, usize> = HashMap::new();
             for &k in same_size {
-                let (_, e, path) = &found[k];
-                let Some(h) = self.content_hash(path, idx.size(*e), idx.modified(*e)) else { continue };
+                let (_, _, path) = &found[k];
+                let h = match content_hash(&self.hashes, path, size, Instant::now() < deadline) {
+                    Hashed::Yes(h) => h,
+                    Hashed::NotNow => {
+                        later.push((path.clone(), size));
+                        continue;
+                    }
+                    Hashed::No => continue,
+                };
                 match first_with.get(&h) {
                     Some(&first) => {
                         copy_of.insert(k, first);
@@ -1028,6 +1393,19 @@ impl Content {
                         first_with.insert(h, k);
                     }
                 }
+            }
+        }
+        if !later.is_empty() && !self.hashing.swap(true, Ordering::SeqCst) {
+            let (cache, busy) = (self.hashes.clone(), self.hashing.clone());
+            let spawned = std::thread::Builder::new().name("copy-hashes".into()).spawn(move || {
+                let _bg = Background::begin();
+                for (path, size) in later {
+                    content_hash(&cache, &path, size, true);
+                }
+                busy.store(false, Ordering::SeqCst);
+            });
+            if spawned.is_err() {
+                self.hashing.store(false, Ordering::SeqCst);
             }
         }
         let mut groups: Vec<(usize, Vec<usize>)> = Vec::new();
@@ -1043,25 +1421,42 @@ impl Content {
         }
         groups
     }
+}
 
-    fn content_hash(&self, path: &str, size: u64, modified: u32) -> Option<u64> {
-        if let Some(&(s, m, h)) = self.hashes.lock().get(path) {
-            if s == size && m == modified {
-                return Some(h);
-            }
+enum Hashed {
+    Yes(u64),
+    /// Not remembered, and no time to read it now.
+    NotNow,
+    /// Cannot be read (gone, locked, changed size).
+    No,
+}
+
+/// The hash of a whole file, remembered while the file stays as it was
+/// (its size, last write and change time); read only when `read`. Opened
+/// only at its real path (no link swapped in after the access check).
+fn content_hash(cache: &HashCache, path: &str, size: u64, read: bool) -> Hashed {
+    use std::io::Read;
+    let Ok(f) = whereti_extract::worker::open_real(Path::new(path)) else { return Hashed::No };
+    let Some(stamp) = crate::dupes::stamp(&f) else { return Hashed::No };
+    if let Some(&(s, st, h)) = cache.lock().get(path) {
+        if s == size && st == stamp {
+            return Hashed::Yes(h);
         }
-        let bytes = std::fs::read(path).ok()?;
-        if bytes.len() as u64 != size {
-            return None;
-        }
-        let h = xxhash_rust::xxh3::xxh3_64(&bytes);
-        let mut cache = self.hashes.lock();
-        if cache.len() > 20_000 {
-            cache.clear();
-        }
-        cache.insert(path.to_string(), (size, modified, h));
-        Some(h)
     }
+    if !read {
+        return Hashed::NotNow;
+    }
+    let mut bytes = Vec::with_capacity(size as usize);
+    if f.take(size + 1).read_to_end(&mut bytes).is_err() || bytes.len() as u64 != size {
+        return Hashed::No;
+    }
+    let h = xxhash_rust::xxh3::xxh3_64(&bytes);
+    let mut cache = cache.lock();
+    if cache.len() > 20_000 {
+        cache.clear();
+    }
+    cache.insert(path.to_string(), (size, stamp, h));
+    Hashed::Yes(h)
 }
 
 /// What a "search the documents not indexed yet" goes through.
@@ -1084,7 +1479,7 @@ impl Content {
         }
         let known = self.known_keys.read();
         let mut candidates: Vec<Candidate> =
-            files_in(idx, &self.folders(), &[]).into_values().filter(|c| !known.contains(&c.key) && !c.photo_only && !c.media_only && !is_mailbox(&c.path)).collect();
+            files_in(idx, &self.folders(), &[]).into_values().filter(|c| !known.contains_key(&c.key) && !c.photo_only && !c.media_only && !is_mailbox(&c.path)).collect();
         drop(known);
         if !filters.clauses.is_empty() {
             let entries: Vec<u32> = candidates
@@ -1122,7 +1517,7 @@ impl Content {
             for (c, ok) in chunk.iter().zip(allowed) {
                 i += 1;
                 if ok {
-                    if let Some((_, text)) = extract(c, sandbox.as_ref(), None, &mut Vec::new(), &|_| {}) {
+                    if let Ok((_, text)) = extract(c, sandbox.as_ref(), None, &mut Looked::No, &|_| {}) {
                         let folded = fold(&text);
                         if plan.needles.iter().all(|w| folded.contains(w.as_str())) {
                             rows.push(Row { path: c.path.clone(), is_dir: false, size: c.size, modified: c.modified, flags: 0 });
@@ -1492,37 +1887,71 @@ fn is_picture(path: &str) -> bool {
     whereti_extract::kind_of(ext) == Some(Kind::Image)
 }
 
-/// Reads one file. `None` when it could not be opened right now (gone,
-/// locked, no access): it is tried again in a later round.
+/// What the photo model made of a photo.
+enum Looked {
+    /// It did not look (off, failing, the photo unreadable now).
+    No,
+    /// Its labels (none found: empty).
+    Tags(Vec<u16>),
+    /// It failed on it (a photo it cannot read, or the model itself).
+    Failed(String),
+}
+
 /// What is in a photo, as words for the index ("dog Hund perro chien
 /// cane pies cachorro câine"); `None` without tags.
-fn photo_tags(path: &Path, tagger: &mut TagWorker, seen: &mut Vec<u16>) -> Option<String> {
-    let bytes = read_shared(path, MAX_TAGGED).ok()?;
-    let tags = tagger.tags(&bytes).ok()?;
-    *seen = tags.iter().map(|(i, _)| *i as u16).collect();
-    (!tags.is_empty()).then(|| whereti_extract::tags::index_text(&tags))
+fn photo_tags(path: &Path, tagger: &mut TagWorker, looked: &mut Looked) -> Option<String> {
+    let bytes = match read_shared(path, MAX_TAGGED) {
+        Ok(b) => b,
+        // too large to look at: as good as looked at, nothing found
+        Err(SandboxError::TooLarge(_)) => {
+            *looked = Looked::Tags(Vec::new());
+            return None;
+        }
+        Err(_) => return None,
+    };
+    match tagger.tags(&bytes) {
+        Ok(tags) => {
+            *looked = Looked::Tags(tags.iter().map(|(i, _)| *i as u16).collect());
+            (!tags.is_empty()).then(|| whereti_extract::tags::index_text(&tags))
+        }
+        Err(e) => {
+            *looked = Looked::Failed(e);
+            None
+        }
+    }
+}
+
+/// Why a file was not read now.
+enum Skip {
+    /// Gone, locked, no access: in a later round.
+    Later,
+    /// It needs whereti-extract.exe, which is missing.
+    NoSandbox,
+    /// The extractor failed in a way that may pass (out of time on a busy
+    /// PC, could not start): once more in a later round.
+    Transient,
 }
 
 /// Reads one file. `tagger`: recognise what is in photos (when on).
-/// `seen`: the photo model's labels, when it looked at a photo. `mark`:
-/// called with `true` before and `false` after parsing in this process.
+/// `looked`: what the photo model made of a photo. `mark`: called with
+/// `true` before and `false` after parsing in this process.
 fn extract(
     c: &Candidate,
     sandbox: Option<&Sandbox>,
     tagger: Option<&mut TagWorker>,
-    seen: &mut Vec<u16>,
+    looked: &mut Looked,
     mark: &dyn Fn(bool),
-) -> Option<(Indexed, String)> {
+) -> Result<(Indexed, String), Skip> {
     let what = |status| Indexed { size: c.size, modified: c.modified, status };
     if c.media_only {
-        return Some((what(Status::Empty), String::new()));
+        return Ok((what(Status::Empty), String::new()));
     }
     let path = Path::new(&c.path);
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
-    let kind = whereti_extract::kind_of(&ext)?;
+    let kind = whereti_extract::kind_of(&ext).ok_or(Skip::Later)?;
     // a photo: where it was taken and what is in it
     let place = if kind == Kind::Image {
-        let tags = tagger.and_then(|t| photo_tags(path, t, seen));
+        let tags = tagger.and_then(|t| photo_tags(path, t, looked));
         mark(true);
         let place = place_text(path, &ext);
         mark(false);
@@ -1536,8 +1965,8 @@ fn extract(
     // a RAW photo: where it was taken and what is in it, not its text
     // (decoding a camera file for OCR costs too much); the same for any
     // photo when the sandbox is missing
-    if c.photo_only && (whereti_query::kinds::RAW.contains(&ext.as_str()) || sandbox.is_none()) {
-        return Some(match place {
+    if (c.photo_only && whereti_query::kinds::RAW.contains(&ext.as_str())) || (kind == Kind::Image && sandbox.is_none()) {
+        return Ok(match place {
             Some(text) => (what(Status::Ok), text),
             None => (what(Status::Empty), String::new()),
         });
@@ -1548,10 +1977,10 @@ fn extract(
     } else if kind == Kind::Mailbox {
         // Outlook's mailbox, however large: the worker reads it from the open
         // file, newest messages first, up to a larger budget
-        sandbox?.extract_file(path, MAILBOX_CHARS)
+        sandbox.ok_or(Skip::NoSandbox)?.extract_file(path, MAILBOX_CHARS)
     } else if c.size > MAX_DOCUMENT && ext == "7z" {
         // a large 7z: its names, from its list at the end (and its start header)
-        let sandbox = sandbox?;
+        let sandbox = sandbox.ok_or(Skip::NoSandbox)?;
         read_head(path, 32)
             .and_then(|head| read_tail(path, ZIP_TAIL).map(|tail| (head, tail)))
             .and_then(|(head, tail)| {
@@ -1560,16 +1989,16 @@ fn extract(
             })
     } else if c.size > MAX_DOCUMENT && ext == "zip" {
         // a large ZIP: its names, from the directory at its end
-        let sandbox = sandbox?;
+        let sandbox = sandbox.ok_or(Skip::NoSandbox)?;
         read_tail(path, ZIP_TAIL).and_then(|b| sandbox.extract_bytes(whereti_extract::ZIP_END, b, MAX_CHARS))
     } else if c.size > MAX_DOCUMENT {
         // too large to read its text: a photo still keeps where it was taken
-        return Some(match place {
+        return Ok(match place {
             Some(text) => (what(Status::Ok), text),
             None => (what(Status::TooLarge), String::new()),
         });
     } else {
-        sandbox?.extract_file(path, MAX_CHARS)
+        sandbox.ok_or(Skip::NoSandbox)?.extract_file(path, MAX_CHARS)
     };
     // a photo: where it was taken, then the text OCR read in it
     let result = match (result, place) {
@@ -1580,16 +2009,38 @@ fn extract(
         (Err(_), Some(p)) => Ok(whereti_extract::Extracted { text: p, truncated: false }),
         (r, None) => r,
     };
-    Some(match result {
+    Ok(match result {
         Ok(e) if e.text.trim().is_empty() => (what(Status::Empty), String::new()),
         Ok(e) => (what(Status::Ok), e.text),
-        Err(SandboxError::Io(_)) => return None,
+        Err(SandboxError::Io(_)) => return Err(Skip::Later),
+        Err(SandboxError::Failed(_)) => return Err(Skip::Transient),
         // the extension promised a format the file is not in (a Tcl .msg): no text, not a failure
         Err(SandboxError::Extract(ExtractError::Unsupported)) => (what(Status::Empty), String::new()),
         Err(SandboxError::Extract(ExtractError::Protected)) => (what(Status::Protected), String::new()),
         Err(SandboxError::TooLarge(_)) => (what(Status::TooLarge), String::new()),
         Err(_) => (what(Status::Failed), String::new()),
     })
+}
+
+/// The extractor next to the service, with the indexing's limits.
+fn new_sandbox() -> Option<Sandbox> {
+    Sandbox::beside_current_exe().map(|mut s| {
+        s.timeout = Duration::from_secs(30);
+        s.max_file = MAX_DOCUMENT;
+        s
+    })
+}
+
+/// Size and date of each indexed file, by key.
+fn known_sizes(known: &HashMap<u64, Indexed>) -> HashMap<u64, (u64, u32)> {
+    known.iter().map(|(k, i)| (*k, (i.size, i.modified))).collect()
+}
+
+/// (busy, away) from the hints of the last `HINT_VALID`, from any user
+/// session: busy when any says so, away only when every one does.
+fn combine_hints(hints: &[(Instant, bool, bool)]) -> (bool, bool) {
+    let recent: Vec<&(Instant, bool, bool)> = hints.iter().filter(|h| h.0.elapsed() < HINT_VALID).collect();
+    (recent.iter().any(|h| h.1), !recent.is_empty() && recent.iter().all(|h| h.2))
 }
 
 /// The last `max` bytes of a file.
@@ -1780,6 +2231,69 @@ mod tests {
         // resuming past the end gives nothing more
         let after = content.scan_run(&plan, 4, Duration::from_secs(1), 100, &NotSecrets);
         assert!(after.done && after.rows.is_empty());
+        drop(content);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hints_from_several_sessions_combine() {
+        let now = Instant::now();
+        let old = now - Duration::from_secs(60);
+        // a locked session away, the one at the screen in a game: busy, not away
+        assert_eq!(combine_hints(&[(now, false, true), (now, true, false)]), (true, false));
+        // every session away: away
+        assert_eq!(combine_hints(&[(now, false, true), (now, false, true)]), (false, true));
+        // old hints count for nothing
+        assert_eq!(combine_hints(&[(old, true, false), (now, false, true)]), (false, true));
+        assert_eq!(combine_hints(&[]), (false, false));
+    }
+
+    /// A name index of one folder, C:\docs, with these files (records from 100).
+    fn docs_index(names: &[String]) -> NameIndex {
+        use whereti_ntfs::mft::{MftEntry, MftScan};
+        let mut scan = MftScan::default();
+        let entry = |record: u64, parent: u64, is_dir: bool| MftEntry {
+            record,
+            parent,
+            is_dir,
+            size: 100,
+            modified: 133_000_000_000_000_000,
+            seq: 1,
+            ..Default::default()
+        };
+        scan.push(entry(5, 5, true), ".");
+        scan.push(entry(20, 5, true), "docs");
+        for (i, n) in names.iter().enumerate() {
+            scan.push(entry(100 + i as u64, 20, false), n);
+        }
+        let vols = vec![whereti_core::VolumeScan { letter: 'C', serial: 1, journal_id: 1, next_usn: 1, scan }];
+        whereti_core::build(vols, &whereti_core::Exclusions::defaults(None)).0
+    }
+
+    #[test]
+    fn filters_find_what_ranks_below_the_first_hits() {
+        // 600 short notes rank above 3 long PDFs for "alfa": ext:pdf must still find the PDFs
+        let mut names: Vec<String> = (0..600).map(|i| format!("note{i}.txt")).collect();
+        names.extend((0..3).map(|i| format!("long{i}.pdf")));
+        let idx = docs_index(&names);
+        let dir = std::env::temp_dir().join(format!("whereti-deep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let content = Content::open(&dir, &|_| {});
+        let index = content.index().unwrap();
+        let filler = "cuvant ".repeat(300);
+        for (i, n) in names.iter().enumerate() {
+            let text = if n.ends_with(".pdf") { format!("alfa {filler}") } else { "alfa".to_string() };
+            index.put(key('C', 100 + i as u64), Indexed { size: 100, modified: 1, status: Status::Ok }, &text).unwrap();
+        }
+        index.commit().unwrap();
+        let ctx = DateCtx { now: 0, tz_offset: 0 };
+        let reply = content.search(&idx, &parse("alfa ext:pdf", &ctx), 50, &[], Arc::new(Vec::new()), &whereti_ipc::Trusted);
+        assert_eq!(reply.rows.len(), 3, "{:?}", reply.rows.iter().map(|r| &r.path).collect::<Vec<_>>());
+        assert_eq!(reply.total, 3);
+        // without filters: a page of the best, and no count beyond what was seen
+        let reply = content.search(&idx, &parse("alfa", &ctx), 50, &[], Arc::new(Vec::new()), &NotSecrets);
+        assert_eq!(reply.rows.len(), 50);
+        assert!(reply.total <= SEARCH_DEPTH as u64);
         drop(content);
         let _ = std::fs::remove_dir_all(&dir);
     }
