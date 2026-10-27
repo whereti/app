@@ -55,7 +55,7 @@ pub fn run(args: SearchArgs) -> Result<(), String> {
 
 fn run_via_service(mut client: Client, args: &SearchArgs) -> Result<(), String> {
     let req = Request::Search(SearchRequest {
-        query: args.query.join(" "),
+        query: query_text(&args.query),
         limit: args.limit as u32,
         usage: Vec::new(),
         sort: match args.sort {
@@ -72,7 +72,7 @@ fn run_via_service(mut client: Client, args: &SearchArgs) -> Result<(), String> 
         other => return Err(format!("unexpected reply: {other:?}")),
     };
     let round_trip = t.elapsed();
-    let tz = date_ctx().tz_offset;
+    let tz = date_ctx();
     for w in &reply.warnings {
         println!("note: {w}");
     }
@@ -81,7 +81,7 @@ fn run_via_service(mut client: Client, args: &SearchArgs) -> Result<(), String> 
         if k == first_close {
             println!("close matches (one letter off):");
         }
-        print_row(r, tz);
+        print_row(r, &tz);
     }
     println!();
     println!(
@@ -92,7 +92,7 @@ fn run_via_service(mut client: Client, args: &SearchArgs) -> Result<(), String> 
     );
     // Then the files whose text matches (not already listed by name).
     let content_req = Request::ContentSearch(SearchRequest {
-        query: args.query.join(" "),
+        query: query_text(&args.query),
         limit: args.limit as u32,
         sort: whereti_ipc::Sort::Relevance,
         usage: Vec::new(),
@@ -105,7 +105,7 @@ fn run_via_service(mut client: Client, args: &SearchArgs) -> Result<(), String> 
             println!();
             println!("found in content:");
             for r in &extra {
-                print_row(r, tz);
+                print_row(r, &tz);
             }
             if let Some(n) = &c.note {
                 println!("note: {n}");
@@ -135,7 +135,7 @@ fn run_via_service(mut client: Client, args: &SearchArgs) -> Result<(), String> 
     Ok(())
 }
 
-fn print_row(r: &Row, tz: i32) {
+fn print_row(r: &Row, tz: &whereti_query::DateCtx) {
     let size = if r.is_dir { "<dir>".to_string() } else { bytes(r.size) };
     println!("{size:>10}  {}  {}", local_time(r.modified, tz), r.path);
 }
@@ -160,7 +160,7 @@ fn run_local(args: &SearchArgs) -> Result<(), String> {
     let load_time = t.elapsed();
 
     let ctx = date_ctx();
-    let query = parse(&args.query.join(" "), &ctx);
+    let query = parse(&query_text(&args.query), &ctx);
     let opts = SearchOptions {
         limit: args.limit,
         sort: match args.sort {
@@ -190,7 +190,7 @@ fn run_local(args: &SearchArgs) -> Result<(), String> {
             modified: index.modified(i),
             flags: index.flags(i),
         };
-        print_row(&row, ctx.tz_offset);
+        print_row(&row, &ctx);
     }
     println!();
     println!(
@@ -291,11 +291,61 @@ pub fn status(args: StatusArgs) -> Result<(), String> {
     Ok(())
 }
 
-fn local_time(minutes_utc: u32, tz_offset: i32) -> String {
+/// The local time zone's daylight saving rule, as Windows has it (None
+/// when it has none, or gives it only for one year).
+pub fn local_tz_rules() -> Option<whereti_query::TzRules> {
+    use whereti_query::{Transition, TzRules};
+    use windows_sys::Win32::Foundation::SYSTEMTIME;
+    use windows_sys::Win32::System::Time::{GetTimeZoneInformation, TIME_ZONE_INFORMATION};
+    // SAFETY: zeroed POD out-parameter.
+    let mut tz: TIME_ZONE_INFORMATION = unsafe { std::mem::zeroed() };
+    if unsafe { GetTimeZoneInformation(&mut tz) } == u32::MAX {
+        return None;
+    }
+    // wYear != 0 is a one-off date, not a yearly rule
+    if tz.DaylightDate.wYear != 0 || tz.StandardDate.wYear != 0 {
+        return None;
+    }
+    let change = |t: &SYSTEMTIME| Transition {
+        month: t.wMonth as u8,
+        week: t.wDay as u8,
+        weekday: t.wDayOfWeek as u8,
+        minute: t.wHour * 60 + t.wMinute,
+    };
+    Some(TzRules {
+        standard: -(tz.Bias + tz.StandardBias),
+        daylight: -(tz.Bias + tz.DaylightBias),
+        to_daylight: change(&tz.DaylightDate),
+        to_standard: change(&tz.StandardDate),
+    })
+}
+
+/// The words as one search box text: an argument with a space came quoted
+/// from the shell, so it is quoted again (`path:"C:\Program Files"`).
+fn query_text(args: &[String]) -> String {
+    args.iter()
+        .map(|a| {
+            if !a.contains(char::is_whitespace) || a.contains('"') {
+                return a.clone();
+            }
+            // `name:value with spaces` quotes the value, so the function stays
+            match a.split_once(':') {
+                Some((name, value)) if name.len() > 1 && name.chars().all(|c| c.is_ascii_alphabetic()) => {
+                    format!("{name}:\"{value}\"")
+                }
+                _ => format!("\"{a}\""),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn local_time(minutes_utc: u32, ctx: &whereti_query::DateCtx) -> String {
     if minutes_utc == 0 {
         return "                ".into();
     }
-    let local = minutes_utc as i64 + tz_offset as i64;
+    // the offset of that date (summer or winter), not today's
+    let local = minutes_utc as i64 + ctx.offset_at(minutes_utc as i64) as i64;
     let (y, m, d) = civil_from_day(local.div_euclid(1440));
     let mins = local.rem_euclid(1440);
     format!("{y:04}-{m:02}-{d:02} {:02}:{:02}", mins / 60, mins % 60)
@@ -438,5 +488,20 @@ pub fn content(args: ContentArgs) -> Result<(), String> {
         }
         Response::Error(e) => Err(e),
         other => Err(format!("unexpected reply: {other:?}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn arguments_with_spaces_stay_one_word() {
+        let q = |a: &[&str]| query_text(&a.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert_eq!(q(&["raport", "ext:pdf"]), "raport ext:pdf");
+        assert_eq!(q(&["nume exact.txt"]), "\"nume exact.txt\"");
+        assert_eq!(q(&[r"path:C:\Program Files", "x"]), r#"path:"C:\Program Files" x"#);
+        assert_eq!(q(&[r"C:\Program Files"]), r#""C:\Program Files""#);
+        assert_eq!(q(&[r#"say "hi" there"#]), r#"say "hi" there"#);
     }
 }

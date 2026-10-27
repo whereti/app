@@ -114,6 +114,8 @@ fn serve(args: ServeArgs) -> Result<(), String> {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    // daylight saving rules, so a summer date searched in winter is right
+    whereti_query::set_tz_rules(search_cmd::local_tz_rules());
     let result = match cli.cmd {
         Cmd::Scan(args) => scan(args),
         Cmd::Index(args) => index_cmd::run(args).map(|_| ExitCode::SUCCESS),

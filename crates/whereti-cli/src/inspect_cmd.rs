@@ -16,7 +16,7 @@ use crate::index_cmd::default_index_path;
 pub struct InspectArgs {
     /// File or folder to inspect
     path: PathBuf,
-    /// Index file (default: %LOCALAPPDATA%\whereti\names.idx)
+    /// Index file (default: %ProgramData%\whereti\names.idx)
     #[arg(long)]
     index: Option<PathBuf>,
 }
@@ -44,7 +44,14 @@ pub fn run(args: InspectArgs) -> Result<(), String> {
     println!("MFT record        {record} (sequence {})", frn >> 48);
     println!("Windows says      modified minute {}", ft / 600_000_000);
 
-    let letter = args.path.to_string_lossy().chars().next().unwrap_or('C');
+    // the drive of the full path (a relative path or `.` names none)
+    let full = std::fs::canonicalize(&args.path).map_err(|e| format!("cannot resolve {}: {e}", args.path.display()))?;
+    let full = full.to_string_lossy();
+    let full = full.strip_prefix(r"\\?\").unwrap_or(&full);
+    let letter = match full.as_bytes() {
+        [l, b':', ..] if l.is_ascii_alphabetic() => (*l as char).to_ascii_uppercase(),
+        _ => return Err(format!("{} is not on a local drive", args.path.display())),
+    };
     let vol = Volume::open(letter, false).map_err(|e| crate::open_error(letter, e))?;
     let mut buf = Vec::new();
     match journal::read_record(&vol, record, &mut buf).map_err(|e| e.to_string())? {
