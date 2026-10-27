@@ -14,10 +14,10 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use ed25519_dalek::{Signature, VerifyingKey};
 
-/// The public key keys are checked with. Replaced by the production key
-/// (scripts/new-license-key.mjs) before the first release; scripts/package.ps1
-/// -Release refuses to build while this is still the development key.
-pub const PUBLIC_KEY_HEX: &str = "94227185d97edf2e009d21471dda317df8c766a407391f3cb840ebd53ded5d2b";
+/// The production public key keys are checked with (made once with
+/// whereti.licenses/scripts/new-key.mjs; the private half signs the keys).
+/// scripts/package.ps1 -Release refuses to build with the development key.
+pub const PUBLIC_KEY_HEX: &str = "60a6dc92f067e73023b7e51860847348776873770b15af4ead02574f5c1dcabb";
 /// The development key, for tests and dev builds only (the release script
 /// compares against it).
 #[cfg_attr(not(test), allow(dead_code))]
