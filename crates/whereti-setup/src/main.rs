@@ -24,7 +24,18 @@ use eframe::egui::{
     Stroke, Vec2,
 };
 
+/// The version this installer installs, readable in the file itself:
+/// whereti's updater checks it against what the update server offered, so
+/// a server that lies cannot pass an older installer off as a newer one.
+#[used]
+static VERSION_MARK: &str = concat!("WHERETI-SETUP-VERSION=", env!("CARGO_PKG_VERSION"), "\0");
+
 fn main() {
+    // keep the mark in the file even if nothing reads it here
+    std::hint::black_box(VERSION_MARK);
+    // DLLs loaded from here on (by egui, by Windows on our behalf) come
+    // from System32 only, not from the folder the installer was run from
+    ops::dlls_from_system32_only();
     // the installer speaks the Windows display language
     whereti_i18n::set(whereti_i18n::Lang::system());
     let args: Vec<String> = std::env::args().skip(1).collect();

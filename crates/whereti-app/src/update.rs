@@ -324,15 +324,50 @@ fn download_and_run(offer: &Offer, progress: &mut dyn FnMut(u64, u64)) -> Result
     if whereti_net::sha256_hex(&bytes)? != offer.sha256 {
         return Err(tr("The download is damaged. Try again later.").into());
     }
+    // The installer says which version it is: it must be the one offered
+    // (a lying update server cannot pass an older, signed installer off as new).
+    if installer_version(&bytes).as_deref() != Some(offer.version.as_str()) {
+        return Err(tr("The download is damaged. Try again later.").into());
+    }
     let dir = std::env::temp_dir().join("whereti-update");
     let _ = std::fs::create_dir_all(&dir);
     let file = dir.join(format!("whereti-setup-{}.exe", offer.version.replace(['\\', '/', ':'], "")));
     std::fs::write(&file, &bytes).map_err(|e| e.to_string())?;
+    // From here until the installer has started, nobody else may change the
+    // file; and what is on disk is checked again through that same handle.
+    let held = hold(&file, &offer.sha256)?;
     if let Err(e) = verify_publisher(&file) {
+        drop(held);
         let _ = std::fs::remove_file(&file);
         return Err(crate::trf!("The update is not signed by {publisher}: {e}", publisher = PUBLISHER, e));
     }
-    run_installer(&file)
+    let result = run_installer(&file);
+    drop(held);
+    result
+}
+
+/// The version an installer carries (`WHERETI-SETUP-VERSION=x.y.z`).
+fn installer_version(bytes: &[u8]) -> Option<String> {
+    let mark = b"WHERETI-SETUP-VERSION=";
+    let at = bytes.windows(mark.len()).position(|w| w == mark)? + mark.len();
+    let end = bytes[at..].iter().take(32).position(|&b| b == 0)? + at;
+    let v = std::str::from_utf8(&bytes[at..end]).ok()?;
+    v.bytes().all(|b| b.is_ascii_digit() || b == b'.' || b == b'-' || b.is_ascii_alphanumeric()).then(|| v.to_string())
+}
+
+/// Opens the saved installer so that no one can write or delete it while
+/// it is held, and checks that what is on disk is what was downloaded.
+fn hold(file: &Path, sha256: &str) -> Result<std::fs::File, String> {
+    use std::io::Read;
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_SHARE_READ: u32 = 0x1;
+    let mut f = std::fs::OpenOptions::new().read(true).share_mode(FILE_SHARE_READ).open(file).map_err(|e| e.to_string())?;
+    let mut bytes = Vec::new();
+    f.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+    if whereti_net::sha256_hex(&bytes)? != sha256 {
+        return Err(crate::i18n::tr("The download is damaged. Try again later.").into());
+    }
+    Ok(f)
 }
 
 /// Starts `whereti-setup.exe /S /open`: it asks Windows for permission,
@@ -381,13 +416,35 @@ impl EncodeWide for std::ffi::OsStr {
 }
 
 
-/// A valid Authenticode signature whose signer is Software Hive S.R.L.
-/// Revocation lists are not fetched, so this sends nothing anywhere.
+/// The company's registration number (CUI) and country, in the signing
+/// certificate's subject: a name alone could be any "Software Hive S.R.L.".
+const PUBLISHER_SERIAL: &str = "54366095";
+const PUBLISHER_COUNTRY: &str = "RO";
+
+/// A valid Authenticode signature of Software Hive S.R.L. (name, CUI and
+/// country), from a certificate not revoked. When the revocation lists
+/// cannot be reached (an offline network), the signature is checked without
+/// them; a certificate known to be revoked is refused.
 fn verify_publisher(file: &Path) -> Result<(), String> {
-    use windows_sys::Win32::Security::Cryptography::{CertGetNameStringW, CERT_NAME_SIMPLE_DISPLAY_TYPE};
+    const CERT_E_REVOCATION_FAILURE: i32 = 0x800B_010E_u32 as i32;
+    const CRYPT_E_REVOCATION_OFFLINE: i32 = 0x8009_2013_u32 as i32;
+    const CRYPT_E_NO_REVOCATION_CHECK: i32 = 0x8009_2012_u32 as i32;
+    match verify_signature(file, true) {
+        Err((code, _)) if [CERT_E_REVOCATION_FAILURE, CRYPT_E_REVOCATION_OFFLINE, CRYPT_E_NO_REVOCATION_CHECK].contains(&code) => {
+            verify_signature(file, false).map_err(|(_, e)| e)
+        }
+        other => other.map_err(|(_, e)| e),
+    }
+}
+
+/// One WinVerifyTrust pass; `revocation`: also check the chain against the
+/// certificate authority's revocation lists.
+fn verify_signature(file: &Path, revocation: bool) -> Result<(), (i32, String)> {
+    use windows_sys::Win32::Security::Cryptography::{CertGetNameStringW, CERT_NAME_ATTR_TYPE, CERT_NAME_SIMPLE_DISPLAY_TYPE};
     use windows_sys::Win32::Security::WinTrust::{
         WTHelperGetProvSignerFromChain, WTHelperProvDataFromStateData, WinVerifyTrust, WINTRUST_ACTION_GENERIC_VERIFY_V2,
-        WINTRUST_DATA, WINTRUST_DATA_0, WINTRUST_FILE_INFO, WTD_CACHE_ONLY_URL_RETRIEVAL, WTD_CHOICE_FILE, WTD_REVOKE_NONE,
+        WINTRUST_DATA, WINTRUST_DATA_0, WINTRUST_FILE_INFO, WTD_CACHE_ONLY_URL_RETRIEVAL, WTD_CHOICE_FILE,
+        WTD_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT, WTD_REVOKE_NONE, WTD_REVOKE_WHOLECHAIN,
         WTD_STATEACTION_CLOSE, WTD_STATEACTION_VERIFY, WTD_UI_NONE,
     };
     let path = file.as_os_str().encode_wide_nul();
@@ -400,14 +457,15 @@ fn verify_publisher(file: &Path) -> Result<(), String> {
         let mut data: WINTRUST_DATA = std::mem::zeroed();
         data.cbStruct = std::mem::size_of::<WINTRUST_DATA>() as u32;
         data.dwUIChoice = WTD_UI_NONE;
-        data.fdwRevocationChecks = WTD_REVOKE_NONE;
+        data.fdwRevocationChecks = if revocation { WTD_REVOKE_WHOLECHAIN } else { WTD_REVOKE_NONE };
         data.dwUnionChoice = WTD_CHOICE_FILE;
         data.Anonymous = WINTRUST_DATA_0 { pFile: &mut fi };
         data.dwStateAction = WTD_STATEACTION_VERIFY;
-        data.dwProvFlags = WTD_CACHE_ONLY_URL_RETRIEVAL;
+        data.dwProvFlags = if revocation { WTD_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT } else { WTD_CACHE_ONLY_URL_RETRIEVAL };
         let mut action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
         let status = WinVerifyTrust(std::ptr::null_mut(), &mut action, &mut data as *mut _ as *mut _);
         let mut signer = String::new();
+        let (mut serial, mut country) = (String::new(), String::new());
         if status == 0 {
             let prov = WTHelperProvDataFromStateData(data.hWVTStateData);
             let sgnr = if prov.is_null() { std::ptr::null_mut() } else { WTHelperGetProvSignerFromChain(prov, 0, 0, 0) };
@@ -416,15 +474,26 @@ fn verify_publisher(file: &Path) -> Result<(), String> {
                 let mut buf = [0u16; 256];
                 let n = CertGetNameStringW(cert, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0, std::ptr::null(), buf.as_mut_ptr(), 256);
                 signer = String::from_utf16_lossy(&buf[..n.saturating_sub(1) as usize]);
+                // subject attributes by OID: serialNumber (2.5.4.5), country (2.5.4.6)
+                let attr = |oid: &[u8]| {
+                    let mut buf = [0u16; 128];
+                    let n = CertGetNameStringW(cert, CERT_NAME_ATTR_TYPE, 0, oid.as_ptr().cast(), buf.as_mut_ptr(), 128);
+                    String::from_utf16_lossy(&buf[..n.saturating_sub(1) as usize])
+                };
+                serial = attr(b"2.5.4.5\0");
+                country = attr(b"2.5.4.6\0");
             }
         }
         data.dwStateAction = WTD_STATEACTION_CLOSE;
         WinVerifyTrust(std::ptr::null_mut(), &mut action, &mut data as *mut _ as *mut _);
         if status != 0 {
-            return Err(format!("no valid signature ({:#x})", status as u32));
+            return Err((status, format!("no valid signature ({:#x})", status as u32)));
         }
-        if !signer.trim().eq_ignore_ascii_case(PUBLISHER) {
-            return Err(format!("signed by {signer}"));
+        if !signer.trim().eq_ignore_ascii_case(PUBLISHER)
+            || serial.trim() != PUBLISHER_SERIAL
+            || !country.trim().eq_ignore_ascii_case(PUBLISHER_COUNTRY)
+        {
+            return Err((0, format!("signed by {signer} ({serial}, {country})")));
         }
     }
     Ok(())
@@ -515,5 +584,36 @@ mod tests {
         std::fs::write(&path, b"MZ not really a program").unwrap();
         assert!(verify_publisher(&path).is_err());
         let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[cfg(test)]
+mod publisher_tests {
+    use super::*;
+
+    /// The signed installer of a release passes (name, CUI, country,
+    /// revocation); an unsigned program does not. Needs dist\ from a
+    /// signed build; skipped without it.
+    #[test]
+    fn only_the_company_s_signature_passes() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../dist");
+        let signed = std::fs::read_dir(&root)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("whereti-setup-")));
+        let Some(signed) = signed else { return };
+        assert_eq!(verify_publisher(&signed), Ok(()));
+        let unsigned = std::env::current_exe().unwrap();
+        assert!(verify_publisher(&unsigned).is_err());
+    }
+
+    #[test]
+    fn the_installer_says_its_version() {
+        let mut bytes = b"MZ....".to_vec();
+        bytes.extend_from_slice(b"WHERETI-SETUP-VERSION=1.0.0\0rest");
+        assert_eq!(installer_version(&bytes).as_deref(), Some("1.0.0"));
+        assert_eq!(installer_version(b"MZ no mark"), None);
     }
 }

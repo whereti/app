@@ -12,6 +12,10 @@ const FILES: [&str; 5] = ["whereti.exe", "whereti-service.exe", "whereti-extract
 
 fn main() {
     println!("cargo:rerun-if-env-changed=WHERETI_PAYLOAD");
+    // The installer often runs from Downloads, and elevated: the DLLs it
+    // links to are looked for in System32 only, never beside it, where
+    // anything downloaded could sit (LOAD_LIBRARY_SEARCH_SYSTEM32).
+    println!("cargo:rustc-link-arg-bins=/DEPENDENTLOADFLAG:0x800");
     let dir = match std::env::var_os("WHERETI_PAYLOAD") {
         Some(d) => PathBuf::from(d),
         None => PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/release"),

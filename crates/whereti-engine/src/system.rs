@@ -30,10 +30,25 @@ pub fn default_index_path() -> PathBuf {
 }
 
 /// Creates the data folder readable only by SYSTEM and Administrators.
+///
+/// A folder already there is used only if SYSTEM or Administrators own it
+/// and it is a real folder. Any user may create folders in ProgramData: one
+/// made before whereti was installed (or after it was removed) would let
+/// that user read the index and point the service's writes elsewhere (a
+/// junction). Such a folder is removed, without following links inside it,
+/// and made again: it holds nothing the service cannot rebuild.
 pub fn ensure_data_dir() -> io::Result<PathBuf> {
     let dir = data_dir();
-    if dir.is_dir() {
-        return Ok(dir);
+    if let Ok(meta) = std::fs::symlink_metadata(&dir) {
+        if is_ours(&dir, &meta) {
+            return Ok(dir);
+        }
+        let link = meta.file_type().is_symlink() || is_reparse(&meta);
+        // a link goes, not what it points to; a real folder goes whole
+        let removed = if link { std::fs::remove_dir(&dir).or_else(|_| std::fs::remove_file(&dir)) } else { std::fs::remove_dir_all(&dir) };
+        if let Err(e) = removed {
+            return Err(io::Error::other(format!("{} is not whereti's and cannot be removed: {e}", dir.display())));
+        }
     }
     let sddl: Vec<u16> = "D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)".encode_utf16().chain([0]).collect();
     let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
@@ -55,6 +70,47 @@ pub fn ensure_data_dir() -> io::Result<PathBuf> {
         return Err(err);
     }
     Ok(dir)
+}
+
+fn is_reparse(meta: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+/// A real folder owned by SYSTEM or Administrators.
+fn is_ours(dir: &std::path::Path, meta: &std::fs::Metadata) -> bool {
+    use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::{
+        IsWellKnownSid, WinBuiltinAdministratorsSid, WinLocalSystemSid, OWNER_SECURITY_INFORMATION, PSID,
+    };
+    if !meta.is_dir() || meta.file_type().is_symlink() || is_reparse(meta) {
+        return false;
+    }
+    let wide = dir.as_os_str().encode_wide_nul();
+    let mut owner: PSID = std::ptr::null_mut();
+    let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    // SAFETY: valid path; `owner` points into `sd`, freed below.
+    let err = unsafe {
+        GetNamedSecurityInfoW(
+            wide.as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut owner,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut sd,
+        )
+    };
+    if err != 0 || owner.is_null() {
+        return false;
+    }
+    // SAFETY: `owner` is a valid SID inside `sd`.
+    let ours = unsafe { IsWellKnownSid(owner, WinLocalSystemSid) != 0 || IsWellKnownSid(owner, WinBuiltinAdministratorsSid) != 0 };
+    // SAFETY: allocated by GetNamedSecurityInfoW.
+    unsafe { LocalFree(sd) };
+    ours
 }
 
 trait EncodeWideNul {

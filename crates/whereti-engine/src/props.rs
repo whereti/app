@@ -103,7 +103,7 @@ fn read_inner(path: &Path, ext: &str, tz_offset: i32) -> Props {
 
 fn read_head(path: &Path, max: u64) -> std::io::Result<Vec<u8>> {
     let mut buf = Vec::new();
-    std::fs::File::open(path)?.take(max).read_to_end(&mut buf)?;
+    whereti_extract::worker::open_real(path)?.take(max).read_to_end(&mut buf)?;
     Ok(buf)
 }
 
@@ -252,7 +252,7 @@ fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
 /// PDFs keep their strings encrypted: none.
 fn pdf_author(path: &Path) -> Option<String> {
     use std::io::{Seek, SeekFrom};
-    let mut f = std::fs::File::open(path).ok()?;
+    let mut f = whereti_extract::worker::open_real(path).ok()?;
     let len = f.metadata().ok()?.len();
     let mut head = Vec::new();
     (&mut f).take(1 << 20).read_to_end(&mut head).ok()?;
@@ -370,7 +370,7 @@ fn media(path: &Path, p: &mut Props) {
 
 /// The text of the first `<tag>` in one XML part of a ZIP-based document.
 fn zip_xml_tag(path: &Path, part: &str, tag: &str) -> Option<String> {
-    let file = std::fs::File::open(path).ok()?;
+    let file = whereti_extract::worker::open_real(path).ok()?;
     let mut zip = zip::ZipArchive::new(file).ok()?;
     let mut entry = zip.by_name(part).ok()?;
     if entry.size() > 1 << 20 {

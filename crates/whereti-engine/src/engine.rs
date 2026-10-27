@@ -189,6 +189,19 @@ impl Engine {
     }
 
     pub fn handle(&self, req: Request, caller: &dyn Caller) -> Response {
+        // What the service indexes and reads is the same for everyone on the
+        // PC: only an administrator's account may change it.
+        let for_everyone = matches!(
+            req,
+            Request::SetExclusions { .. }
+                | Request::SetContentFolders { .. }
+                | Request::SetPhotoTags { .. }
+                | Request::SetMeaning { .. }
+                | Request::SetWorkFolders { .. }
+        );
+        if for_everyone && !caller.is_admin() {
+            return Response::Error("only an administrator of this PC can change this setting".into());
+        }
         match req {
             Request::Hello { .. } => Response::Hello {
                 version: PROTOCOL_VERSION,

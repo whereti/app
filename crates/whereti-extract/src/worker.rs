@@ -21,11 +21,114 @@ use crate::{extract, ExtractError, Extracted};
 const EXIT_UNSUPPORTED: i32 = 2;
 const EXIT_PROTECTED: i32 = 3;
 const EXIT_DAMAGED: i32 = 4;
+/// The worker could not give up its rights: it reads nothing.
+const EXIT_LOCKDOWN: i32 = 5;
+
+/// Gives up what the worker inherits from the SYSTEM service before it reads
+/// a single byte of a document: every privilege (bar traversing folders),
+/// and its integrity drops to Low. A document that took over a parser then
+/// can write no file or registry key the user or the system uses, cannot
+/// touch the service or any other process, and cannot use SYSTEM's
+/// privileges (debug, impersonate, load drivers, take ownership...). The
+/// installer also blocks the worker's network access in Windows Firewall.
+fn lockdown() -> Result<(), String> {
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, LUID, ERROR_NOT_ALL_ASSIGNED, HANDLE};
+    use windows_sys::Win32::Security::{
+        AdjustTokenPrivileges, AllocateAndInitializeSid, FreeSid, GetTokenInformation, LookupPrivilegeValueW,
+        SetTokenInformation, TokenIntegrityLevel, TokenPrivileges, LUID_AND_ATTRIBUTES, SE_PRIVILEGE_REMOVED,
+        SID_AND_ATTRIBUTES, SID_IDENTIFIER_AUTHORITY, TOKEN_ADJUST_DEFAULT, TOKEN_ADJUST_PRIVILEGES,
+        TOKEN_MANDATORY_LABEL, TOKEN_PRIVILEGES, TOKEN_QUERY,
+    };
+    use windows_sys::Win32::System::SystemServices::{SECURITY_MANDATORY_LOW_RID, SE_GROUP_INTEGRITY};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    let err = |what: &str| format!("{what}: {}", std::io::Error::last_os_error());
+    let mut token: HANDLE = std::ptr::null_mut();
+    // SAFETY: our own process token, closed below.
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_ADJUST_DEFAULT | TOKEN_QUERY, &mut token) } == 0 {
+        return Err(err("open token"));
+    }
+    struct Close(HANDLE);
+    impl Drop for Close {
+        fn drop(&mut self) {
+            // SAFETY: a handle we opened.
+            unsafe { CloseHandle(self.0) };
+        }
+    }
+    let _close = Close(token);
+
+    // 1. every privilege removed for good, except passing through folders
+    let mut needed = 0u32;
+    // SAFETY: size query, then a buffer of that size.
+    unsafe { GetTokenInformation(token, TokenPrivileges, std::ptr::null_mut(), 0, &mut needed) };
+    let mut buf = vec![0u64; (needed as usize).div_ceil(8) + 1];
+    // SAFETY: the buffer is at least `needed` bytes and 8-aligned.
+    if unsafe { GetTokenInformation(token, TokenPrivileges, buf.as_mut_ptr().cast(), needed, &mut needed) } == 0 {
+        return Err(err("read privileges"));
+    }
+    let mut keep = LUID { LowPart: 0, HighPart: 0 };
+    let name: Vec<u16> = "SeChangeNotifyPrivilege".encode_utf16().chain([0]).collect();
+    // SAFETY: a NUL-terminated name.
+    unsafe { LookupPrivilegeValueW(std::ptr::null(), name.as_ptr(), &mut keep) };
+    // SAFETY: TOKEN_PRIVILEGES as Windows wrote it: a count, then that many entries.
+    let privs = unsafe { &mut *(buf.as_mut_ptr() as *mut TOKEN_PRIVILEGES) };
+    let entries: &mut [LUID_AND_ATTRIBUTES] =
+        // SAFETY: `PrivilegeCount` entries follow the count, inside `buf`.
+        unsafe { std::slice::from_raw_parts_mut(privs.Privileges.as_mut_ptr(), privs.PrivilegeCount as usize) };
+    let mut removed = 0u32;
+    for e in entries.iter_mut() {
+        if e.Luid.LowPart == keep.LowPart && e.Luid.HighPart == keep.HighPart {
+            e.Attributes = 0; // left as it is
+        } else {
+            e.Attributes = SE_PRIVILEGE_REMOVED;
+            removed += 1;
+        }
+    }
+    if removed > 0 {
+        // SAFETY: the list Windows gave us, each entry marked.
+        let ok = unsafe { AdjustTokenPrivileges(token, 0, privs, 0, std::ptr::null_mut(), std::ptr::null_mut()) };
+        // SAFETY: plain read of the thread's last error.
+        if ok == 0 || unsafe { GetLastError() } == ERROR_NOT_ALL_ASSIGNED {
+            return Err(err("remove privileges"));
+        }
+    }
+
+    // 2. integrity down to Low (a process may always lower its own)
+    let authority = SID_IDENTIFIER_AUTHORITY { Value: [0, 0, 0, 0, 0, 16] };
+    let mut sid = std::ptr::null_mut();
+    // SAFETY: the mandatory label authority with one sub-authority; freed below.
+    if unsafe { AllocateAndInitializeSid(&authority, 1, SECURITY_MANDATORY_LOW_RID as u32, 0, 0, 0, 0, 0, 0, 0, &mut sid) } == 0 {
+        return Err(err("low integrity SID"));
+    }
+    let label = TOKEN_MANDATORY_LABEL { Label: SID_AND_ATTRIBUTES { Sid: sid, Attributes: SE_GROUP_INTEGRITY as u32 } };
+    let size = std::mem::size_of::<TOKEN_MANDATORY_LABEL>() as u32 + 12;
+    // SAFETY: a valid label for our own token; the SID lives until FreeSid.
+    let ok = unsafe { SetTokenInformation(token, TokenIntegrityLevel, (&label as *const TOKEN_MANDATORY_LABEL).cast(), size) };
+    // SAFETY: the SID we allocated.
+    unsafe { FreeSid(sid) };
+    if ok == 0 {
+        return Err(err("lower integrity"));
+    }
+    Ok(())
+}
 
 /// Worker side: the whole `main` of whereti-extract.exe.
 pub fn serve_stdio() -> i32 {
+    // before reading anything (the service writes stdin only once this
+    // process is inside its job; parsing starts after this)
+    if let Err(e) = lockdown() {
+        eprintln!("whereti-extract: {e}");
+        return EXIT_LOCKDOWN;
+    }
     let args: Vec<String> = std::env::args().collect();
     let arg = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
+    // for the tests: after the lockdown, writing a file must be refused
+    if let Some(probe) = arg("--probe-lockdown") {
+        return match std::fs::write(&probe, b"x") {
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => 0,
+            _ => 1,
+        };
+    }
     if let Some(model) = arg("--tags") {
         return serve_tags(Path::new(&model));
     }
@@ -244,9 +347,8 @@ impl Sandbox {
     /// worker is in its job; at most 60 s, so Outlook started meanwhile
     /// waits little.
     fn extract_mailbox(&self, path: &Path, max_chars: usize) -> Result<Extracted, SandboxError> {
-        use std::os::windows::fs::OpenOptionsExt;
         use std::os::windows::io::AsRawHandle;
-        let file = std::fs::OpenOptions::new().read(true).share_mode(0x1 | 0x2 | 0x4).open(path).map_err(SandboxError::Io)?;
+        let file = open_real(path).map_err(SandboxError::Io)?;
         let worker = Sandbox { exe: self.exe.clone(), timeout: Duration::from_secs(60), memory_limit: self.memory_limit, max_file: self.max_file };
         let result = worker.run_with(&["--mailbox".to_string(), "--max".to_string(), max_chars.to_string()], Vec::new(), Some(file.as_raw_handle()));
         drop(file);
@@ -506,9 +608,12 @@ impl TagWorker {
     }
 }
 
-/// Reads a file without blocking its writers and without changing its
-/// last-access time.
-pub fn read_shared(path: &Path, max: u64) -> Result<Vec<u8>, SandboxError> {
+/// Opens `path` to read, sharing it with its writers, only if the file
+/// opened is the one at `path` itself. The service reads as SYSTEM files a
+/// user asked about (and checked to be readable by that user); a folder on
+/// the way swapped for a junction would otherwise send it to someone
+/// else's file. Read from the handle this returns, never by path again.
+pub fn open_real(path: &Path) -> std::io::Result<std::fs::File> {
     use std::os::windows::fs::OpenOptionsExt;
     const FILE_SHARE_ALL: u32 = 0x1 | 0x2 | 0x4;
     const FILE_FLAG_SEQUENTIAL_SCAN: u32 = 0x0800_0000;
@@ -516,8 +621,52 @@ pub fn read_shared(path: &Path, max: u64) -> Result<Vec<u8>, SandboxError> {
         .read(true)
         .share_mode(FILE_SHARE_ALL)
         .custom_flags(FILE_FLAG_SEQUENTIAL_SCAN)
-        .open(path)
-        .map_err(SandboxError::Io)?;
+        .open(path)?;
+    let real = final_path(&file)?;
+    if !same_path(&real, path) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("{} leads to {} (a link on the way): not read", path.display(), real.display()),
+        ));
+    }
+    Ok(file)
+}
+
+/// Where an open file really is, as a DOS path.
+fn final_path(file: &std::fs::File) -> std::io::Result<PathBuf> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{GetFinalPathNameByHandleW, FILE_NAME_NORMALIZED, VOLUME_NAME_DOS};
+    let mut buf = vec![0u16; 512];
+    loop {
+        // SAFETY: an open handle and a buffer of the given length.
+        let n = unsafe {
+            GetFinalPathNameByHandleW(file.as_raw_handle() as _, buf.as_mut_ptr(), buf.len() as u32, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS)
+        } as usize;
+        if n == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if n < buf.len() {
+            let s = String::from_utf16_lossy(&buf[..n]);
+            let s = match s.strip_prefix(r"\\?\UNC\") {
+                Some(rest) => format!(r"\\{rest}"),
+                None => s.strip_prefix(r"\\?\").unwrap_or(&s).to_string(),
+            };
+            return Ok(PathBuf::from(s));
+        }
+        buf.resize(n + 1, 0);
+    }
+}
+
+/// The same path, letter case and slashes aside.
+fn same_path(a: &Path, b: &Path) -> bool {
+    let norm = |p: &Path| p.to_string_lossy().replace('/', "\\").trim_end_matches('\\').to_lowercase();
+    norm(a) == norm(b)
+}
+
+/// Reads a file without blocking its writers and without changing its
+/// last-access time (only at its real path, see `open_real`).
+pub fn read_shared(path: &Path, max: u64) -> Result<Vec<u8>, SandboxError> {
+    let file = open_real(path).map_err(SandboxError::Io)?;
     let len = file.metadata().map_err(SandboxError::Io)?.len();
     if len > max {
         return Err(SandboxError::TooLarge(len));

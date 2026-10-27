@@ -1600,8 +1600,7 @@ fn extract(
 /// The last `max` bytes of a file.
 fn read_tail(path: &Path, max: u64) -> Result<Vec<u8>, SandboxError> {
     use std::io::{Read, Seek, SeekFrom};
-    use std::os::windows::fs::OpenOptionsExt;
-    let mut f = std::fs::OpenOptions::new().read(true).share_mode(7).open(path).map_err(SandboxError::Io)?;
+    let mut f = whereti_extract::worker::open_real(path).map_err(SandboxError::Io)?;
     let len = f.metadata().map_err(SandboxError::Io)?.len();
     f.seek(SeekFrom::Start(len.saturating_sub(max))).map_err(SandboxError::Io)?;
     let mut buf = Vec::new();
@@ -1613,8 +1612,7 @@ fn read_head(path: &Path, max: u64) -> Result<Vec<u8>, SandboxError> {
     match read_shared(path, max) {
         Err(SandboxError::TooLarge(_)) => {
             use std::io::Read;
-            use std::os::windows::fs::OpenOptionsExt;
-            let f = std::fs::OpenOptions::new().read(true).share_mode(7).open(path).map_err(SandboxError::Io)?;
+            let f = whereti_extract::worker::open_real(path).map_err(SandboxError::Io)?;
             let mut buf = Vec::new();
             f.take(max).read_to_end(&mut buf).map_err(SandboxError::Io)?;
             Ok(buf)

@@ -30,23 +30,72 @@ const UNINSTALL_KEY: PCWSTR = w!(r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uni
 const RUN_KEY: PCWSTR = w!(r"Software\Microsoft\Windows\CurrentVersion\Run");
 const SERVICE: &str = "whereti";
 
+/// A folder as Windows knows it (never from environment variables: the
+/// elevated installer must not take a path the user could have set).
+fn known_folder(id: &windows::core::GUID, fallback: &str) -> PathBuf {
+    use windows::Win32::System::Com::CoTaskMemFree;
+    use windows::Win32::UI::Shell::{SHGetKnownFolderPath, KF_FLAG_DEFAULT};
+    // SAFETY: the returned string is freed with CoTaskMemFree.
+    unsafe {
+        match SHGetKnownFolderPath(id, KF_FLAG_DEFAULT, None) {
+            Ok(p) => {
+                let path = p.to_string().map(PathBuf::from).unwrap_or_else(|_| PathBuf::from(fallback));
+                CoTaskMemFree(Some(p.0 as _));
+                path
+            }
+            Err(_) => PathBuf::from(fallback),
+        }
+    }
+}
+
 pub fn install_dir() -> PathBuf {
-    let base = std::env::var_os("ProgramW6432")
-        .or_else(|| std::env::var_os("ProgramFiles"))
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"C:\Program Files"));
-    base.join("whereti")
+    known_folder(&windows::Win32::UI::Shell::FOLDERID_ProgramFiles, r"C:\Program Files").join("whereti")
 }
 
 fn data_dir() -> PathBuf {
-    std::env::var_os("ProgramData").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(r"C:\ProgramData")).join("whereti")
+    known_folder(&windows::Win32::UI::Shell::FOLDERID_ProgramData, r"C:\ProgramData").join("whereti")
 }
 
 fn start_menu_link() -> PathBuf {
-    std::env::var_os("ProgramData")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
-        .join(r"Microsoft\Windows\Start Menu\Programs\whereti.lnk")
+    known_folder(&windows::Win32::UI::Shell::FOLDERID_CommonPrograms, r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs")
+        .join("whereti.lnk")
+}
+
+/// System32, from Windows.
+fn system32() -> PathBuf {
+    use windows::Win32::System::SystemInformation::GetSystemDirectoryW;
+    let mut buf = [0u16; 260];
+    // SAFETY: a buffer of the given length.
+    let n = unsafe { GetSystemDirectoryW(Some(&mut buf)) } as usize;
+    if n == 0 || n >= buf.len() {
+        return PathBuf::from(r"C:\Windows\System32");
+    }
+    PathBuf::from(String::from_utf16_lossy(&buf[..n]))
+}
+
+/// DLLs come from System32 only from here on.
+pub fn dlls_from_system32_only() {
+    use windows::Win32::System::LibraryLoader::{SetDefaultDllDirectories, LOAD_LIBRARY_SEARCH_SYSTEM32};
+    // SAFETY: a process-wide setting with a valid flag.
+    let _ = unsafe { SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32) };
+}
+
+const FIREWALL_RULE: &str = "whereti document reader (no network)";
+
+/// The document reader never needs the network: Windows Firewall blocks
+/// it, so a document that took it over cannot send anything out.
+fn block_reader_network(dir: &Path) {
+    let netsh = system32().join("netsh.exe");
+    let _ = Command::new(&netsh).args(["advfirewall", "firewall", "delete", "rule", &format!("name={FIREWALL_RULE}")]).output();
+    let program = format!("program={}", dir.join("whereti-extract.exe").display());
+    let _ = Command::new(&netsh)
+        .args(["advfirewall", "firewall", "add", "rule", &format!("name={FIREWALL_RULE}"), "dir=out", "action=block", &program, "enable=yes", "profile=any"])
+        .output();
+}
+
+fn unblock_reader_network() {
+    let netsh = system32().join("netsh.exe");
+    let _ = Command::new(&netsh).args(["advfirewall", "firewall", "delete", "rule", &format!("name={FIREWALL_RULE}")]).output();
 }
 
 /// The version already installed, if any (from Settings → Apps).
@@ -89,6 +138,8 @@ pub fn install(log: &mut dyn FnMut(&str)) -> Result<(), String> {
         let bytes = std::fs::read(&me).map_err(|e| format!("cannot read the installer: {e}"))?;
         write_file(&uninstaller, &bytes)?;
     }
+
+    block_reader_network(&dir);
 
     log("Installing the search service…");
     let service = dir.join("whereti-service.exe");
@@ -323,6 +374,7 @@ pub fn uninstall(log: &mut dyn FnMut(&str)) -> Result<(), String> {
         run(&service, &["uninstall"])?;
     }
     close_running(&dir);
+    unblock_reader_network();
 
     log("Removing the files…");
     let me = std::env::current_exe().ok();

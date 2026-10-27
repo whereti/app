@@ -30,6 +30,12 @@ use windows_sys::Win32::System::Pipes::{
 pub const PIPE_NAME: &str = r"\\.\pipe\whereti";
 pub const PROTOCOL_VERSION: u32 = 12;
 const MAX_MESSAGE: usize = 64 << 20;
+/// What the service reads from a client in one request: requests are small
+/// (500 exclusion paths fit easily), so no client makes it hold 64 MB.
+const MAX_REQUEST: usize = 2 << 20;
+/// Clients served at once; more wait for a free one, so no one can make the
+/// service start thread after thread.
+const MAX_CLIENTS: usize = 64;
 
 /// The account that created the pipe (OW), SYSTEM and Administrators: full
 /// access. Interactive users: read + write data only, no
@@ -264,6 +270,11 @@ pub fn write_message<T: Serialize>(w: &mut impl Write, msg: &T) -> io::Result<()
 
 /// `Ok(None)` when the other side closed the connection cleanly.
 pub fn read_message<T: for<'de> Deserialize<'de>>(r: &mut impl Read) -> io::Result<Option<T>> {
+    read_message_max(r, MAX_MESSAGE)
+}
+
+/// `read_message`, with a smaller ceiling.
+fn read_message_max<T: for<'de> Deserialize<'de>>(r: &mut impl Read, max: usize) -> io::Result<Option<T>> {
     let mut len = [0u8; 4];
     match r.read_exact(&mut len) {
         Ok(()) => {}
@@ -272,7 +283,7 @@ pub fn read_message<T: for<'de> Deserialize<'de>>(r: &mut impl Read) -> io::Resu
         Err(e) => return Err(e),
     }
     let len = u32::from_le_bytes(len) as usize;
-    if len > MAX_MESSAGE {
+    if len > max {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "message too large"));
     }
     let mut buf = vec![0u8; len];
@@ -423,6 +434,11 @@ fn is_elevated(pid: u32) -> bool {
 pub trait Caller {
     /// For each path: may the caller open it for reading?
     fn can_read(&self, paths: &[String]) -> Vec<bool>;
+    /// May the caller change what the service does for everyone (what is
+    /// indexed, what is read)? An administrator's account, elevated or not.
+    fn is_admin(&self) -> bool {
+        false
+    }
 }
 
 /// A caller allowed everything (in-process use and tests).
@@ -431,6 +447,9 @@ pub struct Trusted;
 impl Caller for Trusted {
     fn can_read(&self, paths: &[String]) -> Vec<bool> {
         vec![true; paths.len()]
+    }
+    fn is_admin(&self) -> bool {
+        true
     }
 }
 
@@ -478,6 +497,46 @@ impl Caller for PipeCaller {
         unsafe { RevertToSelf() };
         out
     }
+
+    /// The client's token holds the Administrators group, enabled or (not
+    /// elevated) for deny only: the account is one of the PC's
+    /// administrators. A standard account (a child's, a guest's) is not.
+    fn is_admin(&self) -> bool {
+        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+        use windows_sys::Win32::Security::{
+            GetTokenInformation, IsWellKnownSid, RevertToSelf, TokenGroups, WinBuiltinAdministratorsSid, TOKEN_GROUPS,
+            TOKEN_QUERY,
+        };
+        use windows_sys::Win32::System::Pipes::ImpersonateNamedPipeClient;
+        use windows_sys::Win32::System::Threading::{GetCurrentThread, OpenThreadToken};
+        // SAFETY: valid pipe handle of a connected client.
+        if unsafe { ImpersonateNamedPipeClient(self.0 as _) } == 0 {
+            return false;
+        }
+        let mut token: HANDLE = std::ptr::null_mut();
+        // SAFETY: the impersonation token of this thread; closed below.
+        let opened = unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut token) } != 0;
+        // SAFETY: back to the service's own rights before anything else.
+        unsafe { RevertToSelf() };
+        if !opened {
+            return false;
+        }
+        let mut needed = 0u32;
+        // SAFETY: size query, then a buffer of that size (8-aligned).
+        unsafe { GetTokenInformation(token, TokenGroups, std::ptr::null_mut(), 0, &mut needed) };
+        let mut buf = vec![0u64; (needed as usize).div_ceil(8) + 1];
+        let ok = unsafe { GetTokenInformation(token, TokenGroups, buf.as_mut_ptr().cast(), needed, &mut needed) } != 0;
+        let admin = ok && {
+            // SAFETY: TOKEN_GROUPS as Windows wrote it: a count, then that many entries.
+            let groups = unsafe { &*(buf.as_ptr() as *const TOKEN_GROUPS) };
+            let list = unsafe { std::slice::from_raw_parts(groups.Groups.as_ptr(), groups.GroupCount as usize) };
+            // SAFETY: each SID points into `buf`.
+            list.iter().any(|g| unsafe { IsWellKnownSid(g.Sid, WinBuiltinAdministratorsSid) } != 0)
+        };
+        // SAFETY: the token we opened.
+        unsafe { CloseHandle(token) };
+        admin
+    }
 }
 
 pub type Handler = Arc<dyn Fn(Request, &dyn Caller) -> Response + Send + Sync>;
@@ -516,6 +575,7 @@ impl Server {
 }
 
 fn accept_loop(name: &str, mut instance: OwnedHandle, handler: Handler, stop: Arc<AtomicBool>) {
+    let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     loop {
         let raw = std::os::windows::io::AsRawHandle::as_raw_handle(&instance);
         // SAFETY: valid pipe handle; synchronous call.
@@ -525,10 +585,23 @@ fn accept_loop(name: &str, mut instance: OwnedHandle, handler: Handler, stop: Ar
             return;
         }
         if connected {
+            // at most MAX_CLIENTS at once: the next one waits its turn
+            while active.load(Ordering::SeqCst) >= MAX_CLIENTS && !stop.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(20));
+            }
             let handler = handler.clone();
-            let _ = std::thread::Builder::new()
-                .name("pipe-client".into())
-                .spawn(move || serve_client(instance, handler));
+            let active = active.clone();
+            active.fetch_add(1, Ordering::SeqCst);
+            let spawned = std::thread::Builder::new().name("pipe-client".into()).spawn({
+                let active = active.clone();
+                move || {
+                    serve_client(instance, handler);
+                    active.fetch_sub(1, Ordering::SeqCst);
+                }
+            });
+            if spawned.is_err() {
+                active.fetch_sub(1, Ordering::SeqCst);
+            }
         }
         // A fresh instance for the next client.
         instance = loop {
@@ -544,7 +617,7 @@ fn accept_loop(name: &str, mut instance: OwnedHandle, handler: Handler, stop: Ar
 fn serve_client(handle: OwnedHandle, handler: Handler) {
     let mut pipe = File::from(handle);
     loop {
-        let req: Request = match read_message(&mut pipe) {
+        let req: Request = match read_message_max(&mut pipe, MAX_REQUEST) {
             Ok(Some(r)) => r,
             Ok(None) => return,
             Err(e) => {
@@ -700,5 +773,30 @@ ot\here.txt".to_string()];
         assert!(read_message::<Request>(&mut huge.as_slice()).is_err());
         let garbage = [3u8, 0, 0, 0, 0xFF, 0xFF, 0xFF];
         assert!(read_message::<Request>(&mut garbage.as_slice()).is_err());
+    }
+}
+
+#[cfg(test)]
+mod limits_tests {
+    use super::*;
+
+    #[test]
+    fn a_request_larger_than_the_ceiling_is_refused() {
+        let mut big = ((MAX_REQUEST + 1) as u32).to_le_bytes().to_vec();
+        big.extend(std::iter::repeat_n(0u8, 16));
+        let r: io::Result<Option<Request>> = read_message_max(&mut big.as_slice(), MAX_REQUEST);
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn only_admins_change_settings_by_default() {
+        struct Plain;
+        impl Caller for Plain {
+            fn can_read(&self, p: &[String]) -> Vec<bool> {
+                vec![true; p.len()]
+            }
+        }
+        assert!(!Plain.is_admin());
+        assert!(Trusted.is_admin());
     }
 }

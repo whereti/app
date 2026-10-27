@@ -125,8 +125,8 @@ fn remember(path: &str, h: Hashes) {
 }
 
 fn open(path: &str) -> Option<std::fs::File> {
-    use std::os::windows::fs::OpenOptionsExt;
-    std::fs::OpenOptions::new().read(true).share_mode(7).open(path).ok()
+    // only at its real path: no link swapped in after the access check
+    whereti_extract::worker::open_real(std::path::Path::new(path)).ok()
 }
 
 /// The first and last `EDGE` bytes.
