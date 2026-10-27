@@ -11,8 +11,9 @@
 //!    when every byte matched: people delete the "copies" they are shown.
 //!
 //! Hashing a large file can take longer than one search: its progress is
-//! remembered (by path, size and date), so the next search goes on from
-//! there, and sets not proven yet are simply not shown yet.
+//! remembered (by path, size, and last write and change time to the 100
+//! ns, read from the file itself), so the next search goes on from there,
+//! and sets not proven yet are simply not shown yet.
 
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom};
@@ -97,21 +98,40 @@ pub fn size_groups(idx: &NameIndex, query: &Query, within: Option<&HashSet<u32>>
 #[derive(Clone)]
 struct Hashes {
     size: u64,
-    modified: u32,
+    /// The file's last write and last change, to the 100 ns, as read from
+    /// it when hashed: a file rewritten with its old date kept (a
+    /// VeraCrypt container, a virtual disk) still changes its change time.
+    stamp: Stamp,
     edges: Option<u64>,
     whole: Option<u64>,
     /// A whole-file hash under way: bytes done, and the hasher's state.
     partial: Option<(u64, Box<xxhash_rust::xxh3::Xxh3>)>,
 }
 
+/// (last write, last change), 100 ns units.
+pub(crate) type Stamp = (i64, i64);
+
+/// The last write and change times of an open file.
+pub(crate) fn stamp(f: &std::fs::File) -> Option<Stamp> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{FileBasicInfo, GetFileInformationByHandleEx, FILE_BASIC_INFO};
+    // SAFETY: a valid handle; a zeroed POD out-parameter of the size given
+    let mut info: FILE_BASIC_INFO = unsafe { std::mem::zeroed() };
+    let ok = unsafe {
+        GetFileInformationByHandleEx(f.as_raw_handle() as _, FileBasicInfo, &mut info as *mut _ as *mut _, std::mem::size_of::<FILE_BASIC_INFO>() as u32)
+    };
+    (ok != 0).then_some((info.LastWriteTime, info.ChangeTime))
+}
+
 static CACHE: Mutex<Option<HashMap<String, Hashes>>> = Mutex::new(None);
 
-fn cached(row: &Row) -> Hashes {
+/// What is known of the file as it is now (`stamp`): nothing after a change.
+fn cached(row: &Row, stamp: Stamp) -> Hashes {
     let mut c = CACHE.lock();
     let map = c.get_or_insert_with(HashMap::new);
     match map.get(&row.path) {
-        Some(h) if h.size == row.size && h.modified == row.modified => h.clone(),
-        _ => Hashes { size: row.size, modified: row.modified, edges: None, whole: None, partial: None },
+        Some(h) if h.size == row.size && h.stamp == stamp => h.clone(),
+        _ => Hashes { size: row.size, stamp, edges: None, whole: None, partial: None },
     }
 }
 
@@ -129,9 +149,18 @@ fn open(path: &str) -> Option<std::fs::File> {
     whereti_extract::worker::open_real(std::path::Path::new(path)).ok()
 }
 
-/// The first and last `EDGE` bytes.
-fn edges_hash(path: &str, size: u64) -> Option<u64> {
-    let mut f = open(path)?;
+/// The first and last `EDGE` bytes, remembered.
+fn edges(row: &Row) -> Option<u64> {
+    let mut f = open(&row.path)?;
+    let mut h = cached(row, stamp(&f)?);
+    if h.edges.is_none() {
+        h.edges = edges_hash(&mut f, row.size);
+        remember(&row.path, h.clone());
+    }
+    h.edges
+}
+
+fn edges_hash(f: &mut std::fs::File, size: u64) -> Option<u64> {
     let mut h = xxhash_rust::xxh3::Xxh3::new();
     let mut buf = vec![0u8; EDGE.min(size) as usize];
     f.read_exact(&mut buf).ok()?;
@@ -156,11 +185,13 @@ enum Whole {
 /// Every byte of the file, from where an earlier search stopped, until
 /// `deadline`.
 fn whole_hash(row: &Row, deadline: Instant) -> Whole {
-    let mut h = cached(row);
+    // opened first: the hashes remembered count only for the file as it is now
+    let Some(mut f) = open(&row.path) else { return Whole::Unreadable };
+    let Some(now) = stamp(&f) else { return Whole::Unreadable };
+    let mut h = cached(row, now);
     if let Some(w) = h.whole {
         return Whole::Done(w);
     }
-    let Some(mut f) = open(&row.path) else { return Whole::Unreadable };
     let (mut done, mut hasher) = h.partial.take().unwrap_or_else(|| (0, Box::new(xxhash_rust::xxh3::Xxh3::new())));
     if f.seek(SeekFrom::Start(done)).is_err() {
         return Whole::Unreadable;
@@ -230,14 +261,6 @@ pub fn verify(candidates: Vec<Vec<Row>>, budget: Duration, limit: usize, caller:
             checked += 1;
             continue;
         }
-        let edges = |r: &Row| {
-            let mut h = cached(r);
-            if h.edges.is_none() {
-                h.edges = edges_hash(&r.path, r.size);
-                remember(&r.path, h.clone());
-            }
-            h.edges
-        };
         for same_edges in split_by(readable, edges) {
             // a file of at most 2 x EDGE was read whole already
             let same = if same_edges[0].size <= 2 * EDGE {
@@ -293,6 +316,25 @@ mod tests {
         let mut paths: Vec<&str> = found.groups[0].iter().map(|r| r.path.as_str()).collect();
         paths.sort();
         assert_eq!(paths, vec![a.path.as_str(), b.path.as_str()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_rewritten_with_its_old_date_is_compared_again() {
+        let dir = std::env::temp_dir().join(format!("whereti-dupes-stamp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let data: Vec<u8> = (0..400_000u32).map(|i| (i * 13 % 241) as u8).collect();
+        let a = write(&dir, "a.vhd", &data);
+        let b = write(&dir, "b.vhd", &data);
+        assert_eq!(verify(vec![vec![a.clone(), b.clone()]], Duration::from_secs(10), 100, &Trusted).groups.len(), 1);
+        // b changes in the middle, its date put back as it was
+        let f = std::fs::OpenOptions::new().write(true).open(&b.path).unwrap();
+        let when = f.metadata().unwrap().modified().unwrap();
+        use std::os::windows::fs::FileExt;
+        f.seek_write(&[0xFF], 200_000).unwrap();
+        f.set_modified(when).unwrap();
+        drop(f);
+        assert!(verify(vec![vec![a, b]], Duration::from_secs(10), 100, &Trusted).groups.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
