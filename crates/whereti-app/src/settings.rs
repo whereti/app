@@ -618,12 +618,12 @@ fn about(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
             ui.add_space(10.0);
             ui.vertical(|ui| {
                 ui.add_space(4.0);
-                ui.label(
-                    egui::RichText::new(format!("whereti {}", env!("CARGO_PKG_VERSION")))
-                        .size(18.0)
-                        .family(egui::FontFamily::Name("display".into()))
-                        .color(p.text),
-                );
+                ui.label(crate::theme::wordmark(
+                    &format!("whereti {}", env!("CARGO_PKG_VERSION")),
+                    FontId::new(18.0, egui::FontFamily::Name("display".into())),
+                    p.text,
+                    p,
+                ));
                 ui.label(
                     egui::RichText::new(tr("Instant file search for Windows."))
                         .size(13.0)

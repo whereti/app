@@ -161,3 +161,28 @@ pub fn apply(ctx: &egui::Context, accent: Color32) {
         });
     }
 }
+
+/// The "ti" of the name: the orange of the logo's pin, a shade deeper on a
+/// light background so it reads (as on whereti.com).
+pub fn ti(p: &Palette) -> Color32 {
+    if p.dark {
+        Color32::from_rgb(0xFF, 0xA5, 0x3D)
+    } else {
+        Color32::from_rgb(0xEE, 0x6A, 0x12)
+    }
+}
+
+/// `text` with every "whereti" in it drawn as where·ti: "ti" in the pin's
+/// orange, the rest in `color`. Translations keep the name as it is.
+pub fn wordmark(text: &str, font: egui::FontId, color: Color32, p: &Palette) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+    let format = |c: Color32| egui::TextFormat { font_id: font.clone(), color: c, ..Default::default() };
+    let mut rest = text;
+    while let Some(i) = rest.find("whereti") {
+        job.append(&rest[..i + 5], 0.0, format(color));
+        job.append("ti", 0.0, format(ti(p)));
+        rest = &rest[i + 7..];
+    }
+    job.append(rest, 0.0, format(color));
+    job
+}

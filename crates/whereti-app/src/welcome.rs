@@ -37,12 +37,7 @@ pub fn show(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
                     let right = 190.0;
                     ui.vertical(|ui| {
                         ui.set_width(ui.available_width() - right - 12.0);
-                        ui.label(
-                            egui::RichText::new(tr("Welcome to whereti"))
-                                .size(24.0)
-                                .family(FontFamily::Name("display".into()))
-                                .color(p.text),
-                        );
+                        ui.label(theme::wordmark(tr("Welcome to whereti"), FontId::new(24.0, FontFamily::Name("display".into())), p.text, p));
                         ui.add_space(2.0);
                         ui.add(
                             egui::Label::new(
