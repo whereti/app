@@ -620,9 +620,34 @@ fn add_volume(
             rule[c as usize] = by;
         }
     }
+    // Each left-out entry counts for the outermost left-out folder above it:
+    // the one that actually keeps it out (a package's `dist` inside
+    // `node_modules` is `node_modules`' doing, not the `dist` rule's).
+    let mut top = vec![u32::MAX; n];
     for i in 0..n {
-        if state[i] == 1 && rule[i] > 0 {
-            if let Some(c) = counts.get_mut(rule[i] as usize - 1) {
+        if state[i] != 1 || top[i] != u32::MAX {
+            continue;
+        }
+        chain.clear();
+        let mut cur = i as u32;
+        let by = loop {
+            if top[cur as usize] != u32::MAX {
+                break top[cur as usize];
+            }
+            chain.push(cur);
+            let p = parent_of(cur as usize);
+            if p == NO_PARENT || p == cur || state[p as usize] != 1 || chain.len() > 4096 {
+                break rule[cur as usize]; // the outermost one
+            }
+            cur = p;
+        };
+        for &c in &chain {
+            top[c as usize] = by;
+        }
+    }
+    for i in 0..n {
+        if state[i] == 1 && top[i] > 0 && top[i] != u32::MAX {
+            if let Some(c) = counts.get_mut(top[i] as usize - 1) {
                 *c += 1;
             }
         }

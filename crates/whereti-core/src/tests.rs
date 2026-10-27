@@ -628,3 +628,38 @@ fn app_internals_go_only_below_appdata() {
     );
 }
 
+
+#[test]
+fn a_folder_two_rules_catch_counts_once() {
+    // a Rust target: beside Cargo.toml and marked with CACHEDIR.TAG
+    let c = scan(vec![
+        d(5, 5, "."),
+        d(100, 5, "proj"),
+        f(101, 100, "Cargo.toml"),
+        d(102, 100, "target"),
+        f(103, 102, "CACHEDIR.TAG"),
+        d(104, 102, "debug"),
+        f(105, 104, "app.exe"),
+    ]);
+    let vols = vec![VolumeScan { letter: 'D', serial: 4, journal_id: 1, next_usn: 1, scan: c }];
+    let idx = build(vols, &Exclusions::defaults(None)).0;
+    let total: u64 = idx.skipped().iter().map(|(_, n)| n).sum();
+    assert_eq!(total, 4, "target, its tag, debug and the program, once");
+}
+
+#[test]
+fn a_package_inside_node_modules_counts_for_node_modules() {
+    let c = scan(vec![
+        d(5, 5, "."),
+        d(100, 5, "web"),
+        f(101, 100, "package.json"),
+        d(102, 100, "node_modules"),
+        d(103, 102, "left-pad"),
+        f(104, 103, "package.json"),
+        d(105, 103, "dist"),
+        f(106, 105, "index.js"),
+    ]);
+    let vols = vec![VolumeScan { letter: 'D', serial: 4, journal_id: 1, next_usn: 1, scan: c }];
+    let idx = build(vols, &Exclusions::defaults(None)).0;
+    assert_eq!(idx.skipped(), vec![(r"**\node_modules".to_string(), 5)]);
+}

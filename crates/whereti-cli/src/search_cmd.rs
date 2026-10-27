@@ -335,8 +335,12 @@ pub fn exclusions(args: ExclusionsArgs) -> Result<(), String> {
     let mut paths = cfg.exclusions.clone();
     match (args.action.as_str(), args.path) {
         ("list", _) => {
+            // with what each one left out at the last scan, when the service knows
             for p in &paths {
-                println!("{p}");
+                match cfg.skipped.iter().find(|(r, _)| r == p) {
+                    Some((_, n)) => println!("{n:>10}  {p}"),
+                    None => println!("{:>10}  {p}", "-"),
+                }
             }
             return Ok(());
         }
