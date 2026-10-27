@@ -126,6 +126,8 @@ impl EncodeWideNul for std::ffi::OsStr {
 
 /// Now and the local UTC offset, for `dm:today` & co.
 pub fn date_ctx() -> DateCtx {
+    // the summer time rule for dates in queries, read again each time
+    whereti_query::set_tz_rules(whereti_query::local_tz_rules());
     const TIME_ZONE_ID_DAYLIGHT: u32 = 2;
     let unix_min = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

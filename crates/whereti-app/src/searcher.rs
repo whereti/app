@@ -15,6 +15,8 @@ const CONTENT_DEBOUNCE: Duration = Duration::from_millis(150);
 /// A change of settings is sent again for about this many seconds while
 /// the service cannot be reached.
 const SETTINGS_RETRIES: u32 = 60;
+/// The service closes a connection idle for 60 s: reconnect a bit before.
+const RECONNECT_AFTER: Duration = Duration::from_secs(45);
 
 pub struct Job {
     pub generation: u64,
@@ -174,6 +176,8 @@ fn worker(jobs: Receiver<Msg>, out: Sender<Update>, wake: impl Fn()) {
     let mut carried: std::collections::VecDeque<Msg> = std::collections::VecDeque::new();
     // tries in a row to send a change of settings (about a second apart)
     let mut retries = 0u32;
+    // when the connection last answered: the service lets idle ones go
+    let mut last_answer = Instant::now();
     while let Some(first) = carried.pop_front().or_else(|| jobs.recv().ok()) {
         // Collapse everything queued: newest search, newest exclusions, flags.
         let mut p = Pending::default();
@@ -241,6 +245,11 @@ fn worker(jobs: Receiver<Msg>, out: Sender<Update>, wake: impl Fn()) {
                 std::thread::sleep(Duration::from_secs(1));
             }
         };
+        // idle long enough for the service to have closed it: a fresh one,
+        // so the first request after a pause does not fail
+        if last_answer.elapsed() >= RECONNECT_AFTER {
+            client = None;
+        }
         if client.is_none() {
             match Client::connect(Duration::from_millis(300)) {
                 Ok(c) => client = Some(c),
@@ -384,6 +393,7 @@ fn worker(jobs: Receiver<Msg>, out: Sender<Update>, wake: impl Fn()) {
             keep_settings(&mut carried);
         } else {
             retries = 0;
+            last_answer = Instant::now();
         }
         wake();
     }
