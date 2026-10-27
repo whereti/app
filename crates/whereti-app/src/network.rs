@@ -70,7 +70,7 @@ pub fn set_folders(list: Vec<String>) {
     if let Some(dir) = config_file().parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let _ = std::fs::write(config_file(), text);
+    let _ = crate::shell::write_whole(&config_file(), text.as_bytes());
     if let Ok(mut f) = FOLDERS.write() {
         *f = list;
     }
@@ -236,7 +236,7 @@ fn save_cache() {
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let _ = std::fs::write(path, text);
+    let _ = crate::shell::write_whole(&path, text.as_bytes());
 }
 
 fn load_cache() {

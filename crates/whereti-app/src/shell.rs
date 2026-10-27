@@ -187,6 +187,60 @@ fn notification_state() -> (bool, bool) {
     (matches!(state, QUNS_BUSY | QUNS_RUNNING_D3D_FULL_SCREEN | QUNS_PRESENTATION_MODE), state == QUNS_NOT_PRESENT)
 }
 
+/// Writes a file whole or not at all: to a temporary file beside it, then
+/// renamed over it, so a crash or power loss never leaves it half written.
+pub fn write_whole(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = std::path::PathBuf::from(tmp);
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)
+}
+
+/// One saved file, written off the UI thread: only the newest text is
+/// written, and a deletion (Forget) is never undone by a write still on its
+/// way.
+pub struct Saved {
+    latest: std::sync::Mutex<u64>,
+}
+
+impl Saved {
+    pub const fn new() -> Saved {
+        Saved { latest: std::sync::Mutex::new(0) }
+    }
+
+    /// Writes `text` to `path` in the background, unless a newer save or a
+    /// deletion comes first.
+    pub fn save(&'static self, path: std::path::PathBuf, text: String) {
+        let mine = {
+            let mut n = self.latest.lock().unwrap_or_else(|e| e.into_inner());
+            *n += 1;
+            *n
+        };
+        std::thread::spawn(move || {
+            let n = self.latest.lock().unwrap_or_else(|e| e.into_inner());
+            if *n == mine {
+                if let Some(dir) = path.parent() {
+                    let _ = std::fs::create_dir_all(dir);
+                }
+                let _ = write_whole(&path, text.as_bytes());
+            }
+        });
+    }
+
+    /// Deletes the file; saves still on their way are dropped.
+    pub fn delete(&self, path: &std::path::Path) {
+        let mut n = self.latest.lock().unwrap_or_else(|e| e.into_inner());
+        *n += 1;
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 pub fn trace(msg: impl AsRef<str>) {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if !*ON.get_or_init(|| std::env::var_os("WT_UI_TRACE").is_some()) {

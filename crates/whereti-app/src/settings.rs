@@ -145,7 +145,7 @@ impl SettingsState {
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        let _ = std::fs::write(path, text);
+        let _ = crate::shell::write_whole(&path, text.as_bytes());
     }
 
     pub fn apply_theme(&self, ctx: &egui::Context) {

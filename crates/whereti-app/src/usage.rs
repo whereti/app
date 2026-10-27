@@ -114,14 +114,10 @@ pub fn record(path: &str) {
         }
         map.iter().map(|(p, o)| format!("{}\t{}\t{p}\n", o.count, o.last)).collect::<String>()
     };
-    std::thread::spawn(move || {
-        let path = file();
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        let _ = std::fs::write(path, text);
-    });
+    SAVED.save(file(), text);
 }
+
+static SAVED: crate::shell::Saved = crate::shell::Saved::new();
 
 /// Settings > Search > "Forget": whereti's own list. Windows' Recent list is
 /// Windows' (cleared from Explorer's options).
@@ -129,7 +125,7 @@ pub fn forget() {
     if let Ok(mut store) = STORE.lock() {
         store.opened = Some(HashMap::new());
     }
-    let _ = std::fs::remove_file(file());
+    SAVED.delete(&file());
 }
 
 /// The plain words of a query, folded: what a used file's name must hold.

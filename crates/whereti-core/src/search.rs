@@ -840,7 +840,9 @@ impl PathMatcher {
                             buf.push(b':');
                         } else {
                             let ps = idx.parent(d).map_or(u32::MAX, |p| slot[p as usize]);
-                            if ps != u32::MAX {
+                            // a parent not done yet (a cycle, or a tree deeper than
+                            // the order follows): this folder's own name only
+                            if ps != u32::MAX && (ps as usize) < done_len.len() {
                                 let ps = ps as usize;
                                 buf.extend_from_slice(&done_tails[ps * stride..ps * stride + done_len[ps] as usize]);
                                 parent_hit = done_hit[ps];

@@ -239,13 +239,32 @@ fn read_folder(folder: &str, kind: Kind) -> Vec<Item> {
             }
             let target = match kind {
                 // the parsing name of an app is its id inside AppsFolder
-                Kind::App => format!(r"shell:AppsFolder\{}", parsing.rsplit('\\').next().unwrap_or(&parsing)),
+                // (`::{4234D49B-…}\<id>`; a desktop app's id is often its
+                // path, `C:\Python313\python.exe`: all after the folder)
+                Kind::App => format!(r"shell:AppsFolder\{}", app_id(&parsing)),
                 _ => parsing,
             };
             out.push(item(kind, name, target, &[]));
         }
     }
     out
+}
+
+/// An app's id inside AppsFolder, from its parsing name.
+fn app_id(parsing: &str) -> &str {
+    match parsing.strip_prefix("::{").and_then(|r| r.split_once("}\\")) {
+        Some((_, id)) => id,
+        // not in that form: its last part, as before
+        None => parsing.rsplit('\\').next().unwrap_or(parsing),
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn an_app_id_keeps_its_backslashes() {
+    let folder = r"::{4234D49B-0245-4DF3-B780-3893943456E1}";
+    assert_eq!(app_id(&format!(r"{folder}\C:\Python313\python.exe")), r"C:\Python313\python.exe");
+    assert_eq!(app_id(&format!(r"{folder}\Microsoft.WindowsCalculator_8wekyb3d8bbwe!App")), "Microsoft.WindowsCalculator_8wekyb3d8bbwe!App");
 }
 
 /// The Start menu's app list also holds uninstallers, help files and links.

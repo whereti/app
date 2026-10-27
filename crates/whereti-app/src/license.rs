@@ -110,7 +110,7 @@ pub fn save(l: &License) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    std::fs::write(path, &l.key)
+    crate::shell::write_whole(&path, l.key.as_bytes())
 }
 
 pub fn remove() {

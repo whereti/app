@@ -56,14 +56,10 @@ pub fn record(query: &str) {
     }) else {
         return;
     };
-    std::thread::spawn(move || {
-        let path = file();
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        let _ = std::fs::write(path, text);
-    });
+    SAVED.save(file(), text);
 }
+
+static SAVED: crate::shell::Saved = crate::shell::Saved::new();
 
 /// The searches, newest first (none while it is off).
 pub fn list() -> Vec<String> {
@@ -81,9 +77,7 @@ pub fn remove(query: &str) {
     }) else {
         return;
     };
-    std::thread::spawn(move || {
-        let _ = std::fs::write(file(), text);
-    });
+    SAVED.save(file(), text);
 }
 
 /// Settings > Search > "Forget".
@@ -91,7 +85,7 @@ pub fn forget() {
     if let Ok(mut l) = LIST.lock() {
         *l = Some(Vec::new());
     }
-    let _ = std::fs::remove_file(file());
+    SAVED.delete(&file());
 }
 
 #[cfg(test)]

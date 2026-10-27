@@ -192,7 +192,9 @@ impl Updater {
             return;
         }
         self.next_look = Instant::now() + LOOK_EVERY;
-        if !matches!(*self.phase.lock(), Phase::Idle | Phase::Failed(_)) {
+        // an offer is looked at again each day too: the server may have
+        // withdrawn it, or have a newer one
+        if !matches!(*self.phase.lock(), Phase::Idle | Phase::Failed(_) | Phase::Offered(_)) {
             return;
         }
         let path = state_file();
@@ -215,14 +217,20 @@ impl Updater {
         }
         let (phase, ctx) = (self.phase.clone(), ctx.clone());
         let _ = std::thread::Builder::new().name("update-check".into()).spawn(move || {
-            if let Ok(Some(offer)) = check() {
-                let mut saved = Saved::load(&path);
-                saved.offer = Some(offer.clone());
-                saved.save(&path);
-                *phase.lock() = Phase::Offered(offer);
+            // a failed check is silent and waits for tomorrow
+            let Ok(answer) = check() else { return };
+            let mut saved = Saved::load(&path);
+            saved.offer = answer.clone();
+            saved.save(&path);
+            let mut phase = phase.lock();
+            // never while one is being downloaded or installed
+            if matches!(*phase, Phase::Idle | Phase::Failed(_) | Phase::Offered(_)) {
+                *phase = match answer {
+                    Some(offer) => Phase::Offered(offer),
+                    None => Phase::Idle,
+                };
                 ctx.request_repaint();
             }
-            // a failed check is silent and waits for tomorrow
         });
     }
 
@@ -284,8 +292,30 @@ pub fn newer(a: &str, b: &str) -> bool {
     }
     match (pa, pb) {
         (None, Some(_)) => true,
-        (Some(x), Some(y)) => x > y,
+        (Some(x), Some(y)) => pre_cmp(&x, &y) == std::cmp::Ordering::Greater,
         _ => false,
+    }
+}
+
+/// Prerelease labels part by part, numbers as numbers (`rc.10` after `rc.9`).
+fn pre_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    let mut xs = a.split('.');
+    let mut ys = b.split('.');
+    loop {
+        let o = match (xs.next(), ys.next()) {
+            (None, None) => return std::cmp::Ordering::Equal,
+            (None, Some(_)) => return std::cmp::Ordering::Less,
+            (Some(_), None) => return std::cmp::Ordering::Greater,
+            (Some(x), Some(y)) => match (x.parse::<u64>(), y.parse::<u64>()) {
+                (Ok(m), Ok(n)) => m.cmp(&n),
+                (Ok(_), Err(_)) => std::cmp::Ordering::Less,
+                (Err(_), Ok(_)) => std::cmp::Ordering::Greater,
+                _ => x.cmp(y),
+            },
+        };
+        if o != std::cmp::Ordering::Equal {
+            return o;
+        }
     }
 }
 
@@ -538,6 +568,8 @@ mod tests {
         assert!(newer("v1.0.0", "0.9.9"));
         assert!(newer("0.2.0", "0.2.0-rc.1"));
         assert!(!newer("0.2.0-rc.1", "0.2.0"));
+        assert!(newer("1.0.0-rc.10", "1.0.0-rc.9"));
+        assert!(newer("1.0.0-rc.1", "1.0.0-beta.2"));
         assert!(!newer("0.1.0", "0.1.0"));
         assert!(!newer("garbage", "0.1.0"));
     }

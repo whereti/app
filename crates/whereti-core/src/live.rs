@@ -270,6 +270,7 @@ impl NameIndex {
         if smart.is_empty() {
             return false;
         }
+        let on_disk = name;
         let name = fold(name);
         // the names of the folders above, nearest first (the drive's root not included)
         let above = |n: usize| -> Vec<String> {
@@ -317,7 +318,7 @@ impl NameIndex {
             }
             Smart::Marker(m) => {
                 let mut p = dir();
-                p.push(&*name);
+                p.push(on_disk); // its name as on disk, not folded
                 p.push(m);
                 std::fs::symlink_metadata(p).is_ok()
             }
