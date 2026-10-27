@@ -12,7 +12,7 @@ use std::io::{self, Read, Write};
 use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::{FromRawHandle, OwnedHandle};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -36,6 +36,12 @@ const MAX_REQUEST: usize = 2 << 20;
 /// Clients served at once; more wait for a free one, so no one can make the
 /// service start thread after thread.
 const MAX_CLIENTS: usize = 64;
+/// Clients of one account at once, so one account cannot take them all.
+const MAX_PER_USER: usize = 16;
+/// A client that sends nothing (or reads no reply) for this long is let go,
+/// so idle connections cannot keep every slot; the app and `wt` connect
+/// again when they need to.
+const IDLE: Duration = Duration::from_secs(60);
 
 /// The account that created the pipe (OW), SYSTEM and Administrators: full
 /// access. Interactive users: read + write data only, no
@@ -458,11 +464,68 @@ impl Caller for Trusted {
     }
 }
 
+/// `C:\…` as `\\?\C:\…` and `\\server\share\…` as `\\?\UNC\server\share\…`,
+/// so a path of 260 characters or more, or a name ending in a dot or a
+/// space, is opened as it is. A path Windows would have to tidy up first
+/// (`.` or `..` in it, a doubled backslash) is left as it was.
+fn long_path(p: &str) -> String {
+    let p = p.replace('/', "\\");
+    if p.starts_with(r"\\?\") || p.starts_with(r"\\.\") {
+        return p;
+    }
+    let rest = p.strip_prefix(r"\\").unwrap_or(&p);
+    if rest.contains(r"\\") || rest.split('\\').any(|c| c == "." || c == "..") {
+        return p;
+    }
+    let b = p.as_bytes();
+    if b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'\\' {
+        format!(r"\\?\{p}")
+    } else if p.starts_with(r"\\") {
+        format!(r"\\?\UNC\{rest}")
+    } else {
+        p
+    }
+}
+
 /// The client at the other end of a pipe: checked by impersonating it, so
 /// Windows applies that user's own permissions.
 struct PipeCaller(std::os::windows::io::RawHandle);
 
 impl PipeCaller {
+    /// The client's account (its SID, as bytes).
+    fn user(&self) -> Option<Vec<u8>> {
+        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+        use windows_sys::Win32::Security::{GetLengthSid, GetTokenInformation, RevertToSelf, TokenUser, TOKEN_QUERY, TOKEN_USER};
+        use windows_sys::Win32::System::Pipes::ImpersonateNamedPipeClient;
+        use windows_sys::Win32::System::Threading::{GetCurrentThread, OpenThreadToken};
+        // SAFETY: valid pipe handle of a connected client.
+        if unsafe { ImpersonateNamedPipeClient(self.0 as _) } == 0 {
+            return None;
+        }
+        let mut token: HANDLE = std::ptr::null_mut();
+        // SAFETY: the impersonation token of this thread; closed below.
+        let opened = unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut token) } != 0;
+        // SAFETY: back to the service's own rights before anything else.
+        unsafe { RevertToSelf() };
+        if !opened {
+            return None;
+        }
+        let mut needed = 0u32;
+        // SAFETY: size query, then a buffer of that size (8-aligned).
+        unsafe { GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut needed) };
+        let mut buf = vec![0u64; (needed as usize).div_ceil(8) + 1];
+        let ok = unsafe { GetTokenInformation(token, TokenUser, buf.as_mut_ptr().cast(), needed, &mut needed) } != 0;
+        let sid = ok.then(|| {
+            // SAFETY: TOKEN_USER as Windows wrote it; its SID points into `buf`.
+            let user = unsafe { &*(buf.as_ptr() as *const TOKEN_USER) };
+            let len = unsafe { GetLengthSid(user.User.Sid) } as usize;
+            unsafe { std::slice::from_raw_parts(user.User.Sid as *const u8, len) }.to_vec()
+        });
+        // SAFETY: the token we opened.
+        unsafe { CloseHandle(token) };
+        sid
+    }
+
     /// Opens each path as the client, asking for `access` (`flags` for
     /// CreateFileW): whether Windows lets that user have it.
     fn may_open(&self, paths: &[String], access: u32, flags: u32) -> Vec<bool> {
@@ -477,7 +540,7 @@ impl PipeCaller {
         let out = paths
             .iter()
             .map(|p| {
-                let wide: Vec<u16> = p.encode_utf16().chain([0]).collect();
+                let wide: Vec<u16> = long_path(p).encode_utf16().chain([0]).collect();
                 // SAFETY: NUL-terminated path; the handle is closed right away.
                 let h = unsafe {
                     CreateFileW(
@@ -573,13 +636,18 @@ impl Server {
     }
 
     pub fn start_named(name: &str, handler: Handler) -> io::Result<Server> {
+        Self::start_with_idle(name, handler, IDLE)
+    }
+
+    /// `start_named`, letting go of clients idle for `idle`.
+    fn start_with_idle(name: &str, handler: Handler, idle: Duration) -> io::Result<Server> {
         let stop = Arc::new(AtomicBool::new(false));
         // Create the first instance now, so start() fails if the name is taken.
         let first = create_instance(name, true)?;
         let (stop2, name2) = (stop.clone(), name.to_string());
         let thread = std::thread::Builder::new()
             .name("pipe-accept".into())
-            .spawn(move || accept_loop(&name2, first, handler, stop2))?;
+            .spawn(move || accept_loop(&name2, first, handler, stop2, idle))?;
         Ok(Server { name: name.to_string(), stop, thread: Some(thread) })
     }
 
@@ -593,8 +661,59 @@ impl Server {
     }
 }
 
-fn accept_loop(name: &str, mut instance: OwnedHandle, handler: Handler, stop: Arc<AtomicBool>) {
-    let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+/// One connected client, as the accept loop and the watchdog see it.
+struct Slot {
+    thread: std::thread::JoinHandle<()>,
+    state: Arc<ClientState>,
+}
+
+#[derive(Default)]
+struct ClientState {
+    /// Since when the client's thread waits on the pipe (to read a request
+    /// or to write a reply); `None` while it works on a request.
+    waiting: Mutex<Option<Instant>>,
+    /// The client's account, known after its first request.
+    user: Mutex<Option<Vec<u8>>>,
+}
+
+type Slots = Arc<Mutex<Vec<Slot>>>;
+
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Clients still being served.
+fn live(slots: &Slots) -> usize {
+    let mut list = lock(slots);
+    list.retain(|s| !s.thread.is_finished());
+    list.len()
+}
+
+/// Lets go of clients that left the pipe idle for `idle`: their thread is
+/// woken from its wait and ends. Runs until `stop`.
+fn watchdog(slots: Slots, stop: Arc<AtomicBool>, idle: Duration) {
+    use std::os::windows::io::AsRawHandle;
+    while !stop.load(Ordering::SeqCst) {
+        std::thread::sleep(Duration::from_millis(200).min(idle / 4));
+        let mut list = lock(&slots);
+        list.retain(|s| !s.thread.is_finished());
+        for s in list.iter() {
+            // held while cancelling: the thread cannot go on to other work meanwhile
+            let waiting = lock(&s.state.waiting);
+            if waiting.is_some_and(|since| since.elapsed() >= idle) {
+                // SAFETY: the thread's own handle, alive while the JoinHandle is.
+                unsafe { windows_sys::Win32::System::IO::CancelSynchronousIo(s.thread.as_raw_handle() as _) };
+            }
+        }
+    }
+}
+
+fn accept_loop(name: &str, mut instance: OwnedHandle, handler: Handler, stop: Arc<AtomicBool>, idle: Duration) {
+    let slots: Slots = Arc::new(Mutex::new(Vec::new()));
+    {
+        let (slots, stop) = (slots.clone(), stop.clone());
+        let _ = std::thread::Builder::new().name("pipe-watchdog".into()).spawn(move || watchdog(slots, stop, idle));
+    }
     loop {
         let raw = std::os::windows::io::AsRawHandle::as_raw_handle(&instance);
         // SAFETY: valid pipe handle; synchronous call.
@@ -604,22 +723,18 @@ fn accept_loop(name: &str, mut instance: OwnedHandle, handler: Handler, stop: Ar
             return;
         }
         if connected {
-            // at most MAX_CLIENTS at once: the next one waits its turn
-            while active.load(Ordering::SeqCst) >= MAX_CLIENTS && !stop.load(Ordering::SeqCst) {
+            // at most MAX_CLIENTS at once: the next one waits its turn (idle
+            // ones are let go by the watchdog)
+            while live(&slots) >= MAX_CLIENTS && !stop.load(Ordering::SeqCst) {
                 std::thread::sleep(Duration::from_millis(20));
             }
-            let handler = handler.clone();
-            let active = active.clone();
-            active.fetch_add(1, Ordering::SeqCst);
+            let state = Arc::new(ClientState::default());
             let spawned = std::thread::Builder::new().name("pipe-client".into()).spawn({
-                let active = active.clone();
-                move || {
-                    serve_client(instance, handler);
-                    active.fetch_sub(1, Ordering::SeqCst);
-                }
+                let (handler, state, slots) = (handler.clone(), state.clone(), slots.clone());
+                move || serve_client(instance, handler, &state, &slots)
             });
-            if spawned.is_err() {
-                active.fetch_sub(1, Ordering::SeqCst);
+            if let Ok(thread) = spawned {
+                lock(&slots).push(Slot { thread, state });
             }
         }
         // A fresh instance for the next client.
@@ -633,20 +748,50 @@ fn accept_loop(name: &str, mut instance: OwnedHandle, handler: Handler, stop: Ar
     }
 }
 
-fn serve_client(handle: OwnedHandle, handler: Handler) {
+/// Runs `f` (a read or a write on the pipe) marked as waiting, so the
+/// watchdog may cut it short when the client stays idle.
+fn waiting<T>(state: &ClientState, f: impl FnOnce() -> T) -> T {
+    *lock(&state.waiting) = Some(Instant::now());
+    let out = f();
+    // taken after the call: once this returns, no cancel meant for the
+    // wait can reach the work that follows
+    *lock(&state.waiting) = None;
+    out
+}
+
+fn serve_client(handle: OwnedHandle, handler: Handler, state: &ClientState, slots: &Slots) {
     let mut pipe = File::from(handle);
+    let mut first = true;
     loop {
-        let req: Request = match read_message_max(&mut pipe, MAX_REQUEST) {
+        let req: Request = match waiting(state, || read_message_max(&mut pipe, MAX_REQUEST)) {
             Ok(Some(r)) => r,
             Ok(None) => return,
+            // ERROR_OPERATION_ABORTED: idle for too long, let go
+            Err(e) if e.raw_os_error() == Some(995) => return,
             Err(e) => {
-                let _ = write_message(&mut pipe, &Response::Error(format!("bad request: {e}")));
+                let _ = waiting(state, || write_message(&mut pipe, &Response::Error(format!("bad request: {e}"))));
                 return;
             }
         };
         let caller = PipeCaller(std::os::windows::io::AsRawHandle::as_raw_handle(&pipe));
+        if first {
+            // one account cannot take every connection
+            first = false;
+            let me = caller.user();
+            *lock(&state.user) = me.clone();
+            let others = lock(slots)
+                .iter()
+                .filter(|s| !s.thread.is_finished() && !std::ptr::eq(Arc::as_ptr(&s.state), state))
+                .filter(|s| me.is_some() && *lock(&s.state.user) == me)
+                .count();
+            if others >= MAX_PER_USER {
+                let busy = Response::Error("too many connections to the whereti service from this account".into());
+                let _ = waiting(state, || write_message(&mut pipe, &busy));
+                return;
+            }
+        }
         let resp = handler(req, &caller);
-        if write_message(&mut pipe, &resp).is_err() {
+        if waiting(state, || write_message(&mut pipe, &resp)).is_err() {
             return;
         }
     }
@@ -783,6 +928,51 @@ ot\here.txt".to_string()];
         drop(c);
         server.stop();
         assert!(Client::connect_to(&name, Duration::from_millis(100)).is_err(), "pipe must be gone after stop");
+    }
+
+    #[test]
+    fn paths_are_checked_in_their_long_form() {
+        assert_eq!(long_path(r"C:\Users\ana\a.txt"), r"\\?\C:\Users\ana\a.txt");
+        assert_eq!(long_path("C:/Users/ana"), r"\\?\C:\Users\ana");
+        assert_eq!(long_path(r"\\server\share\x"), r"\\?\UNC\server\share\x");
+        assert_eq!(long_path(r"\\?\C:\x"), r"\\?\C:\x");
+        // left for Windows to tidy up
+        assert_eq!(long_path(r"C:\Users\ana\..\bob"), r"C:\Users\ana\..\bob");
+        assert_eq!(long_path(r"C:\Users\\ana"), r"C:\Users\\ana");
+        assert_eq!(long_path("relative"), "relative");
+    }
+
+    #[test]
+    fn a_long_path_is_seen_through_the_pipe_and_an_idle_client_is_let_go() {
+        let name = format!(r"\\.\pipe\whereti-test-long-{}", std::process::id());
+        let handler: Handler = Arc::new(|req, caller| match req {
+            Request::Hello { .. } => Response::Hello { version: PROTOCOL_VERSION, server: "test".into() },
+            Request::SetContentFolders { paths } => {
+                Response::Error(format!("{:?} {:?}", caller.can_read(&paths[..1]), caller.can_list(&paths[1..])))
+            }
+            _ => Response::Ok,
+        });
+        let server = Server::start_with_idle(&name, handler, Duration::from_millis(600)).unwrap();
+        // a folder and a file past 260 characters
+        let mut dir = std::env::temp_dir().join(format!("whereti-long-{}", std::process::id()));
+        let top = dir.clone();
+        while dir.as_os_str().len() < 300 {
+            dir.push("a-rather-long-folder-name-for-this-test");
+        }
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("file.txt");
+        std::fs::write(&file, "x").unwrap();
+        let mut c = Client::connect_to(&name, Duration::from_secs(5)).unwrap();
+        let paths = vec![file.display().to_string(), dir.display().to_string()];
+        assert_eq!(c.call(&Request::SetContentFolders { paths }).unwrap(), Response::Error("[true] [true]".into()));
+        // idle past the limit: the service lets go, a new connection works
+        std::thread::sleep(Duration::from_millis(2000));
+        assert!(c.call(&Request::Status).is_err(), "an idle client must be let go");
+        let mut c = Client::connect_to(&name, Duration::from_secs(5)).unwrap();
+        assert_eq!(c.call(&Request::Status).unwrap(), Response::Ok);
+        drop(c);
+        server.stop();
+        let _ = std::fs::remove_dir_all(&top);
     }
 
     #[test]
