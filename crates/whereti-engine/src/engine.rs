@@ -266,7 +266,7 @@ impl Engine {
                 };
                 // taken:, camera:, artist:…: among the files with those properties
                 let (prop_clauses, rest) = crate::props::split(&query);
-                let res = if prop_clauses.is_empty() {
+                let run = |opts: SearchOptions| if prop_clauses.is_empty() {
                     idx.search_ranked(&query, &opts, &r.usage, self.shared.activity.ranking(idx))
                 } else if prop_clauses.iter().all(|c| c.negated) {
                     // only "not this camera / artist": every file, minus those that have it
@@ -286,6 +286,37 @@ impl Engine {
                 } else {
                     let within = self.content.entries_with_props(idx, &prop_clauses);
                     idx.search_within(&rest, &opts, &r.usage, self.shared.activity.ranking(idx), &within)
+                };
+                // Names only from folders the caller can list, as in Explorer:
+                // another account's documents stay unseen (one check per folder).
+                // When some go, look deeper (twice at most) so the list stays full.
+                let want = opts.limit;
+                let mut depth = want;
+                let res = loop {
+                    let mut res = run(SearchOptions { limit: depth, ..opts });
+                    let shown = listable(idx, &res.hits, caller);
+                    let exact = res.hits.len() - res.close;
+                    let gone_exact = shown[..exact].iter().filter(|ok| !**ok).count();
+                    if shown.iter().any(|ok| !ok) {
+                        let gone_close = shown[exact..].iter().filter(|ok| !**ok).count();
+                        let mut keep = shown.iter();
+                        res.hits.retain(|_| *keep.next().unwrap_or(&false));
+                        res.total = res.total.saturating_sub(gone_exact);
+                        res.close -= gone_close;
+                    }
+                    let kept_exact = exact - gone_exact;
+                    let more = res.total > kept_exact && kept_exact < want && depth < want * 16 && depth < 100_000;
+                    if !more {
+                        // the exact matches first, the close ones after, `want` in all
+                        let close: Vec<u32> = res.hits[kept_exact..].to_vec();
+                        res.hits.truncate(kept_exact.min(want));
+                        let room = want.saturating_sub(res.hits.len());
+                        let close: Vec<u32> = close.into_iter().take(room).collect();
+                        res.close = close.len();
+                        res.hits.extend(close);
+                        break res;
+                    }
+                    depth *= 4;
                 };
                 let rows = res
                     .hits
@@ -439,7 +470,12 @@ impl Engine {
                     open_files: self.shared.open_files.load(Ordering::Relaxed),
                     recent_log: self.shared.log.recent(),
                     content: self.content.status(),
-                    work_folders: self.shared.activity.is_on().then(|| self.shared.activity.top(4)),
+                    // the folders people work in, only those this caller may see
+                    work_folders: self.shared.activity.is_on().then(|| {
+                        let top = self.shared.activity.top(4);
+                        let ok = caller.can_list(&top);
+                        top.into_iter().zip(ok).filter_map(|(f, ok)| ok.then_some(f)).collect()
+                    }),
                 })
             }
         }
@@ -1226,6 +1262,20 @@ fn load_skipped(index_path: &std::path::Path) -> Vec<(char, String, u64)> {
             Some((letter, parts.next()?.to_string(), n))
         })
         .collect()
+}
+
+/// For each hit: is its folder one the caller may list? Each folder is
+/// asked about once.
+fn listable(idx: &NameIndex, hits: &[u32], caller: &dyn Caller) -> Vec<bool> {
+    let parents: Vec<Option<u32>> = hits.iter().map(|&i| idx.parent(i)).collect();
+    let mut unique: Vec<u32> = parents.iter().flatten().copied().collect();
+    unique.sort_unstable();
+    unique.dedup();
+    let paths: Vec<String> = unique.iter().map(|&p| idx.full_path(p)).collect();
+    let answers = caller.can_list(&paths);
+    let ok: std::collections::HashMap<u32, bool> = unique.into_iter().zip(answers).collect();
+    // a drive's own root is always listable
+    parents.iter().map(|p| p.is_none_or(|p| ok.get(&p).copied().unwrap_or(false))).collect()
 }
 
 fn default_exclusions(include_windows: bool) -> Vec<String> {

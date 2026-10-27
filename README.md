@@ -50,9 +50,13 @@ ads.
 
 A Rust workspace. A Windows service (running as SYSTEM, so it can read the
 master file table) keeps the index; the app talks to it over a local named
-pipe that only accepts the signed-in user's own processes, and only shows
-files that user may open. Untrusted documents are parsed in a separate,
-memory-capped worker process (`whereti-extract`), never in the service.
+pipe that only accepts local processes and checks every answer against the
+asking user's Windows permissions: names only from folders that user may
+open, contents only of files that user may read. Only an administrator's
+account may change what the service indexes. Untrusted documents are parsed
+in a separate worker process (`whereti-extract`), never in the service: it
+gives up its privileges and drops to Low integrity before reading anything,
+and Windows Firewall keeps it off the network.
 
 | Crate | What it is |
 |---|---|

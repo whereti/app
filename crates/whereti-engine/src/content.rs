@@ -960,6 +960,9 @@ impl Content {
             })
             .collect();
         found.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.2.cmp(&b.2)));
+        // when some hits were not the caller's, the full count would say how
+        // many of someone else's documents hold the words: count only theirs
+        let all_theirs = found.len() == hits.keys.len();
         let groups = self.group_copies(idx, &found);
         let visible = groups.len() as u64;
         let mut rows = Vec::new();
@@ -976,7 +979,7 @@ impl Content {
         ContentReply {
             rows,
             copies,
-            total: if hits.keys.len() < SEARCH_DEPTH { visible } else { hits.total as u64 },
+            total: if hits.keys.len() < SEARCH_DEPTH || !all_theirs { visible } else { hits.total as u64 },
             micros: t.elapsed().as_micros() as u64,
             note,
         }

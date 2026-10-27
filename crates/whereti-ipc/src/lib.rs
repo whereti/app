@@ -439,6 +439,11 @@ pub trait Caller {
     fn is_admin(&self) -> bool {
         false
     }
+    /// For each folder: may the caller list it (see the names in it, as in
+    /// Explorer)? A name is shown only from a folder its caller can list.
+    fn can_list(&self, dirs: &[String]) -> Vec<bool> {
+        vec![true; dirs.len()]
+    }
 }
 
 /// A caller allowed everything (in-process use and tests).
@@ -457,13 +462,14 @@ impl Caller for Trusted {
 /// Windows applies that user's own permissions.
 struct PipeCaller(std::os::windows::io::RawHandle);
 
-impl Caller for PipeCaller {
-    fn can_read(&self, paths: &[String]) -> Vec<bool> {
+impl PipeCaller {
+    /// Opens each path as the client, asking for `access` (`flags` for
+    /// CreateFileW): whether Windows lets that user have it.
+    fn may_open(&self, paths: &[String], access: u32, flags: u32) -> Vec<bool> {
         use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::Security::RevertToSelf;
         use windows_sys::Win32::Storage::FileSystem::{CreateFileW, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING};
         use windows_sys::Win32::System::Pipes::ImpersonateNamedPipeClient;
-        const FILE_READ_DATA: u32 = 0x1;
         // SAFETY: valid pipe handle of a connected client.
         if unsafe { ImpersonateNamedPipeClient(self.0 as _) } == 0 {
             return vec![false; paths.len()];
@@ -476,11 +482,11 @@ impl Caller for PipeCaller {
                 let h = unsafe {
                     CreateFileW(
                         wide.as_ptr(),
-                        FILE_READ_DATA,
+                        access,
                         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                         std::ptr::null(),
                         OPEN_EXISTING,
-                        0,
+                        flags,
                         std::ptr::null_mut(),
                     )
                 };
@@ -496,6 +502,19 @@ impl Caller for PipeCaller {
         // SAFETY: undo the impersonation on this thread.
         unsafe { RevertToSelf() };
         out
+    }
+}
+
+impl Caller for PipeCaller {
+    fn can_list(&self, dirs: &[String]) -> Vec<bool> {
+        const FILE_LIST_DIRECTORY: u32 = 0x1;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000; // needed to open a folder
+        self.may_open(dirs, FILE_LIST_DIRECTORY, FILE_FLAG_BACKUP_SEMANTICS)
+    }
+
+    fn can_read(&self, paths: &[String]) -> Vec<bool> {
+        const FILE_READ_DATA: u32 = 0x1;
+        self.may_open(paths, FILE_READ_DATA, 0)
     }
 
     /// The client's token holds the Administrators group, enabled or (not
