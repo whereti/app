@@ -95,6 +95,13 @@ pub struct Tagger {
 impl Tagger {
     /// `onnxruntime` is the DLL to load, `model` the image model.
     pub fn new(onnxruntime: &Path, model: &Path) -> Result<Tagger, String> {
+        let bytes = std::fs::read(model).map_err(|e| format!("cannot read {}: {e}", model.display()))?;
+        Tagger::from_bytes(onnxruntime, &bytes)
+    }
+
+    /// The same, from the model file's bytes (the worker gets the file as
+    /// a handle, see worker::TagWorker).
+    pub fn from_bytes(onnxruntime: &Path, model: &[u8]) -> Result<Tagger, String> {
         let env = ort::init_from(onnxruntime)
             .map_err(|e| format!("cannot load {}: {e}", onnxruntime.display()))?
             .with_name("whereti")
@@ -105,7 +112,7 @@ impl Tagger {
         let builder = builder.with_intra_threads(1).map_err(|e| e.to_string())?;
         let mut builder = builder.with_inter_threads(1).map_err(|e| e.to_string())?;
         let session = builder
-            .commit_from_file(model)
+            .commit_from_memory(model)
             .map_err(|e| format!("cannot load the model: {e}"))?;
         // the environment must outlive the session: keep it for the process
         std::mem::forget(env);

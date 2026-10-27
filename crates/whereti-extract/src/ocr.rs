@@ -27,8 +27,11 @@ use windows::Storage::Streams::{DataWriter, InMemoryRandomAccessStream, IRandomA
 
 /// Pages of a scanned PDF read at most.
 const MAX_PAGES: u32 = 50;
-/// Total time for one file; what was read by then is kept.
+/// Total time for one file; what was read by then is kept. The worker's
+/// caller may allow less (`--budget`), and then that is the limit.
 const BUDGET: Duration = Duration::from_secs(20);
+/// About what one page takes to draw and read.
+const PAGE_TIME: Duration = Duration::from_millis(1500);
 /// Width pages are drawn at: about 200 dpi for A4, which OCR reads well.
 const PAGE_WIDTH: u32 = 1700;
 /// A PDF with less text than this per page is treated as a scan.
@@ -39,16 +42,34 @@ pub(crate) struct Ocr {
     max_dim: u32,
 }
 
+/// OCR languages to try first (see `crate::set_ocr_languages`).
+static LANGUAGES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+pub(crate) fn set_languages(tags: &[&str]) {
+    *LANGUAGES.lock().unwrap_or_else(|e| e.into_inner()) = tags.iter().map(|t| t.to_string()).collect();
+}
+
 impl Ocr {
-    /// The OCR in the user's language if Windows has it, else the first
-    /// language Windows has. `None` if Windows has no OCR at all.
+    /// The OCR in the first language the caller gave (`set_languages`) that
+    /// Windows has, else in the languages of this process's profile (in
+    /// the service: the system's), else in the first language Windows has.
+    /// `None` if Windows has no OCR at all.
     pub(crate) fn new() -> Option<Ocr> {
         // SAFETY: initialises WinRT for this thread; harmless if already done.
         unsafe {
             let _ = windows::Win32::System::WinRT::RoInitialize(windows::Win32::System::WinRT::RO_INIT_MULTITHREADED);
         }
-        let engine = OcrEngine::TryCreateFromUserProfileLanguages()
-            .ok()
+        let wanted = LANGUAGES.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let engine = wanted
+            .iter()
+            .find_map(|tag| {
+                let lang = Language::CreateLanguage(&windows::core::HSTRING::from(tag.as_str())).ok()?;
+                if !OcrEngine::IsLanguageSupported(&lang).ok()? {
+                    return None;
+                }
+                OcrEngine::TryCreateFromLanguage(&lang).ok()
+            })
+            .or_else(|| OcrEngine::TryCreateFromUserProfileLanguages().ok())
             .or_else(|| {
                 let langs = OcrEngine::AvailableRecognizerLanguages().ok()?;
                 let first: Language = langs.GetAt(0).ok()?;
@@ -67,20 +88,21 @@ impl Ocr {
     }
 
     /// The text of a scanned PDF, page by page; `None` when the PDF has
-    /// enough text of its own (`own`). `truncated` when the page limit or
-    /// the time budget stopped it.
-    pub(crate) fn pdf_if_scanned(&self, bytes: &[u8], own: &str) -> windows::core::Result<Option<(String, bool)>> {
-        let started = Instant::now();
+    /// enough text of its own (`own_chars` letters and digits, all its pages
+    /// read). `truncated` when the page limit or the time stopped it.
+    pub(crate) fn pdf_if_scanned(&self, bytes: &[u8], own_chars: usize) -> windows::core::Result<Option<(String, bool)>> {
+        let until = until();
         let stream = memory_stream(bytes)?;
         let doc = PdfDocument::LoadFromStreamAsync(&stream)?.join()?;
         let pages = doc.PageCount()?;
-        if !looks_scanned(own, pages as usize) {
+        if !looks_scanned(own_chars, pages as usize) {
             return Ok(None);
         }
         let mut out = String::new();
         let mut truncated = pages > MAX_PAGES;
         for i in 0..pages.min(MAX_PAGES) {
-            if started.elapsed() >= BUDGET {
+            // a page takes about a second: none is started that would end late
+            if Instant::now() + PAGE_TIME >= until {
                 truncated = true;
                 break;
             }
@@ -137,10 +159,91 @@ impl Ocr {
     }
 }
 
-/// A scan: a PDF whose own text is less than a few words per page.
-pub(crate) fn looks_scanned(text: &str, pages: usize) -> bool {
-    let chars = text.chars().filter(|c| c.is_alphanumeric()).count();
+/// A scan: a PDF whose own text (`chars` letters and digits, from all its
+/// pages) is less than a few words per page.
+pub(crate) fn looks_scanned(chars: usize, pages: usize) -> bool {
     chars < SCAN_CHARS_PER_PAGE * pages.max(1)
+}
+
+/// When OCR must stop: its own budget, or sooner if the caller stops
+/// waiting sooner (see `crate::within`).
+fn until() -> Instant {
+    let own = Instant::now() + BUDGET;
+    crate::deadline().map_or(own, |d| d.min(own))
+}
+
+/// What Windows' OCR, picture decoder and PDF renderer can do in this
+/// process (the worker, after its lockdown): `ocr=1 wic=1 pdf=1`, 0 for
+/// what fails; then the step that loaded user32 (which needs a desktop).
+pub(crate) fn probe() -> String {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetModuleHandleW(name: *const u16) -> *mut core::ffi::c_void;
+    }
+    let name: Vec<u16> = "user32.dll".encode_utf16().chain([0]).collect();
+    // SAFETY: a NUL-terminated name; only asks whether it is loaded.
+    let user32 = || !unsafe { GetModuleHandleW(name.as_ptr()) }.is_null();
+    let mut loaded_by = if user32() { "start" } else { "none" };
+    let mut step = |what: &'static str| {
+        if loaded_by == "none" && user32() {
+            loaded_by = what;
+        }
+    };
+    // SAFETY: initialises WinRT for this thread; harmless if already done.
+    unsafe {
+        let _ = windows::Win32::System::WinRT::RoInitialize(windows::Win32::System::WinRT::RO_INIT_MULTITHREADED);
+    }
+    step("winrt");
+    let ocr = Ocr::new().is_some();
+    step("ocr");
+    // a 2x2 BMP
+    let mut bmp = vec![0u8; 54 + 16];
+    bmp[0..2].copy_from_slice(b"BM");
+    bmp[2..6].copy_from_slice(&70u32.to_le_bytes());
+    bmp[10..14].copy_from_slice(&54u32.to_le_bytes());
+    bmp[14..18].copy_from_slice(&40u32.to_le_bytes());
+    bmp[18..22].copy_from_slice(&2i32.to_le_bytes());
+    bmp[22..26].copy_from_slice(&2i32.to_le_bytes());
+    bmp[26..28].copy_from_slice(&1u16.to_le_bytes());
+    bmp[28..30].copy_from_slice(&24u16.to_le_bytes());
+    let wic = (|| -> windows::core::Result<()> {
+        let decoder = BitmapDecoder::CreateAsync(&memory_stream(&bmp)?)?.join()?;
+        decoder.GetSoftwareBitmapAsync()?.join()?;
+        Ok(())
+    })()
+    .is_ok();
+    step("wic");
+    let pdf = (|| -> windows::core::Result<()> {
+        let doc = PdfDocument::LoadFromStreamAsync(&memory_stream(&tiny_pdf())?)?.join()?;
+        let image = InMemoryRandomAccessStream::new()?;
+        doc.GetPage(0)?.RenderToStreamAsync(&image)?.join()?;
+        Ok(())
+    })()
+    .is_ok();
+    step("pdf");
+    format!("ocr={} wic={} pdf={} user32:{loaded_by}", ocr as u8, wic as u8, pdf as u8)
+}
+
+// A one-page PDF with nothing on it.
+fn tiny_pdf() -> Vec<u8> {
+    let objects = [
+        "<</Type/Catalog/Pages 2 0 R>>",
+        "<</Type/Pages/Kids[3 0 R]/Count 1>>",
+        "<</Type/Page/Parent 2 0 R/MediaBox[0 0 72 72]/Resources<<>>>>",
+    ];
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    let mut offsets = Vec::new();
+    for (i, o) in objects.iter().enumerate() {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{} 0 obj\n{o}\nendobj\n", i + 1).as_bytes());
+    }
+    let xref = pdf.len();
+    pdf.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes());
+    for o in offsets {
+        pdf.extend_from_slice(format!("{o:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(format!("trailer\n<</Size {}/Root 1 0 R>>\nstartxref\n{xref}\n%%EOF\n", objects.len() + 1).as_bytes());
+    pdf
 }
 
 pub(crate) fn memory_stream(bytes: &[u8]) -> windows::core::Result<IRandomAccessStream> {
@@ -177,8 +280,8 @@ mod tests {
 
     #[test]
     fn scans_are_recognised() {
-        assert!(looks_scanned("", 3));
-        assert!(looks_scanned("12 3", 1));
-        assert!(!looks_scanned(&"word ".repeat(40), 2));
+        assert!(looks_scanned(0, 3));
+        assert!(looks_scanned(3, 1));
+        assert!(!looks_scanned(160, 2));
     }
 }

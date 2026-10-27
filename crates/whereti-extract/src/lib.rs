@@ -15,11 +15,12 @@ mod ocr;
 pub mod tags;
 mod ole;
 mod rtf;
+mod spawn;
 #[cfg(test)]
 mod tests_mail_ole;
 pub mod worker;
 
-pub use rtf::rtf_to_text;
+pub use rtf::{rtf_bytes_to_text, rtf_to_text};
 
 use std::io::{Cursor, Read};
 
@@ -150,6 +151,13 @@ pub fn ocr_available() -> bool {
     ocr::Ocr::new().is_some()
 }
 
+/// OCR languages to try first in this process (BCP-47 tags, "ro-RO"), for
+/// example those of the user whose files are read; Windows' own choice
+/// when none of them is installed. The worker takes them as `--ocr-lang`.
+pub fn set_ocr_languages(tags: &[&str]) {
+    ocr::set_languages(tags);
+}
+
 /// Every extension `extract` reads, lower case, without the dot.
 pub fn extensions() -> Vec<&'static str> {
     DOC_EXTS.iter().chain(TEXT_EXTS).chain(IMAGE_EXTS).copied().collect()
@@ -187,8 +195,10 @@ pub fn extract(ext: &str, bytes: &[u8], max_chars: usize) -> Result<Extracted, E
             // A scan has (almost) no text of its own: read its pages with OCR.
             // A PDF that pdf-extract cannot parse gets the same chance, since
             // Windows' own PDF reader is more forgiving.
-            if matches!(own, Ok(()) | Err(ExtractError::Damaged(_))) {
-                let scanned = ocr::Ocr::new().and_then(|o| o.pdf_if_scanned(bytes, &out.text).ok().flatten());
+            // It is judged on all the text it has, not on what fit the budget.
+            if matches!(own, Ok(_) | Err(ExtractError::Damaged(_))) {
+                let own_chars = own.as_ref().map_or(0, |n| *n);
+                let scanned = ocr::Ocr::new().and_then(|o| o.pdf_if_scanned(bytes, own_chars).ok().flatten());
                 if let Some((text, truncated)) = scanned {
                     if !text.is_empty() {
                         out = Out::new(max_chars);
@@ -198,14 +208,14 @@ pub fn extract(ext: &str, bytes: &[u8], max_chars: usize) -> Result<Extracted, E
                     }
                 }
             }
-            own?
+            own?;
         }
         Kind::Image => {
             let o = ocr::Ocr::new().ok_or(ExtractError::Unsupported)?;
             let text = o.picture(bytes).map_err(|e| ExtractError::Damaged(e.message().to_string()))?;
             out.push(&text);
         }
-        Kind::Rtf => out.push(&rtf_to_text(&String::from_utf8_lossy(bytes))),
+        Kind::Rtf => out.push(&rtf_bytes_to_text(bytes)),
         Kind::Html => out.push(&html_to_text(&decode_text(bytes)?)),
         Kind::Email => email::eml(bytes, &mut out)?,
         Kind::Outlook => ole::msg(bytes, &mut out)?,
@@ -228,6 +238,32 @@ pub fn extract(ext: &str, bytes: &[u8], max_chars: usize) -> Result<Extracted, E
     Ok(out.finish())
 }
 
+thread_local! {
+    /// When the caller stops waiting: slow work (OCR, the documents inside
+    /// an archive) stops by then and hands back what it has.
+    static DEADLINE: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
+}
+
+/// The time by which this thread's extraction must be done, if any.
+pub(crate) fn deadline() -> Option<std::time::Instant> {
+    DEADLINE.with(|d| d.get())
+}
+
+/// Sets the deadline of this thread's extractions (the worker, from its
+/// caller's timeout).
+pub(crate) fn set_deadline(at: Option<std::time::Instant>) {
+    DEADLINE.with(|d| d.set(at));
+}
+
+/// Runs `f` with the deadline moved to `until` if that is sooner.
+pub(crate) fn within<T>(until: std::time::Instant, f: impl FnOnce() -> T) -> T {
+    let before = deadline();
+    set_deadline(Some(before.map_or(until, |b| b.min(until))));
+    let result = f();
+    set_deadline(before);
+    result
+}
+
 /// Collects text up to a character budget, tidying whitespace.
 struct Out {
     text: String,
@@ -240,7 +276,12 @@ impl Out {
         Out { text: String::new(), budget: max_chars, truncated: false }
     }
 
-    fn full(&self) -> bool {
+    /// The budget is spent. Callers ask this before adding more, so when it
+    /// is, something is left out and the text counts as truncated.
+    fn full(&mut self) -> bool {
+        if self.budget == 0 {
+            self.truncated = true;
+        }
         self.budget == 0
     }
 
@@ -285,15 +326,30 @@ impl Out {
 }
 
 /// UTF-8 / UTF-16 (BOM) or a legacy code page guessed from the bytes.
-/// Refuses binary data.
+/// Refuses binary data. `bytes` may be only the head of a file, cut in the
+/// middle of a character: that character is dropped, not the encoding.
 pub fn decode_text(bytes: &[u8]) -> Result<String, ExtractError> {
     if let Some((enc, bom)) = encoding_rs::Encoding::for_bom(bytes) {
-        return Ok(enc.decode_without_bom_handling(&bytes[bom..]).0.into_owned());
+        let mut body = &bytes[bom..];
+        if enc == encoding_rs::UTF_8 {
+            body = whole_utf8(body);
+        } else {
+            // UTF-16: whole code units, and no high surrogate without its pair
+            body = &body[..body.len() & !1];
+            if let [.., a, b] = body {
+                let unit = if enc == encoding_rs::UTF_16LE { u16::from_le_bytes([*a, *b]) } else { u16::from_be_bytes([*a, *b]) };
+                if (0xD800..0xDC00).contains(&unit) {
+                    body = &body[..body.len() - 2];
+                }
+            }
+        }
+        return Ok(enc.decode_without_bom_handling(body).0.into_owned());
     }
     let head = &bytes[..bytes.len().min(8192)];
     if head.contains(&0) {
         return Err(ExtractError::Unsupported); // binary
     }
+    let bytes = whole_utf8(bytes);
     if let Ok(s) = std::str::from_utf8(bytes) {
         return Ok(s.to_string());
     }
@@ -301,6 +357,15 @@ pub fn decode_text(bytes: &[u8]) -> Result<String, ExtractError> {
     det.feed(bytes, true);
     let enc = det.guess(None, chardetng::Utf8Detection::Allow);
     Ok(enc.decode_without_bom_handling(bytes).0.into_owned())
+}
+
+/// `bytes` without an unfinished UTF-8 character at its very end (a head
+/// cut mid character), when everything before it is valid UTF-8.
+fn whole_utf8(bytes: &[u8]) -> &[u8] {
+    match std::str::from_utf8(bytes) {
+        Err(e) if e.error_len().is_none() && bytes.len() - e.valid_up_to() <= 3 => &bytes[..e.valid_up_to()],
+        _ => bytes,
+    }
 }
 
 fn zip_archive(bytes: &[u8]) -> Result<zip::ZipArchive<Cursor<&[u8]>>, ExtractError> {
@@ -355,7 +420,7 @@ fn xml_text(xml: &[u8], text_tags: &[&str], para_tags: &[&str], tab_tags: &[&str
                 }
             }
             Ok(Event::Text(t)) if inside > 0 => out.push(t.as_ref()),
-            Ok(Event::GeneralRef(r)) if inside > 0 => out.push(&resolve_entity(&r.into_inner())),
+            Ok(Event::GeneralRef(r)) if inside > 0 => out.push(&resolve_entity(&r.into_inner()).unwrap_or_default()),
             Ok(Event::Eof) | Err(_) => return,
             _ => {}
         }
@@ -363,38 +428,120 @@ fn xml_text(xml: &[u8], text_tags: &[&str], para_tags: &[&str], tab_tags: &[&str
     }
 }
 
-fn resolve_entity(name: &str) -> String {
-    match name {
-        "amp" => "&".into(),
-        "lt" => "<".into(),
-        "gt" => ">".into(),
-        "quot" => "\"".into(),
-        "apos" => "'".into(),
-        "nbsp" => " ".into(),
-        n if n.starts_with("#x") || n.starts_with("#X") => {
-            u32::from_str_radix(&n[2..], 16).ok().and_then(char::from_u32).map(String::from).unwrap_or_default()
+/// The text of an entity (`amp`, `eacute`, `#233`, `#xE9`); `None` when
+/// it is not one.
+fn resolve_entity(name: &str) -> Option<String> {
+    let num = if let Some(hex) = name.strip_prefix("#x").or_else(|| name.strip_prefix("#X")) {
+        Some(u32::from_str_radix(hex, 16).ok()?)
+    } else if let Some(dec) = name.strip_prefix('#') {
+        Some(dec.parse::<u32>().ok()?)
+    } else {
+        None
+    };
+    if let Some(n) = num {
+        // 128-159 mean what they do in Windows-1252, as browsers read them
+        if (0x80..0xA0).contains(&n) {
+            return Some(encoding_rs::WINDOWS_1252.decode_without_bom_handling(&[n as u8]).0.into_owned());
         }
-        n if n.starts_with('#') => n[1..].parse::<u32>().ok().and_then(char::from_u32).map(String::from).unwrap_or_default(),
-        _ => String::new(),
+        return Some(char::from_u32(n).filter(|c| *c != '\0').map(String::from).unwrap_or_default());
     }
+    named_entity(name).map(|c| match c {
+        // spaces and invisible marks: a plain space, or nothing
+        '\u{a0}' | '\u{2002}' | '\u{2003}' | '\u{2009}' => " ".to_string(),
+        '\u{ad}' | '\u{200c}' | '\u{200d}' | '\u{200e}' | '\u{200f}' => String::new(),
+        c => c.to_string(),
+    })
+}
+
+/// Latin-1 entities from `nbsp` (160) to `yuml` (255), in order.
+const LATIN1_ENTITIES: [&str; 96] = [
+    "nbsp", "iexcl", "cent", "pound", "curren", "yen", "brvbar", "sect", "uml", "copy", "ordf", "laquo", "not", "shy", "reg",
+    "macr", "deg", "plusmn", "sup2", "sup3", "acute", "micro", "para", "middot", "cedil", "sup1", "ordm", "raquo", "frac14",
+    "frac12", "frac34", "iquest", "Agrave", "Aacute", "Acirc", "Atilde", "Auml", "Aring", "AElig", "Ccedil", "Egrave",
+    "Eacute", "Ecirc", "Euml", "Igrave", "Iacute", "Icirc", "Iuml", "ETH", "Ntilde", "Ograve", "Oacute", "Ocirc", "Otilde",
+    "Ouml", "times", "Oslash", "Ugrave", "Uacute", "Ucirc", "Uuml", "Yacute", "THORN", "szlig", "agrave", "aacute", "acirc",
+    "atilde", "auml", "aring", "aelig", "ccedil", "egrave", "eacute", "ecirc", "euml", "igrave", "iacute", "icirc", "iuml",
+    "eth", "ntilde", "ograve", "oacute", "ocirc", "otilde", "ouml", "divide", "oslash", "ugrave", "uacute", "ucirc", "uuml",
+    "yacute", "thorn", "yuml",
+];
+
+/// The named entities pages commonly use: Latin-1, quotes, dashes, signs.
+fn named_entity(name: &str) -> Option<char> {
+    if let Some(i) = LATIN1_ENTITIES.iter().position(|e| *e == name) {
+        return char::from_u32(160 + i as u32);
+    }
+    Some(match name {
+        "amp" => '&',
+        "lt" => '<',
+        "gt" => '>',
+        "quot" => '"',
+        "apos" => '\'',
+        "OElig" => 'Œ',
+        "oelig" => 'œ',
+        "Scaron" => 'Š',
+        "scaron" => 'š',
+        "Yuml" => 'Ÿ',
+        "fnof" => 'ƒ',
+        "circ" => 'ˆ',
+        "tilde" => '˜',
+        "ensp" => '\u{2002}',
+        "emsp" => '\u{2003}',
+        "thinsp" => '\u{2009}',
+        "zwnj" => '\u{200c}',
+        "zwj" => '\u{200d}',
+        "lrm" => '\u{200e}',
+        "rlm" => '\u{200f}',
+        "ndash" => '–',
+        "mdash" => '—',
+        "lsquo" => '‘',
+        "rsquo" => '’',
+        "sbquo" => '‚',
+        "ldquo" => '“',
+        "rdquo" => '”',
+        "bdquo" => '„',
+        "dagger" => '†',
+        "Dagger" => '‡',
+        "bull" => '•',
+        "hellip" => '…',
+        "permil" => '‰',
+        "prime" => '′',
+        "Prime" => '″',
+        "lsaquo" => '‹',
+        "rsaquo" => '›',
+        "oline" => '‾',
+        "euro" => '€',
+        "trade" => '™',
+        "larr" => '←',
+        "uarr" => '↑',
+        "rarr" => '→',
+        "darr" => '↓',
+        "harr" => '↔',
+        "minus" => '−',
+        "infin" => '∞',
+        "ne" => '≠',
+        "le" => '≤',
+        "ge" => '≥',
+        "asymp" => '≈',
+        _ => return None,
+    })
 }
 
 fn docx(bytes: &[u8], out: &mut Out) -> Result<(), ExtractError> {
     let mut zip = zip_archive(bytes)?;
     let doc = zip_entry(&mut zip, "word/document.xml").ok_or_else(|| ExtractError::Damaged("no word/document.xml".into()))?;
-    xml_text(&doc, &["t"], &["p"], &["tab", "br"], out);
-    // headers, footers, footnotes, comments
+    xml_text(&doc, &["t"], &["p", "br", "cr"], &["tab"], out);
+    // headers, footers, footnotes, endnotes, comments
     let mut extra: Vec<String> = zip_names(&zip)
         .into_iter()
         .filter(|n| {
-            n.starts_with("word/header") || n.starts_with("word/footer") || n == "word/footnotes.xml" || n == "word/comments.xml"
+            n.starts_with("word/header") || n.starts_with("word/footer") || n == "word/footnotes.xml" || n == "word/endnotes.xml" || n == "word/comments.xml"
         })
         .collect();
     extra.sort();
     for name in extra {
         if let Some(xml) = zip_entry(&mut zip, &name) {
             out.newline();
-            xml_text(&xml, &["t"], &["p"], &["tab"], out);
+            xml_text(&xml, &["t"], &["p", "br", "cr"], &["tab"], out);
         }
     }
     Ok(())
@@ -416,7 +563,8 @@ fn pptx(bytes: &[u8], out: &mut Out) -> Result<(), ExtractError> {
     }
     for (_, name) in slides {
         if let Some(xml) = zip_entry(&mut zip, &name) {
-            xml_text(&xml, &["t"], &["p"], &[], out);
+            // <a:br/> is a line break (<a:tab> only defines tab stops)
+            xml_text(&xml, &["t"], &["p", "br"], &[], out);
             out.newline();
         }
     }
@@ -424,7 +572,7 @@ fn pptx(bytes: &[u8], out: &mut Out) -> Result<(), ExtractError> {
     notes.sort();
     for name in notes {
         if let Some(xml) = zip_entry(&mut zip, &name) {
-            xml_text(&xml, &["t"], &["p"], &[], out);
+            xml_text(&xml, &["t"], &["p", "br"], &[], out);
         }
     }
     Ok(())
@@ -441,23 +589,27 @@ fn epub(bytes: &[u8], out: &mut Out) -> Result<(), ExtractError> {
         if let Some(xml) = zip_entry(&mut zip, &opf) {
             let xml = String::from_utf8_lossy(&xml);
             // id -> href, then the spine's itemrefs in order
-            let attr = |tag: &str, name: &str| -> Option<String> {
-                let at = tag.find(&format!("{name}=\""))? + name.len() + 2;
-                Some(tag[at..].split('"').next()?.to_string())
-            };
             let mut hrefs = std::collections::HashMap::new();
             for tag in xml.split('<').filter(|t| t.starts_with("item ") || t.starts_with("opf:item ")) {
-                if let (Some(id), Some(href)) = (attr(tag, "id"), attr(tag, "href")) {
+                if let (Some(id), Some(href)) = (xml_attr(tag, "id"), xml_attr(tag, "href")) {
                     hrefs.insert(id, href);
                 }
             }
             for tag in xml.split('<').filter(|t| t.starts_with("itemref") || t.starts_with("opf:itemref")) {
-                if let Some(href) = attr(tag, "idref").and_then(|id| hrefs.get(&id)) {
-                    chapters.push(format!("{base}{}", href.replace("%20", " ")));
+                if let Some(href) = xml_attr(tag, "idref").and_then(|id| hrefs.get(&id)) {
+                    // the name in the ZIP, matched in any letter case
+                    let path = epub_path(&base, href);
+                    let found = names.iter().find(|n| **n == path).or_else(|| names.iter().find(|n| n.eq_ignore_ascii_case(&path)));
+                    if let Some(name) = found {
+                        if !chapters.contains(name) {
+                            chapters.push(name.clone());
+                        }
+                    }
                 }
             }
         }
     }
+    // no spine, or none of it found: every XHTML file
     if chapters.is_empty() {
         chapters = names.into_iter().filter(|n| {
             let n = n.to_ascii_lowercase();
@@ -475,6 +627,65 @@ fn epub(bytes: &[u8], out: &mut Out) -> Result<(), ExtractError> {
         }
     }
     Ok(())
+}
+
+/// An attribute of a tag (`name="v"` or `name='v'`), entities resolved.
+fn xml_attr(tag: &str, name: &str) -> Option<String> {
+    let mut from = 0;
+    loop {
+        let at = from + tag[from..].find(name)?;
+        from = at + name.len();
+        // a whole attribute name: `id` is not the end of `idref` or `xml:id`
+        let before = tag[..at].chars().next_back();
+        if !before.is_some_and(char::is_whitespace) {
+            continue;
+        }
+        let rest = tag[from..].trim_start();
+        let Some(rest) = rest.strip_prefix('=') else { continue };
+        let rest = rest.trim_start();
+        let quote = rest.chars().next().filter(|q| *q == '"' || *q == '\'')?;
+        let value = rest[1..].split(quote).next()?;
+        return Some(html_to_text(value));
+    }
+}
+
+/// The ZIP name a chapter's `href` points to, from the folder of the OPF:
+/// no `#fragment`, percent escapes decoded, `.` and `..` resolved.
+fn epub_path(base: &str, href: &str) -> String {
+    let href = href.split('#').next().unwrap_or("");
+    // percent escapes are UTF-8 bytes
+    let mut bytes = Vec::with_capacity(href.len());
+    let raw = href.as_bytes();
+    let mut i = 0;
+    while i < raw.len() {
+        let hex = raw.get(i + 1..i + 3).and_then(|h| std::str::from_utf8(h).ok()).and_then(|h| u8::from_str_radix(h, 16).ok());
+        match (raw[i], hex) {
+            (b'%', Some(b)) => {
+                bytes.push(b);
+                i += 3;
+            }
+            (c, _) => {
+                bytes.push(c);
+                i += 1;
+            }
+        }
+    }
+    let href = String::from_utf8_lossy(&bytes);
+    let joined = match href.strip_prefix('/') {
+        Some(root) => root.to_string(),
+        None => format!("{base}{href}"),
+    };
+    let mut parts: Vec<&str> = Vec::new();
+    for part in joined.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            p => parts.push(p),
+        }
+    }
+    parts.join("/")
 }
 
 /// XPS / OpenXPS: the `UnicodeString` of every glyph run, page by page.
@@ -505,7 +716,7 @@ fn xps(bytes: &[u8], out: &mut Out) -> Result<(), ExtractError> {
 fn odf(bytes: &[u8], out: &mut Out) -> Result<(), ExtractError> {
     let mut zip = zip_archive(bytes)?;
     let xml = zip_entry(&mut zip, "content.xml").ok_or_else(|| ExtractError::Damaged("no content.xml".into()))?;
-    xml_text(&xml, &["p", "h", "span", "a"], &["p", "h"], &["tab", "s"], out);
+    xml_text(&xml, &["p", "h", "span", "a"], &["p", "h", "line-break"], &["tab", "s"], out);
     Ok(())
 }
 
@@ -525,16 +736,40 @@ fn spreadsheet(ext: &str, bytes: &[u8], out: &mut Out) -> Result<(), ExtractErro
         }
         out.push(&name);
         out.newline();
-        if let Ok(range) = book.worksheet_range(&name) {
-            for row in range.rows() {
-                if out.full() {
-                    break;
+        // XLSX and XLSB are read cell by cell: a whole sheet in memory is
+        // rows x columns, huge for a sheet with one cell far away
+        let streamed = match &mut book {
+            calamine::Sheets::Xlsx(x) => x.worksheet_cells_reader(&name).ok().map(|mut r| {
+                let mut row = Row::default();
+                while let Ok(Some(cell)) = r.next_cell() {
+                    if !row.add(cell.get_position().0, cell_text(&cell.get_value().clone().into()), out) {
+                        break;
+                    }
                 }
-                let cells: Vec<String> =
-                    row.iter().map(cell_text).filter(|s| !s.is_empty()).collect();
-                if !cells.is_empty() {
-                    out.push(&cells.join("\t"));
-                    out.newline();
+                row.end(out);
+            }),
+            calamine::Sheets::Xlsb(x) => x.worksheet_cells_reader(&name).ok().map(|mut r| {
+                let mut row = Row::default();
+                while let Ok(Some(cell)) = r.next_cell() {
+                    if !row.add(cell.get_position().0, cell_text(&cell.get_value().clone().into()), out) {
+                        break;
+                    }
+                }
+                row.end(out);
+            }),
+            _ => None,
+        };
+        if streamed.is_none() {
+            if let Ok(range) = book.worksheet_range(&name) {
+                for row in range.rows() {
+                    if out.full() {
+                        break;
+                    }
+                    let cells: Vec<String> = row.iter().map(cell_text).filter(|s| !s.is_empty()).collect();
+                    if !cells.is_empty() {
+                        out.push(&cells.join("\t"));
+                        out.newline();
+                    }
                 }
             }
         }
@@ -543,18 +778,67 @@ fn spreadsheet(ext: &str, bytes: &[u8], out: &mut Out) -> Result<(), ExtractErro
     Ok(())
 }
 
-/// Cell text as a person reads it: 3591.5525890622844 → 3591.55.
+/// The cells of one sheet row, as they stream in.
+#[derive(Default)]
+struct Row {
+    at: Option<u32>,
+    cells: Vec<String>,
+}
+
+impl Row {
+    /// Adds a cell of row `row`, writing the row before when it changes.
+    /// `false` once the budget is spent.
+    fn add(&mut self, row: u32, text: String, out: &mut Out) -> bool {
+        if self.at != Some(row) {
+            self.end(out);
+            self.at = Some(row);
+        }
+        if !text.is_empty() {
+            self.cells.push(text);
+        }
+        !out.full()
+    }
+
+    fn end(&mut self, out: &mut Out) {
+        if !self.cells.is_empty() {
+            out.push(&self.cells.join("\t"));
+            out.newline();
+            self.cells.clear();
+        }
+    }
+}
+
+/// Cell text as a person reads it: 3591.5525890622844 → 3591.55, a date
+/// as 2024-03-15 (with its time when it has one).
 fn cell_text(c: &calamine::Data) -> String {
     match c {
         calamine::Data::Float(f) if f.fract() != 0.0 => {
             let s = format!("{f:.2}");
             s.trim_end_matches('0').trim_end_matches('.').to_string()
         }
+        calamine::Data::DateTime(d) if d.is_datetime() => {
+            let (y, mo, day, h, mi, s, _) = d.to_ymd_hms_milli();
+            let time = match (h, mi, s) {
+                (0, 0, 0) => String::new(),
+                (h, mi, 0) => format!("{h:02}:{mi:02}"),
+                (h, mi, s) => format!("{h:02}:{mi:02}:{s:02}"),
+            };
+            if d.as_f64() < 1.0 && !time.is_empty() {
+                // a time of day alone
+                time
+            } else if time.is_empty() {
+                format!("{y:04}-{mo:02}-{day:02}")
+            } else {
+                format!("{y:04}-{mo:02}-{day:02} {time}")
+            }
+        }
         other => other.to_string(),
     }
 }
 
-fn pdf(bytes: &[u8], out: &mut Out) -> Result<(), ExtractError> {
+/// The PDF's own text; returns how many letters and digits it has in all
+/// (more than `out` may keep).
+fn pdf(bytes: &[u8], out: &mut Out) -> Result<usize, ExtractError> {
     if !bytes.starts_with(b"%PDF") {
         return Err(ExtractError::Damaged("not a PDF".into()));
     }
@@ -571,8 +855,16 @@ fn pdf(bytes: &[u8], out: &mut Out) -> Result<(), ExtractError> {
             }
         })?;
     out.push(&text);
-    Ok(())
+    Ok(text.chars().filter(|c| c.is_alphanumeric()).count())
 }
+
+/// Tags that start or end a line of their own (HTML, and FictionBook's).
+const BLOCK_TAGS: &[&str] = &[
+    "p", "br", "div", "li", "ul", "ol", "dl", "dt", "dd", "tr", "table", "thead", "tbody", "tfoot", "caption", "h1", "h2",
+    "h3", "h4", "h5", "h6", "hr", "title", "blockquote", "pre", "section", "article", "header", "footer", "nav", "aside",
+    "main", "figure", "figcaption", "address", "form", "fieldset", "legend", "option", "body", "v", "subtitle",
+    "empty-line", "stanza", "epigraph", "text-author",
+];
 
 /// Text of an HTML page: no tags, scripts or styles; entities resolved.
 pub fn html_to_text(html: &str) -> String {
@@ -580,26 +872,59 @@ pub fn html_to_text(html: &str) -> String {
     let lower = html.to_ascii_lowercase();
     let mut i = 0;
     let b = html.as_bytes();
+    // the next '>' as last found: (searched from, found at), so a page full
+    // of bare '<' is read in one pass, not once per '<'
+    let mut gt: Option<(usize, Option<usize>)> = None;
     while i < b.len() {
         if b[i] == b'<' {
-            for skip in ["script", "style", "noscript"] {
+            if lower[i..].starts_with("<!--") {
+                i = lower[i..].find("-->").map_or(b.len(), |p| i + p + 3);
+                continue;
+            }
+            for skip in ["script", "style", "noscript", "binary"] {
                 if lower[i + 1..].starts_with(skip) {
                     let close = format!("</{skip}");
                     i = lower[i..].find(&close).map_or(b.len(), |p| i + p);
                     break;
                 }
             }
-            let end = html[i..].find('>').map_or(b.len(), |p| i + p + 1);
-            let tag = &lower[i..end];
-            if ["<p", "<br", "<div", "<li", "<tr", "<h1", "<h2", "<h3", "<h4", "</p", "</div", "</li"].iter().any(|t| tag.starts_with(t)) && !out.ends_with('\n') {
-                out.push('\n');
+            if i >= b.len() {
+                break;
+            }
+            let next = match gt {
+                Some((from, at)) if from <= i && at.is_none_or(|p| p >= i) => at,
+                _ => {
+                    let at = b[i..].iter().position(|&c| c == b'>').map(|p| i + p);
+                    gt = Some((i, at));
+                    at
+                }
+            };
+            let end = next.map_or(b.len(), |p| p + 1);
+            let name: String = lower[i + 1..end]
+                .trim_start_matches('/')
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+                .collect();
+            if BLOCK_TAGS.contains(&name.as_str()) {
+                if !out.ends_with('\n') {
+                    out.push('\n');
+                }
+            } else if (name == "td" || name == "th") && !lower[i + 1..].starts_with('/') && !out.is_empty() && !out.ends_with(['\n', '\t']) {
+                // table cells side by side, never glued together
+                out.push('\t');
             }
             i = end;
         } else if b[i] == b'&' {
-            let end = html[i..].find(';').filter(|p| *p < 10).map(|p| i + p);
-            match end {
-                Some(e) => {
-                    out.push_str(&resolve_entity(&html[i + 1..e]));
+            // `&name;` or `&#123;`: a short run of letters, digits and '#'
+            let end = b[i + 1..]
+                .iter()
+                .take(33)
+                .position(|&c| !(c.is_ascii_alphanumeric() || c == b'#'))
+                .map(|p| i + 1 + p)
+                .filter(|&e| e > i + 1 && b[e] == b';');
+            match end.and_then(|e| Some((e, resolve_entity(&html[i + 1..e])?))) {
+                Some((e, text)) => {
+                    out.push_str(&text);
                     i = e + 1;
                 }
                 None => {
@@ -707,6 +1032,117 @@ mod tests {
     fn rtf_and_html() {
         let html = "<html><head><style>p{}</style><script>var x=1;</script></head><body><p>Ofertă &amp; preț</p><p>Linia&nbsp;2</p></body></html>";
         assert_eq!(extract("html", html.as_bytes(), 1000).unwrap().text, "Ofertă & preț\nLinia 2");
+    }
+
+    #[test]
+    fn a_head_cut_mid_character_keeps_its_encoding() {
+        // the indexer reads 8 MB, the preview 240 KB: the cut falls anywhere
+        for text in ["Mașină de spălat", "Привет, мир"] {
+            let bytes = text.as_bytes();
+            for cut in 1..bytes.len() {
+                let got = decode_text(&bytes[..cut]).unwrap();
+                assert!(text.starts_with(&got), "{cut}: {got:?}");
+                assert!(got.len() + 3 >= cut, "{cut}: {got:?}");
+            }
+        }
+        // UTF-16 with a BOM, cut after an odd number of bytes or inside a pair
+        let utf16: Vec<u8> = [0xFF, 0xFE].into_iter().chain("Șură 😀".encode_utf16().flat_map(|u| u.to_le_bytes())).collect();
+        assert_eq!(decode_text(&utf16[..utf16.len() - 1]).unwrap(), "Șură ");
+        assert_eq!(decode_text(&utf16[..utf16.len() - 2]).unwrap(), "Șură ");
+        assert_eq!(decode_text(&utf16[..7]).unwrap(), "Șu");
+        let be: Vec<u8> = [0xFE, 0xFF].into_iter().chain("Șură".encode_utf16().flat_map(|u| u.to_be_bytes())).collect();
+        assert_eq!(decode_text(&be[..be.len() - 1]).unwrap(), "Șur");
+    }
+
+    #[test]
+    fn html_entities_cells_and_headings() {
+        let html = "<h5>Meniu</h5><p>caf&eacute; &amp; cr&egrave;me &euro;5 &ndash; &copy; &#8217;x&#x2019; &#150; &bogus; R&D</p>\
+                    <table><tr><th>Nume</th><th>Pret</th></tr><tr><td>Ceai</td><td>7</td></tr></table><h6>Final</h6>";
+        assert_eq!(html_to_text(html), "\nMeniu\ncafé & crème €5 – © ’x’ – &bogus; R&D\nNume\tPret\nCeai\t7\nFinal\n");
+        // a comment is skipped whole, even with a '>' inside
+        assert_eq!(html_to_text("a<!-- x > y -->b"), "ab");
+        // many bare '<' and '&' are read in one pass
+        let junk = "<&".repeat(200_000);
+        let t = std::time::Instant::now();
+        let _ = html_to_text(&junk);
+        assert!(t.elapsed() < std::time::Duration::from_secs(5), "{:?}", t.elapsed());
+    }
+
+    #[test]
+    fn a_full_budget_marks_the_text_truncated() {
+        let doc = r#"<w:document xmlns:w="w"><w:body><w:p><w:r><w:t>abcd</w:t></w:r></w:p><w:p><w:r><w:t>efgh</w:t></w:r></w:p></w:body></w:document>"#;
+        let e = extract("docx", &make_zip(&[("word/document.xml", doc)]), 4).unwrap();
+        assert_eq!(e.text, "abcd");
+        assert!(e.truncated);
+        let slide = |t: &str| format!(r#"<p:sld xmlns:a="a" xmlns:p="p"><a:p><a:r><a:t>{t}</a:t></a:r></a:p></p:sld>"#);
+        let e = extract("pptx", &make_zip(&[("ppt/slides/slide1.xml", &slide("unu")), ("ppt/slides/slide2.xml", &slide("doi"))]), 3).unwrap();
+        assert!(e.truncated, "{e:?}");
+    }
+
+    #[test]
+    fn line_breaks_and_endnotes_separate_words() {
+        let slide = r#"<p:sld xmlns:a="a" xmlns:p="p"><a:p><a:r><a:t>unu</a:t></a:r><a:br/><a:r><a:t>doi</a:t></a:r></a:p></p:sld>"#;
+        assert_eq!(extract("pptx", &make_zip(&[("ppt/slides/slide1.xml", slide)]), 1000).unwrap().text, "unu\ndoi");
+        let content = r#"<office:document-content xmlns:text="t"><text:p>unu<text:line-break/>doi</text:p></office:document-content>"#;
+        assert_eq!(extract("odt", &make_zip(&[("content.xml", content)]), 1000).unwrap().text, "unu\ndoi");
+        let doc = r#"<w:document xmlns:w="w"><w:body><w:p><w:r><w:t>text</w:t></w:r></w:p></w:body></w:document>"#;
+        let header = r#"<w:hdr xmlns:w="w"><w:p><w:r><w:t>Firma</w:t><w:br/><w:t>Adresa</w:t><w:tab/><w:t>Tel</w:t></w:r></w:p></w:hdr>"#;
+        let endnotes = r#"<w:endnotes xmlns:w="w"><w:endnote><w:p><w:r><w:t>Nota de final</w:t></w:r></w:p></w:endnote></w:endnotes>"#;
+        let bytes = make_zip(&[("word/document.xml", doc), ("word/header1.xml", header), ("word/endnotes.xml", endnotes)]);
+        assert_eq!(extract("docx", &bytes, 1000).unwrap().text, "text\nNota de final\nFirma\nAdresa\tTel");
+    }
+
+    #[test]
+    fn epub_spine_paths_are_resolved() {
+        let opf = r#"<package><manifest>
+            <item id="a" href="../Text/cap%C8%99or%201.xhtml#start" media-type="application/xhtml+xml"/>
+            <item href='./Text/doi&amp;trei.xhtml' id='b'/>
+        </manifest><spine><itemref idref="a"/><itemref idref="b"/></spine></package>"#;
+        let book = make_zip(&[
+            ("OEBPS/content/book.opf", opf),
+            ("OEBPS/Text/capșor 1.xhtml", "<html><body><p>Primul</p></body></html>"),
+            ("OEBPS/content/Text/doi&trei.xhtml", "<html><body><p>Al doilea</p></body></html>"),
+        ]);
+        assert_eq!(extract("epub", &book, 10_000).unwrap().text, "Primul\n\nAl doilea");
+        // a spine that leads nowhere: every XHTML file instead
+        let opf = r#"<package><manifest><item id="a" href="missing.xhtml"/></manifest><spine><itemref idref="a"/></spine></package>"#;
+        let book = make_zip(&[("content.opf", opf), ("text/one.xhtml", "<p>Unu</p>")]);
+        assert_eq!(extract("epub", &book, 10_000).unwrap().text, "Unu");
+    }
+
+    #[test]
+    fn spreadsheet_dates_read_as_dates() {
+        let types = r#"<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+            <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+            <Default Extension="xml" ContentType="application/xml"/>
+            <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+            <Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+            <Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>
+            </Types>"#;
+        let rels = r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+            <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>"#;
+        let book = r#"<?xml version="1.0"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+            <sheets><sheet name="Facturi" sheetId="1" r:id="rId1"/></sheets></workbook>"#;
+        let book_rels = r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+            <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+            <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>"#;
+        let styles = r#"<?xml version="1.0"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+            <numFmts count="1"><numFmt numFmtId="164" formatCode="yyyy-mm-dd hh:mm"/></numFmts>
+            <cellXfs count="3"><xf numFmtId="0"/><xf numFmtId="14"/><xf numFmtId="164"/></cellXfs></styleSheet>"#;
+        // a cell far away (XFD1048576) would make a dense sheet of 17 billion cells
+        let sheet = r#"<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>
+            <row r="1"><c r="A1" t="inlineStr"><is><t>Scadenta</t></is></c><c r="B1" s="1"><v>45366</v></c><c r="C1" s="2"><v>45366.5</v></c></row>
+            <row r="1048576"><c r="XFD1048576"><v>7</v></c></row>
+            </sheetData></worksheet>"#;
+        let bytes = make_zip(&[
+            ("[Content_Types].xml", types),
+            ("_rels/.rels", rels),
+            ("xl/workbook.xml", book),
+            ("xl/_rels/workbook.xml.rels", book_rels),
+            ("xl/styles.xml", styles),
+            ("xl/worksheets/sheet1.xml", sheet),
+        ]);
+        assert_eq!(extract("xlsx", &bytes, 10_000).unwrap().text, "Facturi\nScadenta\t2024-03-15\t2024-03-15 12:00\n7");
     }
 
     #[test]

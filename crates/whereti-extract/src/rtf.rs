@@ -9,7 +9,20 @@ use std::collections::HashMap;
 
 use encoding_rs::Encoding;
 
+/// RTF already decoded to text.
 pub fn rtf_to_text(rtf: &str) -> String {
+    convert(rtf.chars(), false)
+}
+
+/// An RTF file's bytes. RTF is 7-bit by its rules, but some writers put
+/// 8-bit bytes straight into the text: those are read in the document's
+/// code page (`\ansicpg`, Windows-1252 when it names none) or the font's.
+pub fn rtf_bytes_to_text(rtf: &[u8]) -> String {
+    convert(rtf.iter().map(|&b| b as char), true)
+}
+
+/// `raw`: every char is one byte of the file (U+0000 to U+00FF).
+fn convert(rtf: impl Iterator<Item = char>, raw: bool) -> String {
     let mut st = State {
         text: String::new(),
         pending: Vec::new(),
@@ -21,8 +34,9 @@ pub fn rtf_to_text(rtf: &str) -> String {
         fonttbl_depth: None,
         defining_font: None,
         uc: 1,
+        high_surrogate: None,
     };
-    let mut chars = rtf.chars().peekable();
+    let mut chars = rtf.peekable();
     let mut depth = 0usize;
     // characters still to drop after \u (its ANSI fallback)
     let mut fallback = 0usize;
@@ -127,8 +141,25 @@ pub fn rtf_to_text(rtf: &str) -> String {
                     "rdblquote" if st.visible() => st.push('”'),
                     "bullet" if st.visible() => st.push('•'),
                     "u" if st.visible() => {
-                        if let Some(ch) = n.and_then(|n| char::from_u32(n as u16 as u32)) {
-                            st.push(ch);
+                        // negative for code units above 32767; a character
+                        // beyond U+FFFF comes as two (a surrogate pair)
+                        if let Some(unit) = n.map(|n| n as u16) {
+                            match (st.high_surrogate.take(), unit) {
+                                (_, 0xD800..=0xDBFF) => {
+                                    st.flush();
+                                    st.high_surrogate = Some(unit);
+                                }
+                                (Some(high), 0xDC00..=0xDFFF) => {
+                                    if let Some(ch) = char::decode_utf16([high, unit]).next().and_then(|c| c.ok()) {
+                                        st.push(ch);
+                                    }
+                                }
+                                (_, unit) => {
+                                    if let Some(ch) = char::from_u32(unit as u32) {
+                                        st.push(ch);
+                                    }
+                                }
+                            }
                         }
                         fallback = st.uc;
                     }
@@ -137,6 +168,8 @@ pub fn rtf_to_text(rtf: &str) -> String {
             }
             '\r' | '\n' => {}
             _ if fallback > 0 => fallback -= 1,
+            // an 8-bit byte written as is: a byte of the code page, like \'xx
+            c if raw && c as u32 >= 0x80 && st.visible() => st.pending.push(c as u8),
             c if st.visible() => st.push(c),
             _ => {}
         }
@@ -157,6 +190,8 @@ struct State {
     fonttbl_depth: Option<usize>,
     defining_font: Option<i32>,
     uc: usize,
+    /// The first half of a character beyond U+FFFF, given by \u.
+    high_surrogate: Option<u16>,
 }
 
 impl State {
@@ -237,5 +272,19 @@ mod tests {
         // Western document with a Japanese font: \'93 is a quote in f0, a lead byte in f1
         let mixed = r"{\rtf1\ansi\ansicpg1252{\fonttbl{\f0\fcharset0 Arial;}{\f1\fcharset128 MS Gothic;}}\f0 \'93Hi\'94 {\f1 \'93\'fa\'96\'7b} end}";
         assert_eq!(rtf_to_text(mixed), "“Hi” 日本 end");
+    }
+
+    #[test]
+    fn surrogate_pairs_and_raw_bytes() {
+        // U+1F600 as \u55357? \u56832? (and as negative numbers)
+        assert_eq!(rtf_to_text(r"{\rtf1 a\u55357?\u56832?b}"), "a\u{1F600}b");
+        assert_eq!(rtf_to_text(r"{\rtf1 a\u-10179?\u-8704?b}"), "a\u{1F600}b");
+        // an 8-bit byte in a Central European document, and in one with no code page
+        let mut cp1250 = br"{\rtf1\ansi\ansicpg1250 cas".to_vec();
+        cp1250.extend([0xE3, b'}']);
+        assert_eq!(super::rtf_bytes_to_text(&cp1250), "casă");
+        let mut plain = br"{\rtf1 caf".to_vec();
+        plain.extend([0xE9, b'}']);
+        assert_eq!(super::rtf_bytes_to_text(&plain), "café");
     }
 }

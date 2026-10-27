@@ -25,6 +25,13 @@ pub struct Embedder {
 
 impl Embedder {
     pub fn new(onnxruntime: &Path, model: &Path, tokenizer: &Path) -> Result<Embedder, String> {
+        let read = |p: &Path| std::fs::read(p).map_err(|e| format!("cannot read {}: {e}", p.display()));
+        Embedder::from_bytes(onnxruntime, &read(model)?, &read(tokenizer)?)
+    }
+
+    /// The same, from the files' bytes (the worker gets them as handles,
+    /// see worker::EmbedWorker).
+    pub fn from_bytes(onnxruntime: &Path, model: &[u8], tokenizer: &[u8]) -> Result<Embedder, String> {
         let env = ort::init_from(onnxruntime)
             .map_err(|e| format!("cannot load {}: {e}", onnxruntime.display()))?
             .with_name("whereti")
@@ -34,10 +41,10 @@ impl Embedder {
         let builder = ort::session::Session::builder(&env).map_err(|e| e.to_string())?;
         let builder = builder.with_intra_threads(1).map_err(|e| e.to_string())?;
         let mut builder = builder.with_inter_threads(1).map_err(|e| e.to_string())?;
-        let session = builder.commit_from_file(model).map_err(|e| format!("cannot load the model: {e}"))?;
+        let session = builder.commit_from_memory(model).map_err(|e| format!("cannot load the model: {e}"))?;
         std::mem::forget(env);
         let type_ids = session.inputs().iter().any(|i| i.name() == "token_type_ids");
-        let mut tokenizer = tokenizers::Tokenizer::from_file(tokenizer).map_err(|e| format!("cannot load the tokenizer: {e}"))?;
+        let mut tokenizer = tokenizers::Tokenizer::from_bytes(tokenizer).map_err(|e| format!("cannot load the tokenizer: {e}"))?;
         tokenizer
             .with_truncation(Some(tokenizers::TruncationParams { max_length: MAX_TOKENS, ..Default::default() }))
             .map_err(|e| e.to_string())?;
@@ -104,7 +111,11 @@ pub fn pieces(text: &str, max: usize) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
     for word in text.split_whitespace() {
-        if cur.len() + word.len() + 1 > SIZE {
+        // a "word" longer than a piece (base64, a long link) means nothing
+        if word.len() > SIZE {
+            continue;
+        }
+        if !cur.is_empty() && cur.len() + word.len() + 1 > SIZE {
             out.push(std::mem::take(&mut cur));
             if out.len() >= max {
                 return out;
@@ -132,6 +143,9 @@ mod tests {
         assert_eq!(p.len(), 2);
         assert!(p[0].len() <= 900);
         assert!(pieces("doar doua", 3).is_empty());
+        // a first word longer than a piece gives no empty piece
+        let long = format!("{} unu doi trei", "x".repeat(1000));
+        assert_eq!(pieces(&long, 3), vec!["unu doi trei"]);
         let a = quantize(&[0.6, 0.8]);
         assert!((similarity(&a, &a) - 1.0).abs() < 0.02);
     }

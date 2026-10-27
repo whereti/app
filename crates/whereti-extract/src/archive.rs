@@ -4,12 +4,17 @@
 //! So "factura" finds `acte.zip` because `facturi/factura_martie.pdf` is in
 //! it, or because that PDF says "factura".
 //!
+//! Every name comes first, then the text of the documents, read while there
+//! is time (`READ_TIME`, or less when the caller waits less), so an archive
+//! of slow documents still gives all its names.
+//!
 //! Bounded like everything here: members inflated at most `MAX_ENTRY`, at
 //! most `MAX_READ` documents read, pictures not read (OCR is slow), no
 //! archives inside archives, and the whole text within the caller's budget.
 //! A large ZIP sends only its end (the list of names), see `zip_tail_names`.
 
 use std::io::{Cursor, Read};
+use std::time::{Duration, Instant};
 
 use crate::{extract, kind_of, ExtractError, Kind, Out, MAX_ENTRY};
 
@@ -17,6 +22,9 @@ use crate::{extract, kind_of, ExtractError, Kind, Out, MAX_ENTRY};
 const MAX_READ: usize = 200;
 /// Names listed from one archive.
 const MAX_NAMES: usize = 20_000;
+/// Time for reading the documents inside one archive, when the caller
+/// allows more (the service waits 30 s for a file).
+const READ_TIME: Duration = Duration::from_secs(20);
 
 pub(crate) fn is_archive(ext: &str) -> bool {
     matches!(ext, "zip" | "7z" | "rar")
@@ -31,46 +39,83 @@ fn readable(name: &str) -> Option<String> {
     }
 }
 
-/// Adds one member: its name, then (if given) its text.
-fn member(out: &mut Out, name: &str, bytes: Option<Vec<u8>>, read: &mut usize) {
+/// Adds one member's name, on a line of its own.
+fn name_line(out: &mut Out, name: &str) {
     out.newline();
     out.push(&name.replace('/', "\\"));
     out.newline();
-    let (Some(bytes), Some(ext)) = (bytes, readable(name)) else { return };
-    if *read >= MAX_READ || out.full() {
+}
+
+/// When reading the documents inside stops: `READ_TIME` from now, or the
+/// caller's deadline if sooner. Every name is listed before, so a slow
+/// archive still gives all its names.
+fn read_until() -> Instant {
+    let own = Instant::now() + READ_TIME;
+    crate::deadline().map_or(own, |d| d.min(own))
+}
+
+/// Adds a document's text, under its name again, read by `until`.
+fn content(out: &mut Out, name: &str, bytes: &[u8], until: Instant) {
+    let Some(ext) = readable(name) else { return };
+    if out.full() {
         return;
     }
-    *read += 1;
-    if let Ok(e) = extract(&ext, &bytes, out.budget) {
-        out.push(&e.text);
-        out.newline();
+    if let Ok(e) = crate::within(until, || extract(&ext, bytes, out.budget)) {
+        if !e.text.is_empty() {
+            name_line(out, name);
+            out.push(&e.text);
+            out.newline();
+        }
+        out.truncated |= e.truncated;
     }
 }
 
 pub(crate) fn zip(bytes: &[u8], out: &mut Out) -> Result<(), ExtractError> {
     let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).map_err(|e| ExtractError::Damaged(e.to_string()))?;
-    let mut read = 0;
+    // 1. every name, from the central directory: encrypted members and
+    // members in a method not built in (Deflate64, bzip2, LZMA...) too
+    let mut wanted = Vec::new();
+    if archive.len() > MAX_NAMES {
+        out.truncated = true;
+    }
     for i in 0..archive.len().min(MAX_NAMES) {
         if out.full() {
             break;
         }
-        let Ok(mut f) = archive.by_index(i) else { continue };
-        if f.is_dir() {
+        let Some(Ok(name)) = archive.name_for_index(i) else { continue };
+        if name.ends_with('/') || name.ends_with('\\') {
             continue;
         }
-        let Ok(name) = f.name().map(|n| n.into_owned()) else { continue };
-        let wanted = readable(&name).is_some() && read < MAX_READ && !f.encrypted() && f.size() <= MAX_ENTRY;
-        let content = wanted.then(|| {
-            let mut buf = Vec::with_capacity(f.size() as usize);
-            (&mut f).take(MAX_ENTRY).read_to_end(&mut buf).ok().map(|_| buf)
-        });
-        member(out, &name, content.flatten(), &mut read);
+        let name = name.into_owned();
+        name_line(out, &name);
+        if readable(&name).is_some() && wanted.len() < MAX_READ {
+            wanted.push((i, name));
+        }
+    }
+    // 2. the documents' text, while there is time
+    let until = read_until();
+    for (i, name) in wanted {
+        if out.full() || Instant::now() >= until {
+            out.truncated = true;
+            break;
+        }
+        // encrypted, or a method not built in: its name is enough
+        let Ok(f) = archive.by_index(i) else { continue };
+        if f.encrypted() || f.size() > MAX_ENTRY {
+            continue;
+        }
+        let mut buf = Vec::with_capacity(f.size() as usize);
+        if f.take(MAX_ENTRY).read_to_end(&mut buf).is_ok() {
+            content(out, &name, &buf, until);
+        }
     }
     Ok(())
 }
 
 pub(crate) fn sevenz(bytes: &[u8], out: &mut Out) -> Result<(), ExtractError> {
-    let mut reader = sevenz_rust2::ArchiveReader::new(Cursor::new(bytes), sevenz_rust2::Password::empty()).map_err(|e| {
+    let password = sevenz_rust2::Password::empty();
+    let mut source = Cursor::new(bytes);
+    let archive = sevenz_rust2::Archive::read(&mut source, &password).map_err(|e| {
         let text = e.to_string();
         if text.to_lowercase().contains("password") {
             ExtractError::Protected
@@ -78,30 +123,74 @@ pub(crate) fn sevenz(bytes: &[u8], out: &mut Out) -> Result<(), ExtractError> {
             ExtractError::Damaged(text)
         }
     })?;
-    let mut read = 0;
-    let mut names = 0;
-    let _ = reader.for_each_entries(|entry, data| {
-        if out.full() || names >= MAX_NAMES {
-            return Ok(false);
+    // 1. every name, from the archive's header
+    let mut wanted = std::collections::HashSet::new();
+    let files: Vec<usize> = (0..archive.files.len()).filter(|&i| !archive.files[i].is_directory()).collect();
+    if files.len() > MAX_NAMES {
+        out.truncated = true;
+    }
+    for &i in files.iter().take(MAX_NAMES) {
+        if out.full() {
+            break;
         }
-        if entry.is_directory() {
-            return Ok(true);
+        let f = &archive.files[i];
+        name_line(out, f.name());
+        if readable(f.name()).is_some() && f.has_stream() && f.size() <= MAX_ENTRY && wanted.len() < MAX_READ {
+            wanted.insert(i);
         }
-        names += 1;
-        let name = entry.name().to_string();
-        let wanted = readable(&name).is_some() && read < MAX_READ && entry.size() <= MAX_ENTRY;
-        let content = if wanted {
-            let mut buf = Vec::with_capacity(entry.size() as usize);
-            data.take(MAX_ENTRY).read_to_end(&mut buf).ok().map(|_| buf)
-        } else {
-            // the stream must be consumed to reach the next entry
-            let _ = std::io::copy(data, &mut std::io::sink());
-            None
-        };
-        member(out, &name, content, &mut read);
-        Ok(true)
-    });
+    }
+    // 2. the documents' text, block by block, while there is time; a block
+    // that cannot be decoded (unknown method, damaged) is skipped
+    let until = read_until();
+    let file_block = &archive.stream_map.file_block_index;
+    let mut blocks: Vec<usize> = wanted.iter().filter_map(|&i| file_block.get(i).copied().flatten()).collect();
+    blocks.sort_unstable();
+    blocks.dedup();
+    for block in blocks {
+        if out.full() || Instant::now() >= until {
+            out.truncated = true;
+            break;
+        }
+        let first = archive.stream_map.block_first_file_index[block];
+        // the last wanted file of this block: decoding stops after it
+        let last = wanted.iter().copied().filter(|&i| file_block.get(i).copied().flatten() == Some(block)).max().unwrap_or(first);
+        let mut index = first;
+        let decoder = sevenz_rust2::BlockDecoder::new(1, block, &archive, &password, &mut source);
+        let _ = decoder.for_each_entries(&mut |entry, data| {
+            let i = index;
+            index += 1;
+            if out.full() || Instant::now() >= until {
+                out.truncated = true;
+                return Ok(false);
+            }
+            if wanted.contains(&i) {
+                let mut buf = Vec::with_capacity(entry.size() as usize);
+                if data.take(MAX_ENTRY).read_to_end(&mut buf).is_err() {
+                    return Ok(false);
+                }
+                content(out, entry.name(), &buf, until);
+            } else if !drain(data, until) {
+                // a member not read must still be decoded to reach the next
+                out.truncated = true;
+                return Ok(false);
+            }
+            Ok(i < last)
+        });
+    }
     Ok(())
+}
+
+/// Reads a member through to its end, unless time runs out first (a huge
+/// member that compresses well would hold the worker for minutes).
+fn drain(data: &mut dyn Read, until: Instant) -> bool {
+    let mut buf = vec![0u8; 256 << 10];
+    loop {
+        match data.read(&mut buf) {
+            Ok(0) => return true,
+            Ok(_) if Instant::now() < until => {}
+            _ => return false,
+        }
+    }
 }
 
 /// A 7z seen through its two ends (see `crate::sevenz_ends`): reads as a
@@ -170,12 +259,11 @@ pub(crate) fn sevenz_end_names(bytes: &[u8], out: &mut Out) -> Result<(), Extrac
             ExtractError::Damaged(text)
         }
     })?;
-    let mut read = 0;
     for f in reader.archive().files.iter().filter(|f| !f.is_directory()).take(MAX_NAMES) {
         if out.full() {
             break;
         }
-        member(out, f.name(), None, &mut read);
+        name_line(out, f.name());
     }
     Ok(())
 }
@@ -189,12 +277,11 @@ pub(crate) fn rar(bytes: &[u8], out: &mut Out) -> Result<(), ExtractError> {
     } else {
         return Err(ExtractError::Damaged("not a RAR archive".into()));
     };
-    let mut read = 0;
     for n in names {
         if out.full() {
             break;
         }
-        member(out, &n, None, &mut read);
+        name_line(out, &n);
     }
     Ok(())
 }
@@ -292,11 +379,9 @@ fn rar4_names(b: &[u8]) -> Result<Vec<String>, ExtractError> {
                 };
                 add = pack | high << 32;
                 let raw = b.get(name_at..name_at + name_len).ok_or_else(bad)?;
-                // a Unicode name follows the plain one after a 0 byte
-                let plain = raw.split(|&c| c == 0).next().unwrap_or(raw);
                 let dir = flags & 0xE0 == 0xE0;
                 if !dir {
-                    names.push(String::from_utf8_lossy(plain).into_owned());
+                    names.push(rar4_name(raw, flags & 0x200 != 0));
                 }
             }
             // end of archive
@@ -331,20 +416,108 @@ pub(crate) fn zip_tail_names(tail: &[u8], out: &mut Out) -> Result<(), ExtractEr
     }
     let eocd = cd_end;
     let mut p = eocd.checked_sub(cd_size).ok_or_else(bad)?;
-    let mut read = 0;
     let mut names = 0;
     while p + 46 <= eocd && tail[p..].starts_with(b"PK\x01\x02") && names < MAX_NAMES && !out.full() {
+        let flags = u16_at(p + 8).ok_or_else(bad)?;
         let name_len = u16_at(p + 28).ok_or_else(bad)?;
         let extra = u16_at(p + 30).ok_or_else(bad)?;
         let comment = u16_at(p + 32).ok_or_else(bad)?;
         let name = tail.get(p + 46..p + 46 + name_len).ok_or_else(bad)?;
         if !name.ends_with(b"/") {
-            member(out, &String::from_utf8_lossy(name), None, &mut read);
+            // bit 11: the name is UTF-8; else it is in code page 437
+            let name = if flags & 0x800 != 0 { String::from_utf8_lossy(name).into_owned() } else { cp437(name) };
+            name_line(out, &name);
             names += 1;
         }
         p += 46 + name_len + extra + comment;
     }
     Ok(())
+}
+
+/// A RAR 4 file name. With `unicode` set, the name is UTF-8, or a plain
+/// name, a 0 byte, and the Unicode name packed against it; without it, the
+/// name is in the DOS code page (437 when it is not UTF-8).
+fn rar4_name(raw: &[u8], unicode: bool) -> String {
+    let Some(zero) = raw.iter().position(|&c| c == 0) else {
+        return match std::str::from_utf8(raw) {
+            Ok(s) => s.to_string(),
+            Err(_) if unicode => String::from_utf8_lossy(raw).into_owned(),
+            Err(_) => cp437(raw),
+        };
+    };
+    let (plain, packed) = (&raw[..zero], &raw[zero + 1..]);
+    let wide = rar4_unicode(plain, packed);
+    if wide.is_empty() {
+        cp437(plain)
+    } else {
+        String::from_utf16_lossy(&wide)
+    }
+}
+
+/// Unpacks RAR 4's Unicode name: two-bit commands say whether the next
+/// character is one byte (high byte 0), one byte with the name's common
+/// high byte, two bytes, or a run copied from the plain name.
+fn rar4_unicode(plain: &[u8], packed: &[u8]) -> Vec<u16> {
+    const MAX: usize = 1024;
+    let mut out: Vec<u16> = Vec::new();
+    let Some((&high, mut rest)) = packed.split_first() else { return out };
+    let high = (high as u16) << 8;
+    let (mut flags, mut bits) = (0u8, 0u32);
+    while !rest.is_empty() && out.len() < MAX {
+        if bits == 0 {
+            flags = rest[0];
+            rest = &rest[1..];
+            bits = 8;
+        }
+        match flags >> 6 {
+            0 => {
+                let Some((&c, r)) = rest.split_first() else { break };
+                out.push(c as u16);
+                rest = r;
+            }
+            1 => {
+                let Some((&c, r)) = rest.split_first() else { break };
+                out.push(c as u16 + high);
+                rest = r;
+            }
+            2 => {
+                let [lo, hi, r @ ..] = rest else { break };
+                out.push(u16::from_le_bytes([*lo, *hi]));
+                rest = r;
+            }
+            _ => {
+                let Some((&len, r)) = rest.split_first() else { break };
+                rest = r;
+                if len & 0x80 != 0 {
+                    let Some((&fix, r)) = rest.split_first() else { break };
+                    rest = r;
+                    for _ in 0..(len & 0x7F) + 2 {
+                        let at = out.len();
+                        let c = plain.get(at).copied().unwrap_or(0);
+                        out.push((c.wrapping_add(fix)) as u16 + high);
+                    }
+                } else {
+                    for _ in 0..len as usize + 2 {
+                        let at = out.len();
+                        out.push(plain.get(at).copied().unwrap_or(0) as u16);
+                    }
+                }
+            }
+        }
+        flags <<= 2;
+        bits -= 2;
+    }
+    out.truncate(MAX);
+    while out.last() == Some(&0) {
+        out.pop();
+    }
+    out
+}
+
+/// Bytes in code page 437 (the old DOS one that ZIP names default to).
+fn cp437(bytes: &[u8]) -> String {
+    const HIGH: &str = "ÇüéâäàåçêëèïîìÄÅÉæÆôöòûùÿÖÜ¢£¥₧ƒáíóúñÑªº¿⌐¬½¼¡«»░▒▓│┤╡╢╖╕╣║╗╝╜╛┐└┴┬├─┼╞╟╚╔╩╦╠═╬╧╨╤╥╙╘╒╓╫╪┘┌█▄▌▐▀αßΓπΣσµτΦΘΩδ∞φε∩≡±≥≤⌠⌡÷≈°∙·√ⁿ²■\u{a0}";
+    bytes.iter().map(|&c| if c < 0x80 { c as char } else { HIGH.chars().nth(c as usize - 0x80).unwrap_or('?') }).collect()
 }
 
 #[cfg(test)]
@@ -373,6 +546,71 @@ mod tests {
         assert!(e.text.contains("Total de plata 120 lei"));
         assert!(e.text.contains("poza.jpg"));
         assert!(!e.text.contains("not read"));
+    }
+
+    #[test]
+    fn every_name_comes_before_the_documents_and_time_only_cuts_documents() {
+        let z = zip_with(&[("a.txt", b"textul lui a"), ("b.txt", b"textul lui b"), ("poza.jpg", b"x")]);
+        let e = extract("zip", &z, 10_000).unwrap();
+        assert_eq!(e.text, "a.txt\nb.txt\npoza.jpg\na.txt\ntextul lui a\nb.txt\ntextul lui b");
+        // no time left: the names all the same, no text
+        let e = crate::within(Instant::now(), || extract("zip", &z, 10_000)).unwrap();
+        assert_eq!(e.text, "a.txt\nb.txt\npoza.jpg");
+        assert!(e.truncated);
+    }
+
+    /// Sets a flag or a method in a ZIP's local and central headers alike.
+    fn patch_zip(z: &mut [u8], at_local: usize, at_central: usize, value: u16) {
+        for (sig, at) in [(b"PK\x03\x04", at_local), (b"PK\x01\x02", at_central)] {
+            let p = z.windows(4).position(|w| w == sig).unwrap();
+            z[p + at..p + at + 2].copy_from_slice(&value.to_le_bytes());
+        }
+    }
+
+    #[test]
+    fn encrypted_and_unknown_method_members_keep_their_names() {
+        let mut z = zip_with(&[("secret/plan.txt", b"nu se citeste")]);
+        patch_zip(&mut z, 6, 8, 1); // encrypted
+        let e = extract("zip", &z, 10_000).unwrap();
+        assert_eq!(e.text, r"secret\plan.txt");
+        let mut z = zip_with(&[("vechi/arhiva.txt", b"Deflate64")]);
+        patch_zip(&mut z, 8, 10, 9); // Deflate64, not built in
+        let e = extract("zip", &z, 10_000).unwrap();
+        assert_eq!(e.text, r"vechi\arhiva.txt");
+    }
+
+    #[test]
+    fn a_7z_lists_its_names_and_reads_its_documents() {
+        let mut buf = Cursor::new(Vec::new());
+        let mut w = sevenz_rust2::ArchiveWriter::new(&mut buf).unwrap();
+        for (name, data) in [("acte/contract.txt", &b"Contract de inchiriere"[..]), ("mare.bin", &[0u8; 100_000][..]), ("nota.md", b"de citit")] {
+            w.push_archive_entry(sevenz_rust2::ArchiveEntry::new_file(name), Some(data)).unwrap();
+        }
+        w.finish().unwrap();
+        let e = extract("7z", buf.get_ref(), 10_000).unwrap();
+        assert_eq!(e.text, "acte\\contract.txt\nmare.bin\nnota.md\nacte\\contract.txt\nContract de inchiriere\nnota.md\nde citit");
+    }
+
+    #[test]
+    fn rar4_unicode_names_and_cp437_zip_names() {
+        // "ș.txt": a plain name, a 0 byte, then the packed Unicode name:
+        // high byte 0x02, flags 01 00 00 00 (one char with it, three plain), then the last plain one
+        let mut raw = b"?.txt\0".to_vec();
+        raw.extend([0x02, 0x40, 0x19, b'.', b't', b'x', 0x00, b't']);
+        assert_eq!(rar4_name(&raw, true), "ș.txt");
+        assert_eq!(rar4_name("ă.txt".as_bytes(), true), "ă.txt");
+        assert_eq!(rar4_name(b"caf\x82.txt", false), "café.txt");
+        // a ZIP name without the UTF-8 flag is in code page 437
+        let mut z = zip_with(&[("caf\u{e9}.txt", b"x")]);
+        let utf8 = "caf\u{e9}.txt".as_bytes();
+        let p = z.windows(4).position(|w| w == b"PK\x01\x02").unwrap();
+        let name_at = z[p..].windows(utf8.len()).position(|w| w == utf8).unwrap() + p;
+        let cp437: Vec<u8> = b"caf\x82.txt\x00".to_vec(); // same length: one byte for "é", a padding NUL
+        z[name_at..name_at + cp437.len()].copy_from_slice(&cp437);
+        z[p + 8..p + 10].copy_from_slice(&0u16.to_le_bytes());
+        let mut out = Out::new(1000);
+        zip_tail_names(&z, &mut out).unwrap();
+        assert!(out.finish().text.starts_with("café.txt"));
     }
 
     #[test]
