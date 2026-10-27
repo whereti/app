@@ -114,7 +114,9 @@ impl FileIcons {
 
     fn fetch(&self, path: &str, is_dir: bool) -> Option<(Vec<u8>, usize)> {
         let list = self.list.as_ref()?;
-        let own_icon = !is_dir && has_own_icon(path);
+        // a program's own icon is read from the file: not from a share, where
+        // a NAS asleep would hold the window for its timeout
+        let own_icon = !is_dir && has_own_icon(path) && !crate::win::is_network_path(path);
         let (name, attrs, flags) = if is_dir {
             (HSTRING::from("folder"), FILE_ATTRIBUTE_DIRECTORY, SHGFI_SYSICONINDEX | SHGFI_USEFILEATTRIBUTES)
         } else if own_icon {

@@ -240,7 +240,10 @@ fn close_running(dir: &Path) {
                     let path = QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, windows::core::PWSTR(buf.as_mut_ptr()), &mut len)
                         .ok()
                         .map(|()| String::from_utf16_lossy(&buf[..len as usize]).to_lowercase());
-                    if path.is_some_and(|p| p.starts_with(&folder)) && TerminateProcess(h, 1).is_ok() {
+                    // not the uninstaller itself: run without elevation, it waits
+                    // for its elevated copy (this process) and says "removed"
+                    let ours = path.is_some_and(|p| p.starts_with(&folder) && !p.ends_with(r"\uninstall.exe"));
+                    if ours && TerminateProcess(h, 1).is_ok() {
                         closing.push(h);
                     } else {
                         let _ = CloseHandle(h);
@@ -391,16 +394,28 @@ pub fn uninstall(log: &mut dyn FnMut(&str)) -> Result<(), String> {
     unsafe {
         let _ = RegDeleteTreeW(HKEY_LOCAL_MACHINE, UNINSTALL_KEY);
     }
-    // The running uninstaller removes itself and the folder once it exits.
+    // The uninstaller removes itself and the folder once it exits: its
+    // window may stay open a while (it says "removed"), so try for 2 minutes.
+    // Programs by their full path, run from System32: nothing is looked up
+    // in a folder a user could write to.
+    let sys = system32();
+    let exe = dir.join("uninstall.exe");
     let script = format!(
-        "ping 127.0.0.1 -n 3 > nul & del /f /q \"{}\" & rmdir /s /q \"{}\"",
-        dir.join("uninstall.exe").display(),
-        dir.display()
+        "for /l %i in (1,1,60) do @if exist \"{exe}\" (del /f /q \"{exe}\" >nul 2>&1 & \"{ping}\" 127.0.0.1 -n 3 >nul) & rmdir /s /q \"{dir}\"",
+        exe = exe.display(),
+        ping = sys.join("PING.EXE").display(),
+        dir = dir.display()
     );
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        let _ = Command::new("cmd").args(["/c", &script]).creation_flags(CREATE_NO_WINDOW).spawn();
+        let _ = Command::new(sys.join("cmd.exe"))
+            .arg("/c")
+            // as written: cmd does not read the \" escapes Rust would add
+            .raw_arg(&script)
+            .current_dir(&sys)
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn();
     }
     Ok(())
 }

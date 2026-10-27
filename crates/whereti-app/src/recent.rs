@@ -94,15 +94,26 @@ pub fn recent_files(limit: usize) -> Vec<Row> {
         if !seen.insert(key.clone()) || is_noise(&key) {
             continue;
         }
-        // still there, and a file (folders are in the Recent list too)
-        let Ok(meta) = std::fs::metadata(&path) else { continue };
-        if !meta.is_file() {
-            continue;
-        }
+        // a file on a share is listed unchecked: a NAS asleep or a laptop
+        // away from the office would hold the list for the network timeout
+        let size = if crate::win::is_network_path(&key) {
+            // its name tells whether it is a file (folders are in the list too)
+            if path.extension().is_none() {
+                continue;
+            }
+            0
+        } else {
+            // still there, and a file
+            let Ok(meta) = std::fs::metadata(&path) else { continue };
+            if !meta.is_file() {
+                continue;
+            }
+            meta.len()
+        };
         rows.push(Row {
             path: path.to_string_lossy().into_owned(),
             is_dir: false,
-            size: meta.len(),
+            size,
             modified: minutes_since_1601(time),
             flags: 0,
         });

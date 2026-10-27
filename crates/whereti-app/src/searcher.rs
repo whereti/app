@@ -12,6 +12,9 @@ use whereti_ipc::{
 /// Content search waits this long after the name results, so it runs only
 /// once typing pauses.
 const CONTENT_DEBOUNCE: Duration = Duration::from_millis(150);
+/// A change of settings is sent again for about this many seconds while
+/// the service cannot be reached.
+const SETTINGS_RETRIES: u32 = 60;
 
 pub struct Job {
     pub generation: u64,
@@ -142,10 +145,36 @@ struct Pending {
     file_info: Option<String>,
 }
 
+/// Waits `CONTENT_DEBOUNCE` for typing to pause: false when a newer search
+/// came (or the app is closing). Anything else that comes meanwhile (a
+/// status poll, file details for the preview) is kept in `carried`, to be
+/// handled next, and does not cancel the wait.
+fn typing_pauses(jobs: &Receiver<Msg>, carried: &mut std::collections::VecDeque<Msg>) -> bool {
+    let end = Instant::now() + CONTENT_DEBOUNCE;
+    loop {
+        let left = end.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return true;
+        }
+        match jobs.recv_timeout(left) {
+            Ok(m @ Msg::Search(_)) => {
+                carried.push_back(m);
+                return false;
+            }
+            Ok(m) => carried.push_back(m),
+            Err(mpsc::RecvTimeoutError::Timeout) => return true,
+            Err(mpsc::RecvTimeoutError::Disconnected) => return false,
+        }
+    }
+}
+
 fn worker(jobs: Receiver<Msg>, out: Sender<Update>, wake: impl Fn()) {
     let mut client: Option<Client> = None;
-    let mut carried: Option<Msg> = None;
-    while let Some(first) = carried.take().or_else(|| jobs.recv().ok()) {
+    // messages that came while a content search waited for typing to pause
+    let mut carried: std::collections::VecDeque<Msg> = std::collections::VecDeque::new();
+    // tries in a row to send a change of settings (about a second apart)
+    let mut retries = 0u32;
+    while let Some(first) = carried.pop_front().or_else(|| jobs.recv().ok()) {
         // Collapse everything queued: newest search, newest exclusions, flags.
         let mut p = Pending::default();
         let mut take = |m: Msg| match m {
@@ -172,6 +201,9 @@ fn worker(jobs: Receiver<Msg>, out: Sender<Update>, wake: impl Fn()) {
             Msg::FileInfo(path) => p.file_info = Some(path),
         };
         take(first);
+        while let Some(m) = carried.pop_front() {
+            take(m);
+        }
         loop {
             match jobs.try_recv() {
                 Ok(m) => take(m),
@@ -179,6 +211,36 @@ fn worker(jobs: Receiver<Msg>, out: Sender<Update>, wake: impl Fn()) {
                 Err(TryRecvError::Disconnected) => return,
             }
         }
+        // a change of settings must reach the service: kept to send again
+        // when the service cannot be reached (it restarts after an update)
+        let settings: Vec<Msg> = [
+            p.exclusions.clone().map(Msg::SetExclusions),
+            p.photo_tags.map(Msg::SetPhotoTags),
+            p.work_folders.map(Msg::SetWorkFolders),
+            p.meaning.map(Msg::SetMeaning),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        let mut keep_settings = |carried: &mut std::collections::VecDeque<Msg>| {
+            if settings.is_empty() {
+                return;
+            }
+            retries += 1;
+            if retries <= SETTINGS_RETRIES {
+                for m in settings.iter().rev() {
+                    let again = match m {
+                        Msg::SetExclusions(v) => Msg::SetExclusions(v.clone()),
+                        Msg::SetPhotoTags(on) => Msg::SetPhotoTags(*on),
+                        Msg::SetWorkFolders(on) => Msg::SetWorkFolders(*on),
+                        Msg::SetMeaning(on) => Msg::SetMeaning(*on),
+                        _ => continue,
+                    };
+                    carried.push_front(again);
+                }
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        };
         if client.is_none() {
             match Client::connect(Duration::from_millis(300)) {
                 Ok(c) => client = Some(c),
@@ -190,6 +252,7 @@ fn worker(jobs: Receiver<Msg>, out: Sender<Update>, wake: impl Fn()) {
                     };
                     let _ = out.send(Update::Offline(msg));
                     wake();
+                    keep_settings(&mut carried);
                     continue;
                 }
             }
@@ -246,16 +309,17 @@ fn worker(jobs: Receiver<Msg>, out: Sender<Update>, wake: impl Fn()) {
                             }
                         }
                     }
+                    // the service answered: it is running, the search was refused
                     Response::Error(e) => {
-                        let _ = out.send(Update::Offline(e));
+                        let _ = out.send(Update::Done(e));
                     }
                     _ => {}
                 }
                 if job.content {
-                    // A newer keystroke cancels it; the new message is handled next.
-                    match jobs.recv_timeout(CONTENT_DEBOUNCE) {
-                        Ok(m) => carried = Some(m),
-                        Err(_) => {
+                    // A newer search cancels it; other messages wait their turn.
+                    match typing_pauses(&jobs, &mut carried) {
+                        false => {}
+                        true => {
                             let usage = crate::usage::for_query(&job.query);
                             let req = Request::ContentSearch(SearchRequest {
                                 query: job.query.clone(),
@@ -269,9 +333,9 @@ fn worker(jobs: Receiver<Msg>, out: Sender<Update>, wake: impl Fn()) {
                             }
                             // then by meaning, if typing still pauses
                             if job.meaning {
-                                match jobs.recv_timeout(CONTENT_DEBOUNCE) {
-                                    Ok(m) => carried = Some(m),
-                                    Err(_) => {
+                                match typing_pauses(&jobs, &mut carried) {
+                                    false => {}
+                                    true => {
                                         let req = Request::MeaningSearch(SearchRequest {
                                             query: job.query,
                                             limit: 20,
@@ -317,6 +381,9 @@ fn worker(jobs: Receiver<Msg>, out: Sender<Update>, wake: impl Fn()) {
             // The service restarted or stopped: reconnect on the next job.
             client = None;
             let _ = out.send(Update::Offline("connection to the service was lost".into()));
+            keep_settings(&mut carried);
+        } else {
+            retries = 0;
         }
         wake();
     }

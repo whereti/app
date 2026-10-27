@@ -365,6 +365,8 @@ impl WheretiApp {
     }
 
     fn show(&mut self, ctx: &egui::Context) {
+        // the clocks may have moved (summer time, travel) while it sat in the tray
+        self.tz = shell::tz_offset();
         if self.hide_at_start {
             self.hide_at_start = false;
             if let Some(hwnd) = self.hwnd {
@@ -469,6 +471,7 @@ impl WheretiApp {
     }
 
     fn apply_updates(&mut self) {
+        let mut rerun = false;
         for u in self.searcher.updates().collect::<Vec<_>>() {
             match u {
                 Update::Results { generation, reply, round_trip } => {
@@ -543,6 +546,10 @@ impl WheretiApp {
                         let n = extra.len();
                         self.rows.splice(at..at, extra);
                         self.network_start = Some(at);
+                        // the selection stays on the same file
+                        if self.selected >= at && self.selected + n < self.rows.len() {
+                            self.selected += n;
+                        }
                         for s in [&mut self.content_start, &mut self.meaning_start].into_iter().flatten() {
                             *s += n;
                         }
@@ -590,10 +597,18 @@ impl WheretiApp {
                         if let Some(m) = self.meaning_start.as_mut() {
                             *m += n;
                         }
+                        // the selection stays on the same file (Enter or Delete
+                        // must not land on another one)
+                        if self.selected >= at && self.selected + n < self.rows.len() {
+                            self.selected += n;
+                        }
                     }
                 }
                 Update::Status(s) => {
-                    self.offline = None;
+                    // back after being away: what was typed meanwhile was lost
+                    if self.offline.take().is_some() {
+                        rerun = true;
+                    }
                     self.eta.sample(&s.content);
                     let eta = self.eta.left(&s.content);
                     let progress = indexing_fraction(&s).map(|f| ((f * 20.0).floor() as u8).min(19) * 5);
@@ -618,6 +633,9 @@ impl WheretiApp {
                     self.file_info.0 = None;
                 }
             }
+        }
+        if rerun {
+            self.run_search();
         }
     }
 
@@ -776,6 +794,8 @@ impl WheretiApp {
                     self.recall_older(ctx);
                 }
             }
+            // the sections are last frame's: the results may have shrunk since
+            self.selected = self.selected.min(last);
         } else {
             if down {
                 self.selected = (self.selected + step).min(last);
@@ -1275,6 +1295,7 @@ impl WheretiApp {
                 if support_link(ui, p, &text, color, heart, beat).clicked() {
                     self.settings.section = crate::settings::Section::Support;
                     self.page = Page::Settings;
+                    self.searcher.ask_config();
                 }
             });
         });
@@ -1945,7 +1966,9 @@ impl WheretiApp {
 
     /// "GĂSIT ÎN CONȚINUT · 12" (+ indexing progress while it runs).
     fn content_section_label(&self) -> String {
-        let shown = self.content_start.map_or(0, |s| self.rows.len() - s) as u64;
+        // the content rows only, not those close in meaning after them
+        let end = self.meaning_start.unwrap_or(self.rows.len());
+        let shown = self.content_start.map_or(0, |s| end.saturating_sub(s)) as u64;
         let mut label = trf!("FOUND IN CONTENTS · {count}", count = shell::count(shown));
         if let Some(c) = self.status.as_ref().map(|s| &s.content) {
             if content_active(c) {
@@ -2019,6 +2042,7 @@ impl WheretiApp {
                 if r.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                     self.settings.section = crate::settings::Section::About;
                     self.page = Page::Settings;
+                    self.searcher.ask_config();
                 }
             }
         }
@@ -2042,7 +2066,10 @@ impl eframe::App for WheretiApp {
         }
         if Requests::take(&self.requests.toggle) {
             let from = self.requests.from.swap(0, std::sync::atomic::Ordering::SeqCst);
-            if self.visible {
+            // open but behind another window (or minimized): bring it to the
+            // front instead of hiding it
+            let in_front = self.hwnd.is_none_or(|h| h.0 as isize == from);
+            if self.visible && in_front {
                 self.hide(ctx);
             } else {
                 self.show(ctx);

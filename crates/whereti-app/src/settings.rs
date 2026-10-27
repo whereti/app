@@ -623,7 +623,12 @@ fn search(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
                 }
             });
         }
-        if changed {
+        if changed && app.settings.config.is_none() {
+            // the list was never read from the service: sending it would
+            // replace every exclusion there with this one change
+            app.settings.exclusions.clear();
+            app.searcher.ask_config();
+        } else if changed {
             // applied at once: the service rebuilds its index in a few seconds
             app.searcher.set_exclusions(app.settings.exclusions.clone());
         }
