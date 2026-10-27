@@ -24,7 +24,7 @@ pub mod kinds;
 mod fold;
 mod glob;
 
-pub use date::{civil_from_day, day_from_civil, DateCtx};
+pub use date::{civil_from_day, day_from_civil, set_tz_rules, DateCtx, Transition, TzRules};
 pub use fold::{fold, fold_into};
 pub use glob::{glob_match, longest_literal};
 
@@ -717,6 +717,10 @@ mod tests {
     fn dates_parse_through_the_query() {
         assert!(matches!(one("dm:today"), Term::Modified { .. }));
         assert_eq!(one("dm:nicicând"), Term::Text("dm:nicicand".into()));
+        assert!(matches!(one("dm:2024.."), Term::Modified { max: u32::MAX, .. }));
+        assert!(matches!(one("dm:..2024"), Term::Modified { min: 0, .. }));
+        assert_eq!(one("taken:9999"), Term::Text("taken:9999".into()));
+        assert_eq!(one("dm:2024-02-31"), Term::Text("dm:2024-02-31".into()));
     }
 
     #[test]
