@@ -449,3 +449,18 @@ fn a_change_in_a_folder_the_rules_leave_out_needs_no_rescan() {
     let s = idx.apply(0, &[404], &HashSet::new(), &mut m).unwrap();
     assert!(s.needs_rescan);
 }
+
+#[test]
+fn a_folder_renamed_into_a_left_out_name_leaves_the_index() {
+    let mut m = Model::new(6);
+    m.recs.insert(410, Rec { is_dir: true, size: 0, modified: 0, attrs: 0, links: vec![(DOCS, "keep".into())] });
+    m.recs.insert(411, Rec { is_dir: false, size: 1, modified: 0, attrs: 0, links: vec![(410, "inside.txt".into())] });
+    let mut e = exclusions();
+    e.paths.push(r"**\*.lrdata".into());
+    let mut idx = build(vec![VolumeScan { letter: 'C', serial: 1, journal_id: 1, next_usn: 0, scan: m.scan() }], &e).0;
+    assert_eq!(hits(&idx, "inside").len(), 1);
+    m.recs.get_mut(&410).unwrap().links[0].1 = "Pics.lrdata".into();
+    let s = idx.apply(0, &[410], &HashSet::new(), &mut m).unwrap();
+    assert!(!s.needs_rescan);
+    assert!(hits(&idx, "inside").is_empty(), "as a fresh build would");
+}

@@ -242,6 +242,14 @@ fn merge_extensions(out: &mut MftScan, extensions: Vec<RecordInfo>, nameless: &[
         })
         .collect();
     let mut named_orphans: HashSet<u64> = HashSet::new();
+    // a fragmented file's data size can sit in an extension record that
+    // holds no name: every link of its base gets it below
+    let mut ext_sizes: HashMap<u64, u64> = HashMap::new();
+    for ext in &extensions {
+        if let Some(size) = ext.data_size.filter(|&s| s > 0) {
+            ext_sizes.entry(ext.base).or_insert(size);
+        }
+    }
     for ext in extensions {
         let mut template = match first.get(&ext.base) {
             Some(&bi) => out.entries[bi],
@@ -270,6 +278,13 @@ fn merge_extensions(out: &mut MftScan, extensions: Vec<RecordInfo>, nameless: &[
     }
     if !has_long.is_empty() {
         out.entries.retain(|e| !(e.dos_name && has_long.contains(&e.record)));
+    }
+    if !ext_sizes.is_empty() {
+        for e in out.entries.iter_mut().filter(|e| e.size == 0 && !e.is_dir) {
+            if let Some(&size) = ext_sizes.get(&e.record) {
+                e.size = size;
+            }
+        }
     }
     (orphans.len() - named_orphans.len()) as u64
 }

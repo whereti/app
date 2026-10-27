@@ -189,7 +189,12 @@ impl NameIndex {
                     // a folder not in the index that the build leaves out
                     // (a `target` beside Cargo.toml, a browser cache): it
                     // stays out; it is not a folder come in from elsewhere
-                    .filter(|&pe| !(st.is_dir && existing.is_empty() && self.smart_excludes(pe, name, smart)));
+                    // (also one moved or renamed into such a place; one that
+                    // stays where it is is left as it is until compaction)
+                    .filter(|&pe| {
+                        let stays = existing.iter().any(|&e| self.parent(e) == Some(pe) && self.name(e) == name);
+                        !(st.is_dir && !stays && self.smart_excludes(pe, name, smart))
+                    });
                 (pe, name.as_str())
             })
             .collect();
@@ -392,6 +397,8 @@ impl NameIndex {
         if was_dir != st.is_dir {
             pass.structural = true;
             pass.dirs_reordered = true;
+            // a reused record: a folder has no extension, a file its own
+            self.ext[i] = if st.is_dir { 0 } else { ext_id(ext_ids, &mut self.exts, name) };
         }
         self.size[i] = if st.is_dir { 0 } else { st.size };
         self.mtime[i] = filetime_to_minutes(st.modified);

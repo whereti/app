@@ -256,7 +256,10 @@ fn read_vec<T: Pod + Zeroable>(r: &mut impl Read, n: usize, elem: usize, sum: u6
     if n > (1 << 34) / elem.max(1) {
         return Err(bad("section too large"));
     }
-    let mut v = vec![T::zeroed(); n];
+    // a damaged count asks for too much: an error (a rescan), not an abort
+    let mut v: Vec<T> = Vec::new();
+    v.try_reserve_exact(n).map_err(|_| bad("section too large for memory"))?;
+    v.resize(n, T::zeroed());
     r.read_exact(bytemuck::cast_slice_mut(&mut v))?;
     if xxh3_64(bytemuck::cast_slice(&v)) != sum {
         return Err(bad("checksum mismatch (file damaged)"));
