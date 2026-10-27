@@ -394,3 +394,32 @@ mod tests {
         assert_eq!(winter.offset_at(at(2024, 7, 15, 0, 0, 180) as i64), 120); // no rules set
     }
 }
+
+/// The local time zone's daylight saving rule, as Windows has it (None
+/// when it has none, or gives it only for one year).
+#[cfg(windows)]
+pub fn local_tz_rules() -> Option<TzRules> {
+    use windows_sys::Win32::Foundation::SYSTEMTIME;
+    use windows_sys::Win32::System::Time::{GetTimeZoneInformation, TIME_ZONE_INFORMATION};
+    // SAFETY: zeroed POD out-parameter.
+    let mut tz: TIME_ZONE_INFORMATION = unsafe { std::mem::zeroed() };
+    if unsafe { GetTimeZoneInformation(&mut tz) } == u32::MAX {
+        return None;
+    }
+    // wYear != 0 is a one-off date, not a yearly rule
+    if tz.DaylightDate.wYear != 0 || tz.StandardDate.wYear != 0 {
+        return None;
+    }
+    let change = |t: &SYSTEMTIME| Transition {
+        month: t.wMonth as u8,
+        week: t.wDay as u8,
+        weekday: t.wDayOfWeek as u8,
+        minute: t.wHour * 60 + t.wMinute,
+    };
+    Some(TzRules {
+        standard: -(tz.Bias + tz.StandardBias),
+        daylight: -(tz.Bias + tz.DaylightBias),
+        to_daylight: change(&tz.DaylightDate),
+        to_standard: change(&tz.StandardDate),
+    })
+}

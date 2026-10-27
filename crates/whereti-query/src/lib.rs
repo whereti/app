@@ -25,6 +25,8 @@ mod fold;
 mod glob;
 
 pub use date::{civil_from_day, day_from_civil, set_tz_rules, DateCtx, Transition, TzRules};
+#[cfg(windows)]
+pub use date::local_tz_rules;
 pub use fold::{fold, fold_into};
 pub use glob::{glob_match, longest_literal};
 

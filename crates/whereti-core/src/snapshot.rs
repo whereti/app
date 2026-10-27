@@ -20,7 +20,8 @@ use xxhash_rust::xxh3::xxh3_64;
 use crate::index::{NameIndex, VolumeInfo, NO_PARENT};
 
 const MAGIC: &[u8; 8] = b"WHERETI\0";
-const VERSION: u32 = 4;
+// 5: names folded with ligatures, long s and final sigma (whereti-query)
+const VERSION: u32 = 5;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u32)]

@@ -3125,6 +3125,8 @@ fn middle_elide(ui: &egui::Ui, path: &str, font: FontId, width: f32) -> String {
 
 /// Today and the time zone, for parsing `dm:`/`taken:` in the app.
 pub(crate) fn date_ctx() -> whereti_query::DateCtx {
+    // the summer time rule, read again each time: the zone may have changed
+    whereti_query::set_tz_rules(whereti_query::local_tz_rules());
     whereti_query::DateCtx { now: now_minutes().clamp(0, u32::MAX as i64) as u32, tz_offset: shell::tz_offset() }
 }
 

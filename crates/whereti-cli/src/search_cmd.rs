@@ -291,35 +291,6 @@ pub fn status(args: StatusArgs) -> Result<(), String> {
     Ok(())
 }
 
-/// The local time zone's daylight saving rule, as Windows has it (None
-/// when it has none, or gives it only for one year).
-pub fn local_tz_rules() -> Option<whereti_query::TzRules> {
-    use whereti_query::{Transition, TzRules};
-    use windows_sys::Win32::Foundation::SYSTEMTIME;
-    use windows_sys::Win32::System::Time::{GetTimeZoneInformation, TIME_ZONE_INFORMATION};
-    // SAFETY: zeroed POD out-parameter.
-    let mut tz: TIME_ZONE_INFORMATION = unsafe { std::mem::zeroed() };
-    if unsafe { GetTimeZoneInformation(&mut tz) } == u32::MAX {
-        return None;
-    }
-    // wYear != 0 is a one-off date, not a yearly rule
-    if tz.DaylightDate.wYear != 0 || tz.StandardDate.wYear != 0 {
-        return None;
-    }
-    let change = |t: &SYSTEMTIME| Transition {
-        month: t.wMonth as u8,
-        week: t.wDay as u8,
-        weekday: t.wDayOfWeek as u8,
-        minute: t.wHour * 60 + t.wMinute,
-    };
-    Some(TzRules {
-        standard: -(tz.Bias + tz.StandardBias),
-        daylight: -(tz.Bias + tz.DaylightBias),
-        to_daylight: change(&tz.DaylightDate),
-        to_standard: change(&tz.StandardDate),
-    })
-}
-
 /// The words as one search box text: an argument with a space came quoted
 /// from the shell, so it is quoted again (`path:"C:\Program Files"`).
 fn query_text(args: &[String]) -> String {
