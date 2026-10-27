@@ -27,6 +27,14 @@ fn a_file_is_read_only_at_its_real_path() {
     if short != target.join("secret.txt") {
         assert!(open_real(&short).is_ok(), "short path {} refused", short.display());
     }
+    // with a \\?\ prefix: the same path
+    let prefixed = std::path::PathBuf::from(format!(r"\\?\{}", target.join("secret.txt").display()));
+    assert!(open_real(&prefixed).is_ok(), "{} refused", prefixed.display());
+    // through a SUBST drive letter: the same file, at its real path
+    if let Some(drive) = Subst::new(&target) {
+        let through = std::path::PathBuf::from(format!(r"{}\secret.txt", drive.0));
+        assert!(open_real(&through).is_ok(), "{} refused", through.display());
+    }
     // through the junction: refused
     let through = link.join("secret.txt");
     assert!(std::fs::read(&through).is_ok(), "the junction itself works");
@@ -36,6 +44,23 @@ fn a_file_is_read_only_at_its_real_path() {
 
     let _ = std::fs::remove_dir(&link);
     let _ = std::fs::remove_dir_all(&base);
+}
+
+/// A SUBST drive letter for a folder, for this test only (removed on drop).
+struct Subst(String);
+
+impl Subst {
+    fn new(dir: &std::path::Path) -> Option<Subst> {
+        let free = ('M'..='Y').rev().map(|c| format!("{c}:")).find(|d| !std::path::Path::new(&format!(r"{d}\")).exists())?;
+        let made = std::process::Command::new("subst").arg(&free).arg(dir).status().ok()?;
+        made.success().then_some(Subst(free))
+    }
+}
+
+impl Drop for Subst {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("subst").arg(&self.0).arg("/d").status();
+    }
 }
 
 /// The 8.3 form of a path, if the volume keeps short names.

@@ -7,14 +7,18 @@
 //! - runs at below-normal priority with no window;
 //! - is killed after a timeout.
 //!
-//! Wire format: bytes on stdin, `--ext <ext> --max <chars>` on the command
-//! line. Exit code 0 → stdout is `T` or `F` (truncated) followed by UTF-8
-//! text. Other codes map to `ExtractError`; stderr holds the detail.
+//! - starts with a restricted token (see `spawn`), so it cannot read what
+//!   only its caller (SYSTEM, or one user) may, then gives up the rest of
+//!   its rights itself (`lockdown`) before reading a byte.
+//!
+//! Wire format: bytes on stdin, `--ext <ext> --max <chars> --budget <ms>`
+//! on the command line. Exit code 0 → stdout is `T` or `F` (truncated)
+//! followed by UTF-8 text. Other codes map to `ExtractError`; stderr holds
+//! the detail.
 
 use std::io::{Read, Write};
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use crate::{extract, ExtractError, Extracted};
@@ -36,7 +40,7 @@ fn lockdown() -> Result<(), String> {
     use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, LUID, ERROR_NOT_ALL_ASSIGNED, HANDLE};
     use windows_sys::Win32::Security::{
         AdjustTokenPrivileges, AllocateAndInitializeSid, FreeSid, GetTokenInformation, LookupPrivilegeValueW,
-        SetTokenInformation, TokenIntegrityLevel, TokenPrivileges, LUID_AND_ATTRIBUTES, SE_PRIVILEGE_REMOVED,
+        SetTokenInformation, TokenIntegrityLevel, TokenPrivileges, LUID_AND_ATTRIBUTES, SE_PRIVILEGE_ENABLED, SE_PRIVILEGE_REMOVED,
         SID_AND_ATTRIBUTES, SID_IDENTIFIER_AUTHORITY, TOKEN_ADJUST_DEFAULT, TOKEN_ADJUST_PRIVILEGES,
         TOKEN_MANDATORY_LABEL, TOKEN_PRIVILEGES, TOKEN_QUERY,
     };
@@ -59,6 +63,8 @@ fn lockdown() -> Result<(), String> {
     let _close = Close(token);
 
     // 1. every privilege removed for good, except passing through folders
+    // (kept enabled, as Windows has it: without it every folder on a path
+    // would need its own right to pass through)
     let mut needed = 0u32;
     // SAFETY: size query, then a buffer of that size.
     unsafe { GetTokenInformation(token, TokenPrivileges, std::ptr::null_mut(), 0, &mut needed) };
@@ -79,7 +85,7 @@ fn lockdown() -> Result<(), String> {
     let mut removed = 0u32;
     for e in entries.iter_mut() {
         if e.Luid.LowPart == keep.LowPart && e.Luid.HighPart == keep.HighPart {
-            e.Attributes = 0; // left as it is
+            e.Attributes = SE_PRIVILEGE_ENABLED;
         } else {
             e.Attributes = SE_PRIVILEGE_REMOVED;
             removed += 1;
@@ -130,11 +136,34 @@ pub fn serve_stdio() -> i32 {
             _ => 1,
         };
     }
+    // for the tests: with the restricted token, a file only its user may
+    // read must be refused too
+    if let Some(probe) = arg("--probe-read") {
+        return match std::fs::read(&probe) {
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => 0,
+            _ => 1,
+        };
+    }
+    // what Windows' OCR, picture and PDF code can do from here
+    if args.iter().any(|a| a == "--probe-sandbox") {
+        let _ = std::io::stdout().lock().write_all(crate::ocr::probe().as_bytes());
+        return 0;
+    }
+    // the caller's time: slow work stops in time to hand back what it has
+    if let Some(ms) = arg("--budget").and_then(|m| m.parse::<u64>().ok()) {
+        crate::set_deadline(Some(std::time::Instant::now() + Duration::from_millis(ms)));
+    }
+    if let Some(langs) = arg("--ocr-lang") {
+        crate::set_ocr_languages(&langs.split(',').map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>());
+    }
+    let given = args.iter().any(|a| a == "--given");
     if let Some(model) = arg("--tags") {
-        return serve_tags(Path::new(&model));
+        return serve_tags(Model::new(&model, given));
     }
     if let (Some(model), Some(tokenizer)) = (arg("--embed"), arg("--tokenizer")) {
-        return serve_embed(Path::new(&model), Path::new(&tokenizer));
+        let model = Model::new(&model, given);
+        let tokenizer = Model::new(&tokenizer, given);
+        return serve_embed(model, tokenizer);
     }
     if args.iter().any(|a| a == "--mailbox") {
         let max = arg("--max").and_then(|m| m.parse().ok()).unwrap_or(1_000_000);
@@ -172,13 +201,53 @@ pub fn serve_stdio() -> i32 {
     }
 }
 
+/// A model file for the worker: by its path, or (`--given`) as a handle
+/// the caller opened and put into this process, its value first on stdin
+/// (the restricted worker cannot open ProgramData\whereti itself).
+enum Model {
+    Path(PathBuf),
+    Handle(usize),
+}
+
+impl Model {
+    fn new(path: &str, given: bool) -> Model {
+        if !given {
+            return Model::Path(PathBuf::from(path));
+        }
+        let mut h = [0u8; 8];
+        match std::io::stdin().lock().read_exact(&mut h) {
+            Ok(()) => Model::Handle(u64::from_le_bytes(h) as usize),
+            Err(_) => Model::Handle(0),
+        }
+    }
+
+    fn bytes(&self) -> Result<Vec<u8>, String> {
+        use std::io::Seek;
+        use std::os::windows::io::FromRawHandle;
+        match self {
+            Model::Path(p) => std::fs::read(p).map_err(|e| format!("cannot read {}: {e}", p.display())),
+            Model::Handle(0) => Err("no model was given".into()),
+            Model::Handle(h) => {
+                // SAFETY: the caller put a file handle opened for reading into
+                // this process; it stays open (ManuallyDrop) for another read.
+                let mut file = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_handle(*h as std::os::windows::io::RawHandle) });
+                let mut buf = Vec::new();
+                file.seek(std::io::SeekFrom::Start(0)).and_then(|_| file.read_to_end(&mut buf)).map_err(|e| format!("cannot read the model: {e}"))?;
+                Ok(buf)
+            }
+        }
+    }
+}
+
 /// Worker side of `TagWorker`: photos in, tags out, until a zero length.
 /// Request: u32 little-endian length, then the photo's bytes. Answer: one
 /// line, `ok<TAB>label:share,label:share` or `err<TAB>message`. The model is
 /// loaded on the first photo, once the process is inside its job.
-fn serve_tags(model: &Path) -> i32 {
+fn serve_tags(model: Model) -> i32 {
     let dll = std::env::current_exe().map(|e| e.with_file_name("onnxruntime.dll")).unwrap_or_default();
     let mut tagger: Option<crate::tags::Tagger> = None;
+    // a model that cannot load is not loaded again for every photo
+    let mut failed: Option<String> = None;
     let (mut input, mut out) = (std::io::stdin().lock(), std::io::stdout().lock());
     loop {
         let mut len = [0u8; 4];
@@ -194,8 +263,17 @@ fn serve_tags(model: &Path) -> i32 {
             return EXIT_DAMAGED;
         }
         let answer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if let Some(e) = &failed {
+                return Err(e.clone());
+            }
             if tagger.is_none() {
-                tagger = Some(crate::tags::Tagger::new(&dll, model)?);
+                match model.bytes().and_then(|m| crate::tags::Tagger::from_bytes(&dll, &m)) {
+                    Ok(t) => tagger = Some(t),
+                    Err(e) => {
+                        failed = Some(e.clone());
+                        return Err(e);
+                    }
+                }
             }
             tagger.as_mut().map_or(Err("no model".to_string()), |t| t.tags(&bytes))
         }))
@@ -241,7 +319,7 @@ fn serve_mailbox(handle: usize, max: usize) -> i32 {
 /// Worker side of `EmbedWorker`: texts in, vectors out, until a zero
 /// length. Request: u32 little-endian length, then UTF-8 text. Answer: one
 /// line, `ok<TAB>` and the 384 signed bytes in hex, or `err<TAB>message`.
-fn serve_embed(model: &Path, tokenizer: &Path) -> i32 {
+fn serve_embed(model: Model, tokenizer: Model) -> i32 {
     let dll = std::env::current_exe().map(|e| e.with_file_name("onnxruntime.dll")).unwrap_or_default();
     let mut embedder: Option<crate::meaning::Embedder> = None;
     // a model that cannot load is not loaded again for every text
@@ -266,7 +344,11 @@ fn serve_embed(model: &Path, tokenizer: &Path) -> i32 {
                 return Err(e.clone());
             }
             if embedder.is_none() {
-                match crate::meaning::Embedder::new(&dll, model, tokenizer) {
+                let loaded = model
+                    .bytes()
+                    .and_then(|m| Ok((m, tokenizer.bytes()?)))
+                    .and_then(|(m, t)| crate::meaning::Embedder::from_bytes(&dll, &m, &t));
+                match loaded {
                     Ok(e) => embedder = Some(e),
                     Err(e) => {
                         failed = Some(e.clone());
@@ -315,6 +397,9 @@ pub struct Sandbox {
     pub timeout: Duration,
     pub memory_limit: usize,
     pub max_file: u64,
+    /// OCR languages to try first (BCP-47, "ro-RO"), e.g. those of the user
+    /// who asked; else the system's, else any Windows has.
+    pub ocr_languages: Vec<String>,
 }
 
 impl Sandbox {
@@ -325,7 +410,20 @@ impl Sandbox {
     }
 
     pub fn new(exe: PathBuf) -> Sandbox {
-        Sandbox { exe, timeout: Duration::from_secs(10), memory_limit: 512 << 20, max_file: 100 << 20 }
+        Sandbox { exe, timeout: Duration::from_secs(10), memory_limit: 512 << 20, max_file: 100 << 20, ocr_languages: Vec::new() }
+    }
+
+    /// The worker runs with the restricted token (see `spawn`). `false`
+    /// only where Windows' OCR, picture or PDF code failed with it and
+    /// works without it: then the worker has its own lockdown alone.
+    pub fn restricted(&self) -> bool {
+        restricted_works(&self.exe)
+    }
+
+    /// One line for the log: whether the worker has the restricted token,
+    /// and what Windows' OCR, picture and PDF code can do in it.
+    pub fn sandbox_report(&self) -> String {
+        sandbox_check(&self.exe).1
     }
 
     /// Reads `path` (sharing it with writers, so open files work) and
@@ -350,14 +448,18 @@ impl Sandbox {
     fn extract_mailbox(&self, path: &Path, max_chars: usize) -> Result<Extracted, SandboxError> {
         use std::os::windows::io::AsRawHandle;
         let file = open_real(path).map_err(SandboxError::Io)?;
-        let worker = Sandbox { exe: self.exe.clone(), timeout: Duration::from_secs(60), memory_limit: self.memory_limit, max_file: self.max_file };
+        let worker = Sandbox { exe: self.exe.clone(), timeout: Duration::from_secs(60), memory_limit: self.memory_limit, max_file: self.max_file, ocr_languages: Vec::new() };
         let result = worker.run_with(&["--mailbox".to_string(), "--max".to_string(), max_chars.to_string()], Vec::new(), Some(file.as_raw_handle()));
         drop(file);
         result
     }
 
     pub fn extract_bytes(&self, ext: &str, bytes: Vec<u8>, max_chars: usize) -> Result<Extracted, SandboxError> {
-        self.run(&["--ext".to_string(), ext.to_string(), "--max".to_string(), max_chars.to_string()], bytes)
+        let mut args = vec!["--ext".to_string(), ext.to_string(), "--max".to_string(), max_chars.to_string()];
+        if !self.ocr_languages.is_empty() {
+            args.extend(["--ocr-lang".to_string(), self.ocr_languages.join(",")]);
+        }
+        self.run(&args, bytes)
     }
 
     /// Runs the worker with `args`, `bytes` on its stdin, inside the job.
@@ -365,76 +467,72 @@ impl Sandbox {
         self.run_with(args, bytes, None)
     }
 
+    /// For the tests: the worker's exit code with `args` (a `--probe-...`).
+    #[doc(hidden)]
+    pub fn probe_exit(&self, args: &[&str]) -> Option<i32> {
+        let job = Job::new(self.memory_limit).ok()?;
+        let args: Vec<&std::ffi::OsStr> = args.iter().map(std::ffi::OsStr::new).collect();
+        let (mut child, _) = crate::spawn::spawn(&self.exe, &args, self.restricted(), false, &job, &[]).ok()?;
+        drop(child.stdin.take());
+        if !child.wait_for(self.timeout) {
+            child.kill();
+            return None;
+        }
+        child.exit_code()
+    }
+
     /// `run`; `give`: a handle duplicated into the worker (and only into it)
     /// once it is in its job, its value sent first on stdin.
     fn run_with(&self, args: &[String], bytes: Vec<u8>, give: Option<std::os::windows::io::RawHandle>) -> Result<Extracted, SandboxError> {
-        use std::os::windows::io::AsRawHandle;
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
+        // The worker stops its slow work (OCR, the documents in an archive)
+        // a quarter before the timeout, so what it read gets back in time.
+        let budget = (self.timeout.as_millis() as u64 * 3 / 4).to_string();
+        let mut args: Vec<&std::ffi::OsStr> = args.iter().map(std::ffi::OsStr::new).collect();
+        args.extend([std::ffi::OsStr::new("--budget"), std::ffi::OsStr::new(&budget)]);
 
         let job = Job::new(self.memory_limit).map_err(|e| SandboxError::Failed(format!("job object: {e}")))?;
-        let mut child = Command::new(&self.exe)
-            .args(args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .creation_flags(CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS)
-            .spawn()
+        let give: Vec<_> = give.into_iter().collect();
+        let (mut child, given) = crate::spawn::spawn(&self.exe, &args, self.restricted(), true, &job, &give)
             .map_err(|e| SandboxError::Failed(format!("cannot start the extractor: {e}")))?;
-        // The worker blocks on stdin until we write, so it does no work
-        // before it is inside the job.
-        if let Err(e) = job.assign(child.as_raw_handle()) {
-            let _ = child.kill();
-            return Err(SandboxError::Failed(format!("job object: {e}")));
-        }
+        // the handle's value in the worker comes first
         let mut bytes = bytes;
-        if let Some(h) = give {
-            use windows_sys::Win32::Foundation::{DuplicateHandle, DUPLICATE_SAME_ACCESS};
-            use windows_sys::Win32::System::Threading::GetCurrentProcess;
-            let mut target = std::ptr::null_mut();
-            // SAFETY: valid handles: ours, the child process we just started
-            let ok = unsafe {
-                DuplicateHandle(GetCurrentProcess(), h as _, child.as_raw_handle() as _, &mut target, 0, 0, DUPLICATE_SAME_ACCESS)
-            };
-            if ok == 0 {
-                let _ = child.kill();
-                return Err(SandboxError::Failed(format!("cannot give the file to the extractor: {}", std::io::Error::last_os_error())));
-            }
-            let mut first = (target as usize as u64).to_le_bytes().to_vec();
+        if let Some(h) = given.first() {
+            let mut first = h.to_le_bytes().to_vec();
             first.extend_from_slice(&bytes);
             bytes = first;
         }
 
-        let mut stdin = child.stdin.take().unwrap();
+        let mut stdin = child.stdin.take().expect("piped");
         let writer = std::thread::spawn(move || {
             let _ = stdin.write_all(&bytes);
         });
-        let mut stdout = child.stdout.take().unwrap();
+        let mut stdout = child.stdout.take().expect("piped");
         let reader = std::thread::spawn(move || {
             let mut out = Vec::new();
             let _ = stdout.read_to_end(&mut out);
             out
         });
-        let mut stderr = child.stderr.take().unwrap();
+        let mut stderr = child.stderr.take().expect("piped");
         let err_reader = std::thread::spawn(move || {
             let mut out = String::new();
             let _ = stderr.read_to_string(&mut out);
             out
         });
 
-        let finished = wait(child.as_raw_handle(), self.timeout);
+        let finished = child.wait_for(self.timeout);
         if !finished {
-            let _ = child.kill();
+            child.kill();
         }
-        let status = child.wait().map_err(|e| SandboxError::Failed(e.to_string()))?;
+        let code = child.exit_code();
+        // its pipes close with it (the job ends anything it could have left)
+        drop(job);
         let _ = writer.join();
         let out = reader.join().unwrap_or_default();
         let err = err_reader.join().unwrap_or_default();
         if !finished {
             return Err(SandboxError::Failed(format!("took longer than {:.1} s", self.timeout.as_secs_f32())));
         }
-        match status.code() {
+        match code {
             Some(0) if !out.is_empty() => Ok(Extracted {
                 truncated: out[0] == b'T',
                 text: String::from_utf8_lossy(&out[1..]).into_owned(),
@@ -451,7 +549,69 @@ impl Sandbox {
     }
 }
 
-/// Broker side of the photo tags: one worker process that keeps the model
+/// For the tests: restricted workers get a window station and desktop of
+/// their own, as in the service, even when run as a user.
+#[doc(hidden)]
+pub fn use_own_desktop() {
+    crate::spawn::OWN_DESKTOP.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the worker `exe` does its work with the restricted token, found
+/// once per worker: it is started with it and without it, and asked what
+/// Windows' OCR, picture and PDF code can do (`--probe-sandbox`). Without
+/// the restricted token only if it can do less with it.
+fn restricted_works(exe: &Path) -> bool {
+    sandbox_check(exe).0
+}
+
+/// `restricted_works`, and what was found, for the log.
+fn sandbox_check(exe: &Path) -> (bool, String) {
+    static KNOWN: std::sync::Mutex<Vec<(PathBuf, bool, String)>> = std::sync::Mutex::new(Vec::new());
+    let mut known = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, ok, report)) = known.iter().find(|(p, ..)| p == exe) {
+        return (*ok, report.clone());
+    }
+    // what the worker answers, or why it did not
+    let probe = |restricted: bool| -> Result<String, String> {
+        let job = Job::new(512 << 20).map_err(|e| format!("job object: {e}"))?;
+        let (mut child, _) =
+            crate::spawn::spawn(exe, &[std::ffi::OsStr::new("--probe-sandbox")], restricted, false, &job, &[]).map_err(|e| e.to_string())?;
+        drop(child.stdin.take());
+        let mut stdout = child.stdout.take().ok_or("no stdout")?;
+        let reader = std::thread::spawn(move || {
+            let mut out = String::new();
+            let _ = stdout.read_to_string(&mut out);
+            out
+        });
+        let finished = child.wait_for(Duration::from_secs(20));
+        if !finished {
+            child.kill();
+        }
+        let code = child.exit_code();
+        drop(job);
+        let out = reader.join().unwrap_or_default();
+        match (finished, code) {
+            (true, Some(0)) => Ok(out),
+            (false, _) => Err("no answer in 20 s".into()),
+            (_, code) => Err(format!("stopped with code {:#x}", code.unwrap_or(-1))),
+        }
+    };
+    let can = |answer: &str| -> Vec<String> { answer.split_whitespace().filter(|w| w.ends_with("=1")).map(String::from).collect() };
+    let (ok, report) = match probe(true) {
+        Err(e) => (false, format!("restricted token: no ({e})")),
+        Ok(with) if can(&with).len() >= 3 => (true, format!("restricted token: yes ({with})")),
+        Ok(with) => match probe(false) {
+            Ok(without) if !can(&without).iter().all(|w| can(&with).contains(w)) => {
+                (false, format!("restricted token: no ({with}; without it: {without})"))
+            }
+            _ => (true, format!("restricted token: yes ({with})")),
+        },
+    };
+    known.push((exe.to_path_buf(), ok, report.clone()));
+    (ok, report)
+}
+
+// Broker side of the photo tags: one worker process that keeps the model
 /// loaded and takes photos one by one (loading 84 MB per photo would cost
 /// more than tagging it). Same limits as `Sandbox`: a Job Object with the
 /// memory cap, below-normal priority, no window; a photo that takes longer
@@ -460,6 +620,9 @@ pub struct TagWorker {
     exe: PathBuf,
     /// The worker's mode: `--tags <model>`, `--embed <model> --tokenizer <file>`.
     args: Vec<std::ffi::OsString>,
+    /// The model files, opened here and handed to the worker in that order
+    /// (`--given`): with its restricted token it cannot open them itself.
+    files: Vec<PathBuf>,
     memory_limit: usize,
     pub timeout: Duration,
     running: Option<RunningTagger>,
@@ -475,14 +638,18 @@ impl EmbedWorker {
     pub fn beside_current_exe(model: &Path, tokenizer: &Path) -> Option<EmbedWorker> {
         let exe = std::env::current_exe().ok()?.with_file_name("whereti-extract.exe");
         let dll = exe.with_file_name("onnxruntime.dll");
-        (exe.is_file() && dll.is_file() && model.is_file() && tokenizer.is_file()).then(|| {
-            EmbedWorker(TagWorker {
-                exe,
-                args: vec!["--embed".into(), model.into(), "--tokenizer".into(), tokenizer.into()],
-                memory_limit: 768 << 20,
-                timeout: Duration::from_secs(20),
-                running: None,
-            })
+        (exe.is_file() && dll.is_file() && model.is_file() && tokenizer.is_file()).then(|| EmbedWorker::with_exe(exe, model, tokenizer))
+    }
+
+    /// A given worker executable (tests); onnxruntime.dll must be beside it.
+    pub fn with_exe(exe: PathBuf, model: &Path, tokenizer: &Path) -> EmbedWorker {
+        EmbedWorker(TagWorker {
+            exe,
+            args: vec!["--embed".into(), model.into(), "--tokenizer".into(), tokenizer.into(), "--given".into()],
+            files: vec![model.to_path_buf(), tokenizer.to_path_buf()],
+            memory_limit: 768 << 20,
+            timeout: Duration::from_secs(20),
+            running: None,
         })
     }
 
@@ -502,8 +669,8 @@ impl EmbedWorker {
 
 struct RunningTagger {
     _job: Job,
-    child: std::process::Child,
-    stdin: std::process::ChildStdin,
+    child: crate::spawn::Child,
+    stdin: std::fs::File,
     lines: std::sync::mpsc::Receiver<String>,
 }
 
@@ -511,8 +678,8 @@ impl Drop for RunningTagger {
     fn drop(&mut self) {
         let _ = self.stdin.write_all(&0u32.to_le_bytes());
         let _ = self.stdin.flush();
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.child.kill();
+        let _ = self.child.wait_for(Duration::from_secs(5));
     }
 }
 
@@ -522,41 +689,40 @@ impl TagWorker {
     pub fn beside_current_exe(model: &Path) -> Option<TagWorker> {
         let exe = std::env::current_exe().ok()?.with_file_name("whereti-extract.exe");
         let dll = exe.with_file_name("onnxruntime.dll");
-        (exe.is_file() && dll.is_file() && model.is_file()).then(|| TagWorker {
-            exe,
-            args: vec!["--tags".into(), model.into()],
-            memory_limit: 768 << 20,
-            timeout: Duration::from_secs(20),
-            running: None,
-        })
+        (exe.is_file() && dll.is_file() && model.is_file()).then(|| TagWorker::with_exe(exe, model))
     }
 
     /// A given worker executable (tests); onnxruntime.dll must be beside it.
     pub fn with_exe(exe: PathBuf, model: &Path) -> TagWorker {
-        TagWorker { exe, args: vec!["--tags".into(), model.into()], memory_limit: 768 << 20, timeout: Duration::from_secs(20), running: None }
+        TagWorker {
+            exe,
+            args: vec!["--tags".into(), model.into(), "--given".into()],
+            files: vec![model.to_path_buf()],
+            memory_limit: 768 << 20,
+            timeout: Duration::from_secs(20),
+            running: None,
+        }
     }
 
     fn start(&self) -> Result<RunningTagger, String> {
         use std::os::windows::io::AsRawHandle;
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
         let job = Job::new(self.memory_limit).map_err(|e| format!("job object: {e}"))?;
-        let mut child = Command::new(&self.exe)
-            .args(&self.args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .creation_flags(CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS)
-            .spawn()
+        let files: Vec<std::fs::File> =
+            self.files.iter().map(|f| std::fs::File::open(f).map_err(|e| format!("cannot open {}: {e}", f.display()))).collect::<Result<_, _>>()?;
+        let handles: Vec<_> = files.iter().map(|f| f.as_raw_handle()).collect();
+        let args: Vec<&std::ffi::OsStr> = self.args.iter().map(|a| a.as_os_str()).collect();
+        let (mut child, given) = crate::spawn::spawn(&self.exe, &args, restricted_works(&self.exe), false, &job, &handles)
             .map_err(|e| format!("cannot start the extractor: {e}"))?;
-        // it waits for the first photo before loading anything
-        if let Err(e) = job.assign(child.as_raw_handle()) {
-            let _ = child.kill();
-            return Err(format!("job object: {e}"));
-        }
-        let stdin = child.stdin.take().ok_or("no stdin")?;
+        drop(files);
+        let mut stdin = child.stdin.take().ok_or("no stdin")?;
         let stdout = child.stdout.take().ok_or("no stdout")?;
+        // the model files' handles first; it waits for the first request
+        // before loading anything
+        let first: Vec<u8> = given.iter().flat_map(|h| h.to_le_bytes()).collect();
+        if let Err(e) = stdin.write_all(&first) {
+            child.kill();
+            return Err(format!("the tagger stopped: {e}"));
+        }
         let (tx, lines) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             use std::io::BufRead;
@@ -658,12 +824,58 @@ fn final_path(file: &std::fs::File) -> std::io::Result<PathBuf> {
     }
 }
 
-/// The same path, letter case and slashes aside.
 /// The same path, letter case, slashes and short 8.3 names aside (`real` is
-/// what Windows reports for an open file; `asked` may use short names).
+/// what Windows reports for an open file; `asked` may use short names, a
+/// `\\?\` prefix, or a SUBST or network drive letter).
 fn same_path(real: &Path, asked: &Path) -> bool {
     let norm = |p: &Path| p.to_string_lossy().replace('/', "\\").trim_end_matches('\\').to_lowercase();
-    norm(real) == norm(asked) || norm(real) == norm(&long_path(asked))
+    let asked = dos_target(asked);
+    norm(real) == norm(&asked) || norm(real) == norm(&long_path(&asked))
+}
+
+/// `path` as Windows names an open file: no `\\?\` prefix, and a drive
+/// letter made by SUBST or for a network share replaced by the folder or
+/// share it stands for. Drive letters are the system's (or, in the app,
+/// the user's own), which no other user can change: no race here.
+fn dos_target(path: &Path) -> PathBuf {
+    let s = path.to_string_lossy();
+    let s = match s.strip_prefix(r"\\?\UNC\") {
+        Some(rest) => format!(r"\\{rest}"),
+        None => s.strip_prefix(r"\\?\").unwrap_or(&s).to_string(),
+    };
+    let b = s.as_bytes();
+    if b.len() < 2 || b[1] != b':' || !b[0].is_ascii_alphabetic() {
+        return PathBuf::from(s);
+    }
+    let drive = s[..2].to_ascii_uppercase();
+    let Some(target) = dos_device(&drive) else { return PathBuf::from(s) };
+    let mapped = if let Some(dir) = target.strip_prefix(r"\??\") {
+        // SUBST: \??\C:\some\folder
+        Some(dir.trim_end_matches('\\').to_string())
+    } else {
+        // a network drive: \Device\LanmanRedirector\;Z:0000000000012345\server\share
+        let upper = target.to_ascii_uppercase();
+        upper.find(&format!(";{drive}")).and_then(|at| target[at + 1..].find('\\').map(|p| format!(r"\{}", &target[at + 1 + p..])))
+    };
+    match mapped {
+        Some(m) => PathBuf::from(format!("{m}{}", &s[2..])),
+        None => PathBuf::from(s),
+    }
+}
+
+/// What a DOS device name (`X:`) stands for.
+fn dos_device(name: &str) -> Option<String> {
+    use windows_sys::Win32::Storage::FileSystem::QueryDosDeviceW;
+    let wide: Vec<u16> = name.encode_utf16().chain([0]).collect();
+    let mut buf = vec![0u16; 1024];
+    // SAFETY: a NUL-terminated name and a buffer of the given length.
+    let n = unsafe { QueryDosDeviceW(wide.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) } as usize;
+    if n == 0 {
+        return None;
+    }
+    // a list of NUL-terminated names: the first is the current one
+    let first = buf[..n].split(|&c| c == 0).next()?;
+    Some(String::from_utf16_lossy(first))
 }
 
 /// `path` with its short 8.3 names spelled out (`RUNNER~1` -> `runneradmin`).
@@ -698,20 +910,14 @@ pub fn read_shared(path: &Path, max: u64) -> Result<Vec<u8>, SandboxError> {
     Ok(bytes)
 }
 
-fn wait(process: std::os::windows::io::RawHandle, timeout: Duration) -> bool {
-    use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
-    use windows_sys::Win32::System::Threading::WaitForSingleObject;
-    unsafe { WaitForSingleObject(process as _, timeout.as_millis().min(u32::MAX as u128 - 1) as u32) == WAIT_OBJECT_0 }
-}
-
 /// A Job Object that caps memory and kills its processes when dropped.
-struct Job(windows_sys::Win32::Foundation::HANDLE);
+pub(crate) struct Job(windows_sys::Win32::Foundation::HANDLE);
 
 // SAFETY: a kernel handle may be used and closed from any thread.
 unsafe impl Send for Job {}
 
 impl Job {
-    fn new(memory_limit: usize) -> std::io::Result<Job> {
+    pub(crate) fn new(memory_limit: usize) -> std::io::Result<Job> {
         use windows_sys::Win32::System::JobObjects::*;
         unsafe {
             let h = CreateJobObjectW(std::ptr::null(), std::ptr::null());
@@ -739,7 +945,7 @@ impl Job {
         }
     }
 
-    fn assign(&self, process: std::os::windows::io::RawHandle) -> std::io::Result<()> {
+    pub(crate) fn assign(&self, process: std::os::windows::io::RawHandle) -> std::io::Result<()> {
         use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
         if unsafe { AssignProcessToJobObject(self.0, process as _) } == 0 {
             return Err(std::io::Error::last_os_error());
