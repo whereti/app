@@ -817,6 +817,10 @@ impl Content {
         }
         self.update_counts(index, &known);
         let mut sandbox = new_sandbox();
+        // how tightly documents are read (restricted token, or lockdown only)
+        if let Some(s) = &sandbox {
+            shared.log.log(format!("content: document reader: {}", s.sandbox_report()));
+        }
         if sandbox.is_none() {
             shared.log.log("content: whereti-extract.exe is missing next to the service; only text files are indexed");
         }
