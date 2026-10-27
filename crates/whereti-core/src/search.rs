@@ -60,6 +60,8 @@ pub struct SearchResults {
 const FEW_HITS: usize = 3;
 /// Words shorter than this are not corrected (too many near words).
 const MIN_CLOSE_LEN: usize = 4;
+/// Words longer than this get no close matches.
+const MAX_CLOSE_LEN: usize = 40;
 
 enum Matcher {
     Text(Box<Finder<'static>>),
@@ -923,6 +925,11 @@ pub fn near_words(word: &str) -> Vec<String> {
     const LETTERS: &str = "abcdefghijklmnopqrstuvwxyz0123456789";
     let chars: Vec<char> = word.chars().collect();
     let n = chars.len();
+    // a pasted hash or long code is no mistyped word, and its variants grow
+    // with the square of its length (a long one would stall every search)
+    if n > MAX_CLOSE_LEN {
+        return Vec::new();
+    }
     let mut out: Vec<String> = Vec::new();
     let mut push = |v: Vec<char>| {
         let v: String = v.into_iter().collect();
