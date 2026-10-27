@@ -62,11 +62,13 @@ impl VolumeInfo {
     }
 }
 
-/// How many entries each exclusion rule left out at the last build, by rule
-/// text. Kept in memory only (the service saves it beside the index); it
-/// never makes two indexes different.
+/// How many entries each exclusion rule left out, per drive, at the last
+/// scan of that drive: (drive letter, rule, count). Kept in memory only (the
+/// service saves it beside the index); it never makes two indexes different.
+/// Per drive because a compaction rebuilds from the index itself, where the
+/// left-out entries no longer are: those drives keep their counts.
 #[derive(Debug, Default, Clone)]
-pub struct SkipCounts(pub Vec<(String, u64)>);
+pub struct SkipCounts(pub Vec<(char, String, u64)>);
 
 impl PartialEq for SkipCounts {
     fn eq(&self, _: &Self) -> bool {
@@ -146,14 +148,26 @@ impl NameIndex {
         &self.exclusions
     }
 
-    /// What each exclusion left out at the last build (empty for an index
-    /// loaded from disk until `set_skipped`).
-    pub fn skipped(&self) -> &[(String, u64)] {
+    /// What each exclusion left out, all drives together, in the order of
+    /// the exclusions (empty for an index loaded from disk until `set_skipped`).
+    pub fn skipped(&self) -> Vec<(String, u64)> {
+        let mut out: Vec<(String, u64)> = Vec::new();
+        for (_, rule, n) in &self.skipped.0 {
+            match out.iter_mut().find(|(r, _)| r == rule) {
+                Some((_, total)) => *total += n,
+                None => out.push((rule.clone(), *n)),
+            }
+        }
+        out
+    }
+
+    /// The same per drive: (letter, rule, count), what the service saves.
+    pub fn skipped_by_drive(&self) -> &[(char, String, u64)] {
         &self.skipped.0
     }
 
     /// The counts saved beside an index loaded from disk.
-    pub fn set_skipped(&mut self, counts: Vec<(String, u64)>) {
+    pub fn set_skipped(&mut self, counts: Vec<(char, String, u64)>) {
         self.skipped = SkipCounts(counts);
     }
 

@@ -489,45 +489,45 @@ fn generated_folders_are_told_by_what_is_around_them() {
     let c = scan(vec![
         d(5, 5, "."),
         // Rust: target beside Cargo.toml goes; a "target" of one's own stays
-        d(20, 5, "proj"),
-        f(21, 20, "Cargo.toml"),
-        d(22, 20, "target"),
-        d(23, 22, "debug"),
-        f(24, 23, "gone_app.exe"),
-        d(25, 5, "sales"),
-        d(26, 25, "target"),
-        f(27, 26, "keep_target_2026.xlsx"),
+        d(120, 5, "proj"),
+        f(121, 120, "Cargo.toml"),
+        d(122, 120, "target"),
+        d(123, 122, "debug"),
+        f(124, 123, "gone_app.exe"),
+        d(125, 5, "sales"),
+        d(126, 125, "target"),
+        f(127, 126, "keep_target_2026.xlsx"),
         // a cache that marks itself
-        d(30, 5, "blobs"),
-        f(31, 30, "CACHEDIR.TAG"),
-        f(32, 30, "gone_blob.bin"),
+        d(130, 5, "blobs"),
+        f(131, 130, "CACHEDIR.TAG"),
+        f(132, 130, "gone_blob.bin"),
         // Go's module store, and Go code of one's own
-        d(40, 5, "go"),
-        d(41, 40, "pkg"),
-        d(42, 41, "mod"),
-        f(43, 42, "gone_mod.go"),
-        d(44, 40, "src"),
-        f(45, 44, "keep_main.go"),
+        d(140, 5, "go"),
+        d(141, 140, "pkg"),
+        d(142, 141, "mod"),
+        f(143, 142, "gone_mod.go"),
+        d(144, 140, "src"),
+        f(145, 144, "keep_main.go"),
         // Lightroom previews beside the catalog
-        d(50, 5, "Pictures"),
-        f(51, 50, "keep_Catalog.lrcat"),
-        d(52, 50, "Catalog Previews.lrdata"),
-        f(53, 52, "gone_preview.lrprev"),
+        d(150, 5, "Pictures"),
+        f(151, 150, "keep_Catalog.lrcat"),
+        d(152, 150, "Catalog Previews.lrdata"),
+        f(153, 152, "gone_preview.lrprev"),
         // .NET: bin beside a project file; a bin of one's own stays
-        d(60, 5, "app"),
-        f(61, 60, "App.csproj"),
-        d(62, 60, "bin"),
-        f(63, 62, "gone_App.dll"),
-        d(64, 5, "tools"),
-        d(65, 64, "bin"),
-        f(66, 65, "keep_tool.exe"),
+        d(160, 5, "app"),
+        f(161, 160, "App.csproj"),
+        d(162, 160, "bin"),
+        f(163, 162, "gone_App.dll"),
+        d(164, 5, "tools"),
+        d(165, 164, "bin"),
+        f(166, 165, "keep_tool.exe"),
         // Unity: Library inside a project; a Library of books stays
-        d(70, 5, "game"),
-        d(71, 70, "ProjectSettings"),
-        d(72, 70, "Library"),
-        f(73, 72, "gone_asset.bin"),
-        d(74, 5, "Library"),
-        f(75, 74, "keep_book.pdf"),
+        d(170, 5, "game"),
+        d(171, 170, "ProjectSettings"),
+        d(172, 170, "Library"),
+        f(173, 172, "gone_asset.bin"),
+        d(174, 5, "Library"),
+        f(175, 174, "keep_book.pdf"),
     ]);
     let vols = vec![VolumeScan { letter: 'E', serial: 3, journal_id: 1, next_usn: 1, scan: c }];
     let ex = Exclusions::defaults(None);
@@ -551,6 +551,9 @@ fn generated_folders_are_told_by_what_is_around_them() {
     assert_eq!(count(r"**\<CACHEDIR.TAG>"), Some(3));
     assert_eq!(count(r"**\go\pkg\mod"), Some(2));
     assert_eq!(count(r"**\*.lrdata"), Some(2));
+    // a compaction rebuilds from the index, where those are gone: the counts stay
+    let again = idx.rebuild_with(Vec::new());
+    assert_eq!(again.skipped(), idx.skipped());
 }
 
 #[test]
@@ -573,3 +576,55 @@ fn rules_that_look_around_parse_strictly() {
         assert!(!Exclusions::is_valid_any_depth(bad), "{bad}");
     }
 }
+
+#[test]
+fn app_internals_go_only_below_appdata() {
+    let c = scan(vec![
+        d(5, 5, "."),
+        d(110, 5, "Users"),
+        d(111, 110, "ana"),
+        d(112, 111, "AppData"),
+        d(113, 112, "Local"),
+        d(114, 112, "Roaming"),
+        // an Electron app's cache, below AppData
+        d(120, 113, "Slack"),
+        d(121, 120, "Cache"),
+        f(122, 121, "gone_cache.bin"),
+        // a Store app's cache: Packages\<any app>\LocalCache
+        d(130, 113, "Packages"),
+        d(131, 130, "Contoso.App_8wekyb3d8bbwe"),
+        d(132, 131, "LocalCache"),
+        f(133, 132, "gone_store.dat"),
+        // an editor's local history
+        d(140, 114, "Code"),
+        d(141, 140, "User"),
+        d(142, 141, "History"),
+        f(143, 142, "gone_history.json"),
+        // temporary files
+        d(150, 113, "Temp"),
+        f(151, 150, "gone_tmp.txt"),
+        // the same names among one's own files stay
+        d(160, 111, "Documents"),
+        d(161, 160, "Cache"),
+        f(162, 161, "keep_cache_notes.docx"),
+        d(163, 160, "User"),
+        d(164, 163, "History"),
+        f(165, 164, "keep_history_essay.docx"),
+        d(166, 160, "logs"),
+        f(167, 166, "keep_ship_logs.xlsx"),
+    ]);
+    let vols = vec![VolumeScan { letter: 'C', serial: 3, journal_id: 1, next_usn: 1, scan: c }];
+    let idx = build(vols, &Exclusions::defaults(None)).0;
+    assert_eq!(find(&idx, "gone_"), Vec::<String>::new());
+    let mut kept = find(&idx, "keep_");
+    kept.sort();
+    assert_eq!(
+        kept,
+        [
+            r"C:\Users\ana\Documents\Cache\keep_cache_notes.docx",
+            r"C:\Users\ana\Documents\User\History\keep_history_essay.docx",
+            r"C:\Users\ana\Documents\logs\keep_ship_logs.xlsx",
+        ]
+    );
+}
+

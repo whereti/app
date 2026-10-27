@@ -586,7 +586,10 @@ fn search(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
         ui.add_space(12.0);
         line(ui, p);
         // generated folders, a group at a time: on = left out
-        let groups: Vec<(String, Vec<String>)> = app.settings.config.as_ref().map(|c| c.groups.clone()).unwrap_or_default();
+        let mut groups: Vec<(String, Vec<String>)> = app.settings.config.as_ref().map(|c| c.groups.clone()).unwrap_or_default();
+        // the biggest first; a group this app does not know goes last
+        const ORDER: [&str; 6] = ["apps", "dev", "caches", "sdks", "media", "games"];
+        groups.sort_by_key(|(id, _)| ORDER.iter().position(|o| o == id).unwrap_or(ORDER.len()));
         let skipped: Vec<(String, u64)> = app.settings.config.as_ref().map(|c| c.skipped.clone()).unwrap_or_default();
         for (id, rules) in &groups {
             let Some((title, desc)) = group_text(id) else { continue };
@@ -1152,6 +1155,14 @@ pub(crate) fn photo_tags_line(state: &str) -> Option<String> {
 /// The title and the description of a group of generated folders.
 fn group_text(id: &str) -> Option<(&'static str, &'static str)> {
     Some(match id {
+        "apps" => (
+            tr("Inside applications"),
+            tr("Temporary files, browser profiles, the caches and logs of apps and editors, and the files of Store apps."),
+        ),
+        "sdks" => (
+            tr("Developer kits and toolchains"),
+            tr("The headers, libraries and reference packages of Visual Studio, the Windows and Android SDKs, Go, .NET, MSYS2 and others."),
+        ),
         "dev" => (
             tr("Build folders of programming projects"),
             tr("Folders like target, bin or dist, only next to the project file of the tool that rebuilds them."),

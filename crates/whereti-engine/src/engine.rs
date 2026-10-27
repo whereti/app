@@ -300,7 +300,7 @@ impl Engine {
                     Some(idx) => (idx.volumes().iter().map(|v| v.letter()).collect(), idx.exclusions().to_vec()),
                     None => (Vec::new(), Vec::new()),
                 };
-                let skipped = guard.as_ref().map(|i| i.skipped().to_vec()).unwrap_or_default();
+                let skipped = guard.as_ref().map(|i| i.skipped()).unwrap_or_default();
                 Response::Config(ConfigReply {
                     volumes,
                     exclusions,
@@ -586,14 +586,23 @@ impl Worker {
             Exclusions::previous_defaults(windows.as_deref()).paths.iter().map(|p| p.to_lowercase()).collect();
         let has: HashSet<String> = index.exclusions().iter().map(|p| p.to_lowercase()).collect();
         let upgrade_defaults = has == old;
-        // Once per install (whereti 0.9.3): the generated folders told by
-        // what is around them join the exclusions, next to whatever the user
-        // set. Taken back in Settings, they stay out of it.
+        // Rules of the generated-folder groups join the exclusions once each,
+        // next to whatever the user set: `<index>.defaults` lists the rules
+        // already offered. A group taken back in Settings stays out; a group
+        // added in a later version still arrives.
         let groups_marker = self.cfg.index_path.with_extension("defaults");
-        let add_groups: Vec<String> = if upgrade_defaults || groups_marker.exists() {
+        let offered: HashSet<String> = std::fs::read_to_string(&groups_marker)
+            .unwrap_or_default()
+            .lines()
+            .map(|l| l.trim().to_lowercase())
+            .collect();
+        let add_groups: Vec<String> = if upgrade_defaults {
             Vec::new()
         } else {
-            Exclusions::group_rules().into_iter().filter(|r| !has.contains(&r.to_lowercase())).collect()
+            Exclusions::group_rules()
+                .into_iter()
+                .filter(|r| !has.contains(&r.to_lowercase()) && !offered.contains(&r.to_lowercase()))
+                .collect()
         };
         let mut with_groups = index.exclusions().to_vec();
         with_groups.extend(add_groups.iter().cloned());
@@ -651,7 +660,8 @@ impl Worker {
             ));
             self.reconfigure(with_groups)?;
         }
-        let _ = std::fs::write(&groups_marker, "3\n");
+        let all: String = Exclusions::group_rules().iter().map(|r| format!("{r}\n")).collect();
+        let _ = std::fs::write(&groups_marker, all);
         Ok(())
     }
 
@@ -823,7 +833,7 @@ impl Worker {
         let size = {
             let guard = self.shared.index.read();
             let idx = guard.as_ref().expect("index");
-            save_skipped(&self.cfg.index_path, idx.skipped());
+            save_skipped(&self.cfg.index_path, idx.skipped_by_drive());
             snapshot::save(idx, &self.cfg.index_path)
                 .map_err(|e| format!("cannot save {}: {e}", self.cfg.index_path.display()))?
         };
@@ -1185,22 +1195,22 @@ fn system_drive() -> char {
 
 /// The exclusions of a fresh install (PLAN.md §5).
 /// What each exclusion left out, kept beside the index (`<index>.skipped`,
-/// one `count<TAB>rule` per line): an index loaded from disk does not carry it.
-fn save_skipped(index_path: &std::path::Path, counts: &[(String, u64)]) {
-    if counts.is_empty() {
-        return;
-    }
-    let text: String = counts.iter().map(|(r, n)| format!("{n}\t{r}\n")).collect();
+/// one `drive<TAB>count<TAB>rule` per line): an index loaded from disk does
+/// not carry it.
+fn save_skipped(index_path: &std::path::Path, counts: &[(char, String, u64)]) {
+    let text: String = counts.iter().map(|(l, r, n)| format!("{l}\t{n}\t{r}\n")).collect();
     let _ = std::fs::write(index_path.with_extension("skipped"), text);
 }
 
-fn load_skipped(index_path: &std::path::Path) -> Vec<(String, u64)> {
+fn load_skipped(index_path: &std::path::Path) -> Vec<(char, String, u64)> {
     std::fs::read_to_string(index_path.with_extension("skipped"))
         .unwrap_or_default()
         .lines()
         .filter_map(|l| {
-            let (n, r) = l.split_once('\t')?;
-            Some((r.to_string(), n.parse().ok()?))
+            let mut parts = l.splitn(3, '\t');
+            let letter = parts.next()?.chars().next()?;
+            let n = parts.next()?.parse().ok()?;
+            Some((letter, parts.next()?.to_string(), n))
         })
         .collect()
 }

@@ -440,7 +440,11 @@ impl NameIndex {
         }
         let exclusions = Exclusions { paths: self.exclusions.clone() };
         let scans = self.to_scans();
+        let skipped = self.skipped.clone();
         *self = build(scans, &exclusions).0;
+        // rebuilt from what the index holds: what was left out is not there
+        // to count again
+        self.skipped = skipped;
     }
 
     /// A clean index where the given volumes come from fresh scans and the
@@ -459,9 +463,18 @@ impl NameIndex {
             .filter(|s| !fresh.iter().any(|f| f.letter.eq_ignore_ascii_case(&s.letter)))
             .filter(|s| !remove.iter().any(|r| r.eq_ignore_ascii_case(&s.letter)))
             .collect();
+        let fresh_letters: Vec<char> = fresh.iter().map(|f| f.letter.to_ascii_uppercase()).collect();
         scans.extend(fresh);
         scans.sort_by_key(|s| s.letter.to_ascii_uppercase());
-        build(scans, &exclusions).0
+        let mut idx = build(scans, &exclusions).0;
+        // Drives scanned again count anew; the others were rebuilt from the
+        // index, where what was left out is gone: they keep their counts.
+        let gone = |l: char| fresh_letters.contains(&l) || remove.iter().any(|r| r.to_ascii_uppercase() == l);
+        let mut skipped: Vec<(char, String, u64)> =
+            self.skipped.0.iter().filter(|(l, _, _)| !gone(*l)).cloned().collect();
+        skipped.extend(idx.skipped.0.iter().filter(|(l, _, _)| fresh_letters.contains(l)).cloned());
+        idx.skipped = crate::index::SkipCounts(skipped);
+        idx
     }
 
     /// Converts the live entries back into per-volume scans.

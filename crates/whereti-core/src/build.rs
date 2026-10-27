@@ -38,7 +38,10 @@ pub(crate) const ANY_DEPTH: &str = "**";
 /// Folders that are generated can also be told by what is around them, so
 /// a name that people use too (`build`, `target`, `Library`) is left out only
 /// where a tool made it:
-/// - `**\go\pkg\mod`: that path, ending anywhere;
+/// - `**\go\pkg\mod`: that path, ending anywhere (`*` = any one folder:
+///   `**\Packages\*\LocalCache`);
+/// - `**\AppData\...\Code Cache`: that folder anywhere below an `AppData`
+///   (a name that only tools use there, and people may use elsewhere);
 /// - `**\*.lrdata`: folders whose name ends so;
 /// - `**\target <Cargo.toml>`: `target` beside a `Cargo.toml` (`|` between
 ///   several, `*.csproj` for any of a kind);
@@ -129,6 +132,99 @@ pub const DEFAULT_GROUPS: &[(&str, &[&str])] = &[
         ],
     ),
     (
+        // what applications keep for themselves: temporary files, browser
+        // profiles, the caches of Chromium and Electron apps and of editors,
+        // Store apps' caches, logs and crash dumps. Nobody looks for these by
+        // name; every rule is held to AppData, ProgramData or the place the
+        // program itself uses, so a "Cache" or "logs" of one's own stays.
+        "apps",
+        &[
+            r"**\AppData\Local\Temp",
+            r"**\AppData\Local\Google\Chrome\User Data",
+            r"**\AppData\Local\Google\Chrome Beta\User Data",
+            r"**\AppData\Local\Microsoft\Edge\User Data",
+            r"**\AppData\Local\BraveSoftware\Brave-Browser\User Data",
+            r"**\AppData\Local\Vivaldi\User Data",
+            r"**\AppData\Local\Chromium\User Data",
+            r"**\AppData\Roaming\Opera Software",
+            r"**\AppData\Local\Opera Software",
+            r"**\AppData\Roaming\Mozilla\Firefox\Profiles",
+            r"**\AppData\Local\Mozilla\Firefox\Profiles",
+            r"**\AppData\Roaming\Thunderbird\Profiles",
+            r"**\AppData\Local\Microsoft\Windows\INetCache",
+            r"**\AppData\Local\Microsoft\Windows\WebCache",
+            r"**\AppData\Local\Microsoft\Windows\Explorer",
+            r"**\AppData\Local\CrashDumps",
+            r"**\AppData\Local\D3DSCache",
+            r"**\AppData\Local\NVIDIA\DXCache",
+            r"**\AppData\Local\NVIDIA\GLCache",
+            r"**\AppData\Local\AMD\DxCache",
+            r"**\AppData\Local\Packages\*\LocalCache",
+            r"**\AppData\Local\Packages\*\TempState",
+            r"**\AppData\Local\Packages\*\AC",
+            r"**\AppData\...\Cache",
+            r"**\AppData\...\Code Cache",
+            r"**\AppData\...\GPUCache",
+            r"**\AppData\...\DawnCache",
+            r"**\AppData\...\DawnGraphiteCache",
+            r"**\AppData\...\DawnWebGPUCache",
+            r"**\AppData\...\GrShaderCache",
+            r"**\AppData\...\ShaderCache",
+            r"**\AppData\...\Service Worker",
+            r"**\AppData\...\IndexedDB",
+            r"**\AppData\...\blob_storage",
+            r"**\AppData\...\Session Storage",
+            r"**\AppData\...\Local Storage",
+            r"**\AppData\...\Crashpad",
+            r"**\AppData\...\CachedData",
+            r"**\AppData\...\CachedExtensionVSIXs",
+            r"**\AppData\...\CachedProfilesData",
+            r"**\AppData\...\User\History",
+            r"**\AppData\...\User\workspaceStorage",
+            r"**\AppData\...\caches",
+            r"**\AppData\...\logs",
+            r"**\AppData\...\log",
+            r"**\ProgramData\...\logs",
+            r"**\ProgramData\Package Cache",
+            r"**\ProgramData\...\Cache",
+            r"**\AppData\...\site-packages",
+            r"**\AppData\Local\golangci-lint",
+            r"**\AppData\Local\Steam\htmlcache",
+            r"**\Steam\appcache",
+            // the XDG cache folder some tools keep in the profile
+            r"**\Users\*\.cache",
+            r"**\Program Files\WindowsApps",
+            r"**\.codex\.tmp",
+        ],
+    ),
+    (
+        // what SDKs and developer toolchains install: headers, libraries,
+        // reference packages. On by default, a switch for who reads them.
+        "sdks",
+        &[
+            r"**\Program Files (x86)\Windows Kits",
+            r"**\Program Files\Windows Kits",
+            r"**\Program Files (x86)\Microsoft SDKs",
+            r"**\Program Files\Microsoft SDKs",
+            r"**\Program Files\Microsoft Visual Studio",
+            r"**\Program Files (x86)\Microsoft Visual Studio",
+            r"**\Program Files\dotnet\packs",
+            r"**\Program Files\dotnet\sdk",
+            r"**\Program Files\dotnet\shared",
+            r"**\Program Files\Go\src",
+            r"**\Program Files\Go\pkg",
+            r"**\Android\android-sdk",
+            r"**\AppData\Local\Android\Sdk",
+            r"**\Google\Cloud SDK\google-cloud-sdk",
+            r"**\msys64",
+            r"**\msys2",
+            r"**\cygwin64",
+            r"**\Strawberry\perl",
+            r"**\Strawberry\c",
+            r"**\ProgramData\Microsoft\VisualStudio",
+        ],
+    ),
+    (
         // what game engines generate inside a project
         "games",
         &[
@@ -144,8 +240,10 @@ pub const DEFAULT_GROUPS: &[(&str, &[&str])] = &[
 /// A rule that looks around a folder, not only at its path (see `Exclusions`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Smart {
-    /// Folded components; the last one is the folder.
+    /// Folded components; the last one is the folder. `*` matches any one.
     Tail(Vec<String>),
+    /// `tail` (as in `Tail`) somewhere below a folder named `anchor`.
+    Under { anchor: String, tail: Vec<String> },
     /// Folded name ending, with its dot (`.lrdata`).
     Suffix(String),
     /// A folder `name` beside one of `manifests` (folded; `*.ext` = any of a kind).
@@ -176,10 +274,23 @@ impl Smart {
             let ok = suffix.starts_with('.') && suffix.len() > 1 && !suffix.contains(['\\', '*', '<']);
             return ok.then(|| Smart::Suffix(fold(suffix)));
         }
+        // components of a path: names, or `*` for any one folder (never the last)
+        let comps = |text: &str| -> Option<Vec<String>> {
+            let comps: Vec<String> = text.split('\\').map(str::trim).map(fold).collect();
+            let ok = comps.iter().all(|c| !c.is_empty() && (c == "*" || !c.contains(['*', '<', '>', '|'])))
+                && comps.last().is_some_and(|c| c != "*");
+            ok.then_some(comps)
+        };
+        if let Some((anchor, tail)) = rest.split_once("\\...\\") {
+            let anchor = anchor.trim();
+            if anchor.is_empty() || anchor.contains(['\\', '*', '<', '>', '|']) {
+                return None;
+            }
+            return Some(Smart::Under { anchor: fold(anchor), tail: comps(tail)? });
+        }
         if rest.contains('\\') {
-            let comps: Vec<String> = rest.split('\\').map(str::trim).map(fold).collect();
-            let ok = comps.len() >= 2 && comps.iter().all(|c| !c.is_empty() && !c.contains(['*', '<', '>']));
-            return ok.then_some(Smart::Tail(comps));
+            let comps = comps(rest)?;
+            return (comps.len() >= 2).then_some(Smart::Tail(comps));
         }
         None
     }
@@ -324,11 +435,18 @@ pub fn build(volumes: Vec<VolumeScan>, exclusions: &Exclusions) -> (NameIndex, B
     };
     let mut ext_ids: HashMap<String, u16> = HashMap::new();
     let mut stats = BuildStats::default();
-    let mut counts = vec![0u64; exclusions.paths.len()];
+    let mut skipped = Vec::new();
     for vs in volumes {
+        let letter = vs.letter.to_ascii_uppercase();
+        let mut counts = vec![0u64; exclusions.paths.len()];
         add_volume(&mut idx, &mut ext_ids, vs, exclusions, &mut stats, &mut counts);
+        for (rule, n) in exclusions.paths.iter().zip(counts) {
+            if n > 0 {
+                skipped.push((letter, rule.clone(), n));
+            }
+        }
     }
-    idx.skipped = crate::index::SkipCounts(exclusions.paths.iter().cloned().zip(counts).collect());
+    idx.skipped = crate::index::SkipCounts(skipped);
     idx.name_rank = compute_name_rank(&idx);
     idx.dir_order = compute_dir_order(&idx);
     mark_noise(&mut idx);
@@ -425,6 +543,26 @@ fn add_volume(
                 }
             }
         }
+        // Whether a folder named `name` (in parent `p`) ends `comps`, the
+        // folders above matching nearest first (`*` = any); the folder above
+        // the match when it does.
+        let tail_above = |comps: &[String], name: &str, p: u32, up: &mut String| -> Option<u32> {
+            let (last, above) = comps.split_last()?;
+            if name != last {
+                return None;
+            }
+            let mut cur = p;
+            for c in above.iter().rev() {
+                if cur == NO_PARENT || cur == root {
+                    return None;
+                }
+                if c != "*" && folded(scan.name(&scan.entries[cur as usize]), up) != c {
+                    return None;
+                }
+                cur = parent_of(cur as usize);
+            }
+            Some(cur)
+        };
         for (i, e) in scan.entries.iter().enumerate() {
             if !e.is_dir {
                 continue;
@@ -435,20 +573,20 @@ fn add_volume(
                 let hit = match s {
                     Smart::Suffix(sfx) => name.ends_with(sfx.as_str()) && name.len() > sfx.len(),
                     Smart::Beside { name: want, .. } => p != NO_PARENT && name == *want && beside.contains(&(p, k)),
-                    Smart::Tail(comps) => {
-                        name == comps[comps.len() - 1] && {
-                            // the folders above, nearest first, must match too
-                            let mut cur = p;
-                            comps[..comps.len() - 1].iter().rev().all(|c| {
-                                if cur == NO_PARENT || cur == root {
-                                    return false;
-                                }
-                                let ok = folded(scan.name(&scan.entries[cur as usize]), &mut up) == c;
-                                cur = parent_of(cur as usize);
-                                ok
-                            })
+                    Smart::Tail(comps) => tail_above(comps, &name, p, &mut up).is_some(),
+                    Smart::Under { anchor, tail } => tail_above(tail, &name, p, &mut up).is_some_and(|mut cur| {
+                        // a folder named `anchor` somewhere above
+                        for _ in 0..4096 {
+                            if cur == NO_PARENT || cur == root {
+                                return false;
+                            }
+                            if folded(scan.name(&scan.entries[cur as usize]), &mut up) == anchor {
+                                return true;
+                            }
+                            cur = parent_of(cur as usize);
                         }
-                    }
+                        false
+                    }),
                     Smart::Marker(_) => false,
                 };
                 if hit {
