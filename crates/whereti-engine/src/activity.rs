@@ -46,6 +46,9 @@ impl Heat {
     }
 }
 
+/// Per entry 0-8; when it was built; for which index (generation, length).
+type Ranking = (Arc<Vec<u8>>, Option<Instant>, (u64, usize));
+
 pub struct Activity {
     file: PathBuf,
     off_marker: PathBuf,
@@ -57,7 +60,7 @@ pub struct Activity {
     seeded: AtomicBool,
     /// Per entry: 0-8, for `search_ranked`; when it was built, and for which
     /// index (`generation`, length).
-    ranking: RwLock<(Arc<Vec<u8>>, Option<Instant>, (u64, usize))>,
+    ranking: RwLock<Ranking>,
     /// Counts the indexes swapped in: a rebuilt index numbers its entries
     /// anew, even when it has as many.
     generation: AtomicU64,
