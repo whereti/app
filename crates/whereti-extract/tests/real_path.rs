@@ -22,6 +22,11 @@ fn a_file_is_read_only_at_its_real_path() {
     assert!(open_real(&target.join("secret.txt")).is_ok());
     assert!(open_real(&base.join("SOMEONE ELSE").join("SECRET.TXT")).is_ok());
     assert_eq!(read_shared(&target.join("secret.txt"), 100).unwrap(), b"not yours");
+    // by its short 8.3 name (as a temp folder often is): still its real path
+    let short = short_path(&target.join("secret.txt"));
+    if short != target.join("secret.txt") {
+        assert!(open_real(&short).is_ok(), "short path {} refused", short.display());
+    }
     // through the junction: refused
     let through = link.join("secret.txt");
     assert!(std::fs::read(&through).is_ok(), "the junction itself works");
@@ -31,4 +36,21 @@ fn a_file_is_read_only_at_its_real_path() {
 
     let _ = std::fs::remove_dir(&link);
     let _ = std::fs::remove_dir_all(&base);
+}
+
+/// The 8.3 form of a path, if the volume keeps short names.
+fn short_path(path: &std::path::Path) -> std::path::PathBuf {
+    use std::os::windows::ffi::OsStrExt;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetShortPathNameW(long: *const u16, short: *mut u16, len: u32) -> u32;
+    }
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+    let mut buf = vec![0u16; 512];
+    // SAFETY: a NUL-terminated path and a buffer of its length.
+    let n = unsafe { GetShortPathNameW(wide.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) } as usize;
+    if n == 0 || n >= buf.len() {
+        return path.to_path_buf();
+    }
+    std::path::PathBuf::from(String::from_utf16_lossy(&buf[..n]))
 }

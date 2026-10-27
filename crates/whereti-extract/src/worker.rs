@@ -12,6 +12,7 @@
 //! text. Other codes map to `ExtractError`; stderr holds the detail.
 
 use std::io::{Read, Write};
+use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -658,9 +659,30 @@ fn final_path(file: &std::fs::File) -> std::io::Result<PathBuf> {
 }
 
 /// The same path, letter case and slashes aside.
-fn same_path(a: &Path, b: &Path) -> bool {
+/// The same path, letter case, slashes and short 8.3 names aside (`real` is
+/// what Windows reports for an open file; `asked` may use short names).
+fn same_path(real: &Path, asked: &Path) -> bool {
     let norm = |p: &Path| p.to_string_lossy().replace('/', "\\").trim_end_matches('\\').to_lowercase();
-    norm(a) == norm(b)
+    norm(real) == norm(asked) || norm(real) == norm(&long_path(asked))
+}
+
+/// `path` with its short 8.3 names spelled out (`RUNNER~1` -> `runneradmin`).
+/// It names each folder as it is, links included, never where they lead.
+fn long_path(path: &Path) -> PathBuf {
+    use windows_sys::Win32::Storage::FileSystem::GetLongPathNameW;
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+    let mut buf = vec![0u16; 512];
+    loop {
+        // SAFETY: a NUL-terminated path and a buffer of the given length.
+        let n = unsafe { GetLongPathNameW(wide.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) } as usize;
+        if n == 0 {
+            return path.to_path_buf();
+        }
+        if n < buf.len() {
+            return PathBuf::from(String::from_utf16_lossy(&buf[..n]));
+        }
+        buf.resize(n + 1, 0);
+    }
 }
 
 /// Reads a file without blocking its writers and without changing its
