@@ -455,13 +455,13 @@ fn search(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
     ui.add_space(14.0);
 
     // ---- search by meaning
-    let meaning = app.status.as_ref().map(|s| s.content.meaning.clone()).filter(|t| !t.is_empty()).unwrap_or_else(|| "off".into());
+    let meaning = meaning_state(app);
     card(ui, p, |ui| {
         row(
             ui,
             p,
             tr("Search documents by meaning"),
-            tr("Finds documents that say what you typed in other words: \"rental contract\" finds the lease. It downloads a model once (135 MB, from Hugging Face); your documents are read on your PC and never leave it."),
+            meaning_text(),
             |ui| {
                 let mut on = meaning != "off";
                 if toggle(ui, p, &mut on, tr("Search documents by meaning")).clicked() {
@@ -469,8 +469,7 @@ fn search(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
                 }
             },
         );
-        let line = if meaning == "on" { Some(tr("On. Documents are read for their meaning in the background; results come under \"Close in meaning\".").to_string()) } else { photo_tags_line(&meaning) };
-        if let Some(line) = line {
+        if let Some(line) = meaning_line(&meaning) {
             ui.label(egui::RichText::new(line).size(12.5).color(if meaning.starts_with("error") { p.error } else { p.text2 }));
             ui.add_space(12.0);
         }
@@ -1075,6 +1074,24 @@ fn card(ui: &mut egui::Ui, p: &Palette, body: impl FnOnce(&mut egui::Ui)) {
 /// "off", "on", "downloading:<bytes>/<total>" or "error: …".
 pub(crate) fn photo_tags_state(app: &WheretiApp) -> String {
     app.status.as_ref().map(|s| s.content.tags.clone()).filter(|t| !t.is_empty()).unwrap_or_else(|| "off".into())
+}
+
+/// Search by meaning: "off", "on", "downloading:<done>/<total>" or "error:…".
+pub(crate) fn meaning_state(app: &WheretiApp) -> String {
+    app.status.as_ref().map(|s| s.content.meaning.clone()).filter(|t| !t.is_empty()).unwrap_or_else(|| "off".into())
+}
+
+/// What search by meaning does and costs, said the same way everywhere.
+pub(crate) fn meaning_text() -> &'static str {
+    tr("Finds documents that say what you typed in other words: \"rental contract\" finds the lease. It downloads a model once (135 MB, from Hugging Face); your documents are read on your PC and never leave it.")
+}
+
+/// The line under search by meaning: the download, a failure, or that it works.
+pub(crate) fn meaning_line(state: &str) -> Option<String> {
+    if state == "on" {
+        return Some(tr("On. Documents are read for their meaning in the background; results come under \"Close in meaning\".").to_string());
+    }
+    photo_tags_line(state)
 }
 
 /// What recognising photos does and costs, said the same way everywhere.

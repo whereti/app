@@ -6,7 +6,6 @@ use eframe::egui::{self, Align, Color32, CornerRadius, FontFamily, FontId, Frame
 
 use crate::app::{content_active, content_progress, names_progress, semibold, state_ro, Page, WheretiApp};
 use crate::i18n::tr;
-use crate::icons::{self, Icon};
 use crate::theme::{self, Palette};
 use crate::{trf, trn};
 
@@ -32,20 +31,46 @@ pub fn show(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
             ui.add_space(pad);
             ui.vertical(|ui| {
                 ui.set_width(width);
-                // ---- greeting
-                ui.label(
-                    egui::RichText::new(tr("Welcome to whereti"))
-                        .size(26.0)
-                        .family(FontFamily::Name("display".into()))
-                        .color(p.text),
-                );
-                ui.add_space(4.0);
-                ui.label(
-                    egui::RichText::new(tr("Instant search for every file on your PC, by its name and by what is written inside."))
-                    .size(14.0)
-                    .color(p.text2),
-                );
-                ui.add_space(14.0);
+                // ---- greeting, with the way out on the right: the whole page
+                // fits the window as it first opens, without scrolling
+                ui.horizontal(|ui| {
+                    let right = 190.0;
+                    ui.vertical(|ui| {
+                        ui.set_width(ui.available_width() - right - 12.0);
+                        ui.label(
+                            egui::RichText::new(tr("Welcome to whereti"))
+                                .size(24.0)
+                                .family(FontFamily::Name("display".into()))
+                                .color(p.text),
+                        );
+                        ui.add_space(2.0);
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(tr("Instant search for every file on your PC, by its name and by what is written inside."))
+                                    .size(13.5)
+                                    .color(p.text2),
+                            )
+                            .wrap(),
+                        );
+                    });
+                    ui.with_layout(egui::Layout::top_down(Align::Max), |ui| {
+                        ui.set_width(right);
+                        if primary_button(ui, p, tr("Start searching")).clicked() {
+                            finish(app);
+                        }
+                        ui.add_space(4.0);
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(tr("whereti keeps working in the tray, next to the clock."))
+                                    .size(11.5)
+                                    .color(p.text3),
+                            )
+                            .halign(Align::Max)
+                            .wrap(),
+                        );
+                    });
+                });
+                ui.add_space(12.0);
 
                 // ---- the three steps
                 let names_step = match (&offline, &status) {
@@ -93,77 +118,106 @@ pub fn show(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
                     .fill(p.surface)
                     .stroke(Stroke::new(1.0, p.border))
                     .corner_radius(CornerRadius::same(14))
-                    .inner_margin(Margin::symmetric(20, 4))
+                    .inner_margin(Margin::symmetric(18, 2))
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         step_row(ui, p, 1, &names_step, tr("Reading the file names"), &names_detail, false);
                         step_row(ui, p, 2, &content_step, tr("Reading the documents"), &content_detail, false);
                         step_row(ui, p, 3, &ready_step, tr("Ready to search"), &ready_detail, true);
                     });
-                ui.add_space(12.0);
+                ui.add_space(10.0);
 
-                // ---- objects and animals in photos: asked once
-                let tags = crate::settings::photo_tags_state(app);
-                if !app.settings.photo_tags_asked && tags == "off" {
-                    Frame::NONE
-                        .fill(p.surface)
-                        .stroke(Stroke::new(1.0, p.border))
-                        .corner_radius(CornerRadius::same(14))
-                        .inner_margin(Margin::symmetric(20, 16))
-                        .show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            ui.label(egui::RichText::new(tr("Recognize what is in your photos?")).size(15.0).family(semibold()).color(p.text));
-                            ui.add_space(4.0);
-                            ui.add(egui::Label::new(egui::RichText::new(crate::settings::photo_tags_text()).size(12.5).color(p.text2)).wrap());
-                            ui.add_space(10.0);
-                            ui.horizontal(|ui| {
-                                let mut answered = false;
-                                if primary_button(ui, p, tr("Yes, recognize them")).clicked() {
-                                    app.searcher.set_photo_tags(true);
-                                    answered = true;
-                                }
-                                ui.add_space(8.0);
-                                if crate::settings::button(ui, p, tr("Not now"), false).clicked() {
-                                    answered = true;
-                                }
-                                if answered {
-                                    app.settings.photo_tags_asked = true;
-                                    app.settings.save();
-                                }
-                            });
-                        });
-                    ui.add_space(12.0);
-                } else if let Some(line) = crate::settings::photo_tags_line(&tags) {
-                    ui.label(egui::RichText::new(line).size(12.5).color(p.text2));
-                    ui.add_space(12.0);
-                }
+                // ---- the two optional downloads: offered once, never started unasked
+                optional_downloads(app, ui, p);
 
-                // ---- tips
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 10.0;
-                    let w = (ui.available_width() - 20.0) / 3.0;
-                    tip(ui, p, w, Icon::Search, tr("Type part of a name"), tr("“invoice”, “*.pdf”, “ext:docx dm:today”"));
-                    tip(ui, p, w, Icon::Document, tr("Inside documents too"), tr("Words in PDFs, Word and Excel files show up under the names."));
-                    tip(ui, p, w, Icon::Panel, tr("Tab shows a preview"), tr("Enter opens, Ctrl+Enter shows the file in Explorer."));
-                });
-                ui.add_space(14.0);
-                ui.horizontal(|ui| {
-                    if primary_button(ui, p, tr("Start searching")).clicked() {
-                        finish(app);
-                    }
-                    ui.add_space(12.0);
-                    ui.label(
-                        egui::RichText::new(tr("whereti keeps working in the tray, next to the clock."))
-                        .size(12.5)
-                        .color(p.text3),
-                    );
-                });
-                ui.add_space(8.0);
             });
         });
     });
     // keep the steps moving while this page is open
     ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
+}
+
+/// Recognising photos and search by meaning, each a model downloaded once.
+/// Offered here until answered ("Not now" or "Close"); after that only a line
+/// while a download runs or fails. Settings > Search has both for good.
+fn optional_downloads(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
+    let tags = crate::settings::photo_tags_state(app);
+    let meaning = crate::settings::meaning_state(app);
+    if app.settings.photo_tags_asked {
+        for line in [crate::settings::photo_tags_line(&tags), crate::settings::meaning_line(&meaning)].into_iter().flatten() {
+            ui.label(egui::RichText::new(line).size(12.5).color(p.text2));
+        }
+        ui.add_space(12.0);
+        return;
+    }
+    Frame::NONE
+        .fill(p.surface)
+        .stroke(Stroke::new(1.0, p.border))
+        .corner_radius(CornerRadius::same(14))
+        .inner_margin(Margin::symmetric(18, 12))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(egui::RichText::new(tr("Optional: smarter search")).size(14.5).family(semibold()).color(p.text));
+            let photos = optional_row(ui, p, tr("Recognize objects and animals in photos"), tr("Find photos by what they show: a dog, the beach, a car."), "84 MB", crate::settings::photo_tags_line(&tags), &tags);
+            if photos {
+                app.searcher.set_photo_tags(true);
+            }
+            ui.painter().hline(ui.min_rect().x_range(), ui.cursor().top(), Stroke::new(1.0, p.line));
+            let words = optional_row(ui, p, tr("Search documents by meaning"), tr("Find documents written in other words: \"rental contract\" finds the lease."), "135 MB", crate::settings::meaning_line(&meaning), &meaning);
+            if words {
+                app.searcher.set_meaning(true);
+            }
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                let none_chosen = tags == "off" && meaning == "off";
+                let label = if none_chosen { tr("Not now") } else { tr("Close") };
+                if crate::settings::button(ui, p, label, false).clicked() {
+                    app.settings.photo_tags_asked = true;
+                    app.settings.save();
+                }
+                ui.add_space(10.0);
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(tr("Each is downloaded once, from Hugging Face, and works only on your PC. Both stay in Settings, Search."))
+                            .size(12.5)
+                            .color(p.text3),
+                    )
+                    .wrap(),
+                );
+            });
+        });
+    ui.add_space(8.0);
+}
+
+/// One optional download: what it does, and a button while it is off, or how
+/// it goes once chosen. True when the button was clicked.
+fn optional_row(ui: &mut egui::Ui, p: &Palette, title: &str, desc: &str, size: &str, line: Option<String>, state: &str) -> bool {
+    let off = state == "off";
+    let mut clicked = false;
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        let label = trf!("Download ({size})", size);
+        // off, or failed: the button (again); otherwise the text takes the whole width
+        let with_button = off || state.starts_with("error");
+        let control_w = if with_button { crate::settings::button_width(ui, &label) + 12.0 } else { 0.0 };
+        ui.vertical(|ui| {
+            ui.set_width((ui.available_width() - control_w).max(200.0));
+            ui.label(egui::RichText::new(title).size(13.5).family(semibold()).color(p.text));
+            ui.add(egui::Label::new(egui::RichText::new(desc).size(12.5).color(p.text2)).wrap());
+            if let Some(line) = line {
+                ui.add_space(2.0);
+                let color = if state.starts_with("error") { p.error } else { p.accent };
+                ui.label(egui::RichText::new(line).size(12.5).family(semibold()).color(color));
+            }
+        });
+        if with_button {
+            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                clicked = crate::settings::button(ui, p, &label, true).clicked();
+            });
+        }
+    });
+    ui.add_space(8.0);
+    clicked
 }
 
 /// Leaves the welcome page for good.
@@ -182,9 +236,9 @@ fn drives(s: &whereti_ipc::StatusReply) -> String {
 
 #[allow(clippy::too_many_arguments)]
 fn step_row(ui: &mut egui::Ui, p: &Palette, n: usize, step: &Step, title: &str, detail: &str, last: bool) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 56.0), Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 46.0), Sense::hover());
     let painter = ui.painter();
-    let c = Pos2::new(rect.left() + 16.0, rect.top() + 21.0);
+    let c = Pos2::new(rect.left() + 16.0, rect.center().y);
     match step {
         Step::Done => {
             painter.circle_filled(c, 12.0, p.ok);
@@ -215,13 +269,13 @@ fn step_row(ui: &mut egui::Ui, p: &Palette, n: usize, step: &Step, title: &str, 
     }
     let x = rect.left() + 44.0;
     let title_color = if matches!(step, Step::Waiting) { p.text3 } else { p.text };
-    painter.text(Pos2::new(x, rect.top() + 9.0), egui::Align2::LEFT_TOP, title, FontId::new(15.0, semibold()), title_color);
+    painter.text(Pos2::new(x, rect.top() + 5.0), egui::Align2::LEFT_TOP, title, FontId::new(14.0, semibold()), title_color);
     let detail_g = ui.fonts_mut(|f| {
         f.layout(detail.to_string(), FontId::proportional(12.5), p.text2, rect.right() - x - 8.0)
     });
-    painter.galley(Pos2::new(x, rect.top() + 30.0), detail_g, p.text2);
+    painter.galley(Pos2::new(x, rect.top() + 24.0), detail_g, p.text2);
     if let Step::Working(Some(frac)) = step {
-        let bar = Rect::from_min_size(Pos2::new(rect.right() - 170.0, rect.top() + 16.0), Vec2::new(160.0, 6.0));
+        let bar = Rect::from_min_size(Pos2::new(rect.right() - 170.0, rect.top() + 11.0), Vec2::new(160.0, 6.0));
         painter.rect_filled(bar, 3.0, p.line);
         let mut done = bar;
         done.set_width((bar.width() * frac).max(6.0));
@@ -230,29 +284,6 @@ fn step_row(ui: &mut egui::Ui, p: &Palette, n: usize, step: &Step, title: &str, 
     if !last {
         painter.hline(x..=rect.right(), rect.bottom() - 0.5, Stroke::new(1.0, p.line));
     }
-}
-
-fn tip(ui: &mut egui::Ui, p: &Palette, width: f32, icon: Icon, title: &str, text: &str) {
-    Frame::NONE
-        .fill(p.bg)
-        .stroke(Stroke::new(1.0, p.line))
-        .corner_radius(CornerRadius::same(12))
-        .inner_margin(Margin::same(12))
-        .show(ui, |ui| {
-            ui.set_width(width - 24.0);
-            ui.set_min_height(64.0);
-            // the tips sit in a row: lay each one out top to bottom
-            ui.vertical(|ui| {
-                ui.horizontal(|ui| {
-                    let (r, _) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::hover());
-                    icons::paint(ui.painter(), r, icon, p.accent);
-                    ui.add_space(4.0);
-                    ui.label(egui::RichText::new(title).size(13.5).family(semibold()).color(p.text));
-                });
-                ui.add_space(2.0);
-                ui.add(egui::Label::new(egui::RichText::new(text).size(12.0).color(p.text2)).wrap());
-            });
-        });
 }
 
 fn primary_button(ui: &mut egui::Ui, p: &Palette, text: &str) -> egui::Response {
