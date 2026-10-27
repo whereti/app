@@ -114,32 +114,38 @@ fn schema() -> (Schema, Fields) {
 impl ContentIndex {
     /// Opens the index in `dir`, creating it (or recreating it, if it was
     /// written by another format version or is damaged).
+    /// The folder also holds other files (settings, properties, vectors):
+    /// only the index's own files are ever removed. An error that may pass
+    /// (a file locked for a moment) is returned, nothing is removed: the
+    /// caller tries again later.
     pub fn open(dir: &Path) -> tantivy::Result<ContentIndex> {
         std::fs::create_dir_all(dir)?;
         let marker = dir.join("whereti-format.txt");
-        let current = std::fs::read_to_string(&marker).ok().and_then(|s| s.trim().parse::<u32>().ok());
+        let current = match std::fs::read_to_string(&marker) {
+            Ok(s) => s.trim().parse::<u32>().ok(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e.into()),
+        };
         let (schema, f) = schema();
-        let open = || -> tantivy::Result<Index> {
-            if current == Some(FORMAT) {
-                Index::open_in_dir(dir)
-            } else {
-                Err(tantivy::TantivyError::SchemaError("old format".into()))
+        if current == Some(FORMAT) {
+            match Index::open_in_dir(dir) {
+                Ok(i) if i.schema() == schema => return Self::with_index(i, f),
+                Ok(_) => {}
+                Err(e) if damaged(&e) => {}
+                Err(e) => return Err(e),
             }
-        };
-        let index = match open() {
-            Ok(i) if i.schema() == schema => i,
-            _ => {
-                // Start over: remove whatever is there.
-                for e in std::fs::read_dir(dir)?.flatten() {
-                    let p = e.path();
-                    let _ = if p.is_dir() { std::fs::remove_dir_all(&p) } else { std::fs::remove_file(&p) };
-                }
-                let i = Index::create_in_dir(dir, schema)?;
-                std::fs::write(&marker, FORMAT.to_string())?;
-                i
+        }
+        // Start over: remove the index's own files.
+        for e in std::fs::read_dir(dir)?.flatten() {
+            let p = e.path();
+            let name = e.file_name().to_string_lossy().into_owned();
+            if p.is_file() && is_index_file(&name) {
+                let _ = std::fs::remove_file(&p);
             }
-        };
-        Self::with_index(index, f)
+        }
+        let i = Index::create_in_dir(dir, schema)?;
+        std::fs::write(&marker, FORMAT.to_string())?;
+        Self::with_index(i, f)
     }
 
     /// An index in memory, for tests.
@@ -232,9 +238,27 @@ impl ContentIndex {
     }
 
     fn build_query(&self, text: &str) -> Option<Box<dyn Query>> {
-        let words: Vec<String> = tokenize(text, false).into_iter().map(|t| t.text).collect();
+        let tokens = tokenize(text, false);
+        let words: Vec<String> = tokens.iter().map(|t| t.text.clone()).collect();
         let (last, rest) = words.split_last()?;
         let term = |w: &str| Term::from_field_text(self.f.body, w);
+        // letters of a script without spaces, one after the other in the
+        // query: they must stand in this order in the text too
+        let mut runs: Vec<Vec<Term>> = Vec::new();
+        let mut prev_end: Option<usize> = None;
+        for t in &tokens {
+            let single = text[t.offset_from..t.offset_to].chars().next().is_some_and(tokenizer::unspaced);
+            if !single {
+                prev_end = None;
+                continue;
+            }
+            let joined = prev_end.is_some_and(|end| text[end..t.offset_from].chars().all(tokenizer::unspaced));
+            match runs.last_mut() {
+                Some(run) if joined => run.push(term(&t.text)),
+                _ => runs.push(vec![term(&t.text)]),
+            }
+            prev_end = Some(t.offset_to);
+        }
         let mut must: Vec<(Occur, Box<dyn Query>)> = rest
             .iter()
             .map(|w| (Occur::Must, Box::new(TermQuery::new(term(w), IndexRecordOption::WithFreqs)) as Box<dyn Query>))
@@ -248,6 +272,9 @@ impl ContentIndex {
             Box::new(TermQuery::new(term(last), IndexRecordOption::WithFreqs))
         };
         must.push((Occur::Must, last_q));
+        for run in runs.into_iter().filter(|r| r.len() > 1) {
+            must.push((Occur::Must, Box::new(PhraseQuery::new(run))));
+        }
         if words.len() > 1 {
             let phrase = PhraseQuery::new(words.iter().map(|w| term(w)).collect());
             must.push((Occur::Should, Box::new(BoostQuery::new(Box::new(phrase), 3.0))));
@@ -264,6 +291,30 @@ impl ContentIndex {
     pub fn segments(&self) -> usize {
         self.index.searchable_segment_ids().map(|s| s.len()).unwrap_or(0)
     }
+}
+
+/// The index cannot be used as it is (not a passing error): start over.
+fn damaged(e: &tantivy::TantivyError) -> bool {
+    use tantivy::directory::error::OpenReadError;
+    use tantivy::TantivyError as E;
+    matches!(
+        e,
+        E::DataCorruption(_)
+            | E::IncompatibleIndex(_)
+            | E::SchemaError(_)
+            | E::DeserializeError(_)
+            | E::FieldNotFound(_)
+            | E::OpenReadError(OpenReadError::FileDoesNotExist(_) | OpenReadError::IncompatibleIndex(_))
+    )
+}
+
+/// A file Tantivy writes (its metadata, locks and segments named by a
+/// 32-digit id) or the format marker; never anything else in the folder.
+fn is_index_file(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or("");
+    matches!(name, "meta.json" | ".managed.json" | "whereti-format.txt")
+        || (name.starts_with(".tantivy-") && name.ends_with(".lock"))
+        || (stem.len() == 32 && stem.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 fn regex_escape(word: &str) -> String {
@@ -331,8 +382,34 @@ mod tests {
         assert_eq!(idx.search("raport", 5).unwrap().total, 1);
         drop(idx);
         std::fs::write(dir.path().join("whereti-format.txt"), "0").unwrap();
+        std::fs::write(dir.path().join("photo-tags.txt"), "on\n").unwrap();
+        std::fs::write(dir.path().join("meaning.bin"), "x").unwrap();
         let idx = ContentIndex::open(dir.path()).unwrap();
         assert_eq!(idx.docs(), 0, "another format: rebuilt from scratch");
+        // the settings and other stores beside the index stay
+        assert_eq!(std::fs::read_to_string(dir.path().join("photo-tags.txt")).unwrap(), "on\n");
+        assert!(dir.path().join("meaning.bin").exists());
+    }
+
+    #[test]
+    fn only_the_index_files_are_its_own() {
+        assert!(is_index_file("meta.json") && is_index_file(".managed.json") && is_index_file(".tantivy-writer.lock"));
+        assert!(is_index_file("0123456789abcdef0123456789abcdef.idx"));
+        assert!(!is_index_file("props.txt") && !is_index_file("crash.txt") && !is_index_file("ocr-1"));
+    }
+
+    #[test]
+    fn text_without_spaces_is_found() {
+        let idx = ContentIndex::in_memory().unwrap();
+        idx.put(key('C', 1), ok(1), "東京都の天気予報は晴れです").unwrap();
+        idx.put(key('C', 2), ok(1), "大阪の天気").unwrap();
+        idx.commit().unwrap();
+        let keys = |q: &str| idx.search(q, 10).unwrap().keys.into_iter().map(|k| k.0).collect::<Vec<_>>();
+        assert_eq!(keys("東京"), [key('C', 1)]);
+        assert_eq!(keys("天気")[..].len(), 2);
+        assert_eq!(keys("天気予報"), [key('C', 1)]);
+        assert!(keys("京東").is_empty(), "the letters in the query's order");
+        assert_eq!(keys("東京 天気"), [key('C', 1)]);
     }
 
     #[test]

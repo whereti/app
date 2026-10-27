@@ -8,6 +8,9 @@
 //!   by the underscore anyway.
 //! - Very long "words" (base64, hashes, minified code) are dropped: nobody
 //!   searches for them and they would bloat the dictionary.
+//! - Scripts written without spaces (Chinese, Japanese, Thai, Lao, Khmer,
+//!   Burmese) are indexed letter by letter, each at its own position: a
+//!   query in them is then looked for as a phrase of those letters.
 
 use tantivy::tokenizer::{Token, TokenStream, Tokenizer};
 
@@ -88,6 +91,15 @@ pub fn tokenize(text: &str, split_code: bool) -> Vec<Token> {
         *position += 1;
     };
     for (i, c) in text.char_indices() {
+        if unspaced(c) {
+            if let Some(s) = start.take() {
+                flush(s, i, &mut position, &mut out, &mut folded);
+            }
+            if c.is_alphanumeric() {
+                flush(i, i + c.len_utf8(), &mut position, &mut out, &mut folded);
+            }
+            continue;
+        }
         if c.is_alphanumeric() {
             start.get_or_insert(i);
         } else if let Some(s) = start.take() {
@@ -98,6 +110,23 @@ pub fn tokenize(text: &str, split_code: bool) -> Vec<Token> {
         flush(s, text.len(), &mut position, &mut out, &mut folded);
     }
     out
+}
+
+/// A letter of a script written without spaces between words: each is a
+/// word of its own for the index.
+pub fn unspaced(c: char) -> bool {
+    matches!(c as u32,
+        0x0E00..=0x0EFF // Thai, Lao
+        | 0x1000..=0x109F // Myanmar
+        | 0x1780..=0x17FF // Khmer
+        | 0x3040..=0x30FF // Hiragana, Katakana
+        | 0x31F0..=0x31FF // Katakana extensions
+        | 0x3400..=0x4DBF // CJK extension A
+        | 0x4E00..=0x9FFF // CJK
+        | 0xF900..=0xFAFF // CJK compatibility
+        | 0xFF66..=0xFF9F // half-width Katakana
+        | 0x20000..=0x3134F // CJK extensions B-G
+    )
 }
 
 /// Byte ranges of the parts of a camelCase / PascalCase / HTTPServer word.
@@ -146,6 +175,19 @@ mod tests {
         assert_eq!(at(0), ["let"]);
         assert_eq!(at(1), ["getusername", "get", "user", "name"]);
         assert_eq!(at(2), ["httpserver2", "http", "server", "2"]);
+    }
+
+    #[test]
+    fn text_without_spaces_is_split_into_letters() {
+        assert_eq!(
+            words("東京都の天気 ok", false),
+            [(0, "東"), (1, "京"), (2, "都"), (3, "の"), (4, "天"), (5, "気"), (6, "ok")].map(|(p, w)| (p, w.to_string()))
+        );
+        // a long run is no longer one dropped "word"
+        let long = "这是一个很长的中文句子没有任何空格但是应该可以被搜索到";
+        assert_eq!(words(long, false).len(), long.chars().count());
+        // mixed with Latin letters, both sides stay words
+        assert_eq!(words("abc漢字def", false).len(), 4);
     }
 
     #[test]
