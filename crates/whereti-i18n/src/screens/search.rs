@@ -1115,7 +1115,7 @@ pub const ENTRIES: &[Entry] = &[
         it: "ricevuta",
         pl: "paragon",
         pt_br: "recibo",
-        ro: "chitanta",
+        ro: "chitanță",
     },
     Entry {
         en: "report !draft",
@@ -1126,7 +1126,7 @@ pub const ENTRIES: &[Entry] = &[
         it: "relazione !bozza",
         pl: "raport !szkic",
         pt_br: "relatório !rascunho",
-        ro: "raport !ciorna",
+        ro: "raport !ciornă",
     },
     Entry {
         en: "folder:projects",
@@ -1450,7 +1450,7 @@ pub const ENTRIES: &[Entry] = &[
     Entry {
         en: "whereti could not reach that window's address bar. Click into the window and try again.",
         note: "Brief notice: whereti could not move another app's Open/Save window because it could not reach the window's address bar.",
-        de: "whereti hat die Adressleiste dieses Fensters nicht erreicht. Klicke in das Fenster und versuche es erneut.",
+        de: "whereti hat die Adressleiste dieses Fensters nicht erreicht. Klicken Sie in das Fenster und versuchen Sie es erneut.",
         es: "whereti no pudo llegar a la barra de direcciones de esa ventana. Haz clic en la ventana e inténtalo de nuevo.",
         fr: "whereti n'a pas pu atteindre la barre d'adresse de cette fenêtre. Cliquez dans la fenêtre et réessayez.",
         it: "whereti non è riuscito a raggiungere la barra degli indirizzi di quella finestra. Fai clic nella finestra e riprova.",
@@ -1461,7 +1461,7 @@ pub const ENTRIES: &[Entry] = &[
     Entry {
         en: "Identical files: the copies you could delete to free space",
         note: "Search box > the '?' panel, what dupe: does.",
-        de: "Identische Dateien: die Kopien, die du löschen könntest, um Platz zu schaffen",
+        de: "Identische Dateien: die Kopien, die Sie löschen könnten, um Platz zu schaffen",
         es: "Archivos idénticos: las copias que podrías borrar para liberar espacio",
         fr: "Fichiers identiques : les copies que vous pourriez supprimer pour libérer de la place",
         it: "File identici: le copie che potresti eliminare per liberare spazio",

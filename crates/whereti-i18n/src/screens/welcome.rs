@@ -207,13 +207,13 @@ pub const ENTRIES: &[Entry] = &[
     Entry {
         en: "Find documents written in other words: \"rental contract\" finds the lease.",
         note: "Welcome page, optional downloads card, one line under \"Search documents by meaning\". Keep it short (one line); pick an example that works in your language.",
-        de: "Dokumente finden, die es anders formulieren: \"Mietvertrag\" findet die Wohnungsmiete.",
+        de: "Dokumente finden, die es anders formulieren: \"Mietvertrag\" findet die Mietvereinbarung.",
         es: "Encuentra documentos escritos con otras palabras: \"contrato de alquiler\" encuentra el arrendamiento.",
         fr: "Trouvez des documents écrits avec d'autres mots : \"contrat de location\" trouve le bail.",
         it: "Trova documenti scritti con altre parole: \"contratto d'affitto\" trova la locazione.",
-        pl: "Znajduj dokumenty napisane innymi słowami: \"umowa najmu\" znajdzie dzierżawę.",
+        pl: "Znajduj dokumenty napisane innymi słowami: \"umowa najmu\" znajdzie umowę z wynajmującym.",
         pt_br: "Encontre documentos escritos com outras palavras: \"contrato de aluguel\" encontra a locação.",
-        ro: "Găsește documente scrise cu alte cuvinte: \"contract de închiriere\" găsește chiria.",
+        ro: "Găsește documente scrise cu alte cuvinte: \"contract de închiriere\" găsește contractul de locațiune.",
     },
     Entry {
         en: "Each is downloaded once, from Hugging Face, and works only on your PC. Both stay in Settings, Search.",
