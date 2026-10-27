@@ -5584,6 +5584,7 @@ name = "whereti-query"
 version = "0.9.3"
 dependencies = [
  "unicode-normalization",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
