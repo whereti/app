@@ -37,7 +37,17 @@ pub struct Entry {
 
 impl Entry {
     pub fn get(&self, lang: Lang) -> &'static str {
-        let t = match lang {
+        let t = self.own(lang);
+        if t.is_empty() {
+            self.en
+        } else {
+            t
+        }
+    }
+
+    /// The text as written for that language ("" = not translated yet).
+    fn own(&self, lang: Lang) -> &'static str {
+        match lang {
             Lang::De => self.de,
             Lang::En => self.en,
             Lang::Es => self.es,
@@ -46,11 +56,6 @@ impl Entry {
             Lang::Pl => self.pl,
             Lang::PtBr => self.pt_br,
             Lang::Ro => self.ro,
-        };
-        if t.is_empty() {
-            self.en
-        } else {
-            t
         }
     }
 }
@@ -106,13 +111,16 @@ pub fn plural(en: &'static str, n: u64) -> &'static str {
 
 pub fn plural_in(lang: Lang, en: &'static str, n: u64) -> &'static str {
     let text = tr_in(lang, en);
-    // a missing translation falls back to English, with English's rules
-    let rule = if entry(en).is_some_and(|e| !e.get(lang).is_empty() && e.get(lang) != e.en) {
+    let forms: Vec<&'static str> = text.split('|').collect();
+    // the language's own rule when the text has that language's forms (a
+    // French text may read like the English one); else English's rule,
+    // as for a missing translation shown in English
+    let translated = entry(en).is_some_and(|e| !e.own(lang).is_empty());
+    let rule = if translated && forms.len() == lang.locale().plural_forms {
         lang
     } else {
         Lang::En
     };
-    let forms: Vec<&'static str> = text.split('|').collect();
     let i = form_index(rule, n).min(forms.len() - 1);
     forms[i]
 }

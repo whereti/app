@@ -162,7 +162,7 @@ fn plural_texts_have_every_form() {
     for e in all().filter(|e| e.en.contains('|')) {
         for l in Lang::ALL {
             let t = e.get(l);
-            if t == e.en && l != Lang::En {
+            if e.own(l).is_empty() {
                 continue; // not translated yet: English is shown, with its own rule
             }
             assert_eq!(
@@ -216,6 +216,9 @@ fn plural_rules() {
         forms(Pl, &[1, 2, 4, 5, 12, 14, 22, 24, 25, 0, 112, 1001]),
         [0, 1, 1, 2, 2, 2, 1, 1, 2, 2, 2, 2]
     );
+    // a French text spelled like the English one still takes French's rule
+    assert_eq!(crate::plural_in(Fr, "{n} document|{n} documents", 0), "{n} document");
+    assert_eq!(crate::plural_in(En, "{n} document|{n} documents", 0), "{n} documents");
 }
 
 #[test]
