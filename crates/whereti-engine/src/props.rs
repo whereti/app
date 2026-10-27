@@ -64,17 +64,8 @@ pub fn read(path: &Path, ext: &str, tz_offset: i32) -> Props {
 fn read_inner(path: &Path, ext: &str, tz_offset: i32) -> Props {
     let mut p = Props::default();
     if PHOTO_EXTS.contains(&ext) || RAW.contains(&ext) {
-        // the same head as the place reader (content.rs): EXIF is at the
-        // start of a JPEG; HEIC/AVIF keep it anywhere, RAW a little further in
         let raw = RAW.contains(&ext);
-        let head = if matches!(ext, "heic" | "heif" | "hif" | "avif" | "jxl") {
-            64 << 20
-        } else if raw {
-            16 << 20
-        } else {
-            512 << 10
-        };
-        if let Ok(bytes) = read_head(path, head) {
+        if let Ok(bytes) = photo_bytes(path, ext) {
             // a RAW file's first image is its small preview: its size is not the photo's
             if !raw {
                 if let Ok(size) = imagesize::blob_size(&bytes) {
@@ -105,6 +96,104 @@ fn read_head(path: &Path, max: u64) -> std::io::Result<Vec<u8>> {
     let mut buf = Vec::new();
     whereti_extract::worker::open_real(path)?.take(max).read_to_end(&mut buf)?;
     Ok(buf)
+}
+
+/// What of a photo holds its EXIF (here and for where it was taken): the
+/// start of a JPEG; HEIC/AVIF keep it anywhere, RAW a little further in. A
+/// TIFF may keep its directories at the end: those parts are read too, at
+/// their place in the bytes returned.
+pub(crate) fn photo_bytes(path: &Path, ext: &str) -> std::io::Result<Vec<u8>> {
+    let head: u64 = if matches!(ext, "heic" | "heif" | "hif" | "avif" | "jxl") {
+        64 << 20
+    } else if RAW.contains(&ext) {
+        16 << 20
+    } else {
+        512 << 10
+    };
+    let mut f = whereti_extract::worker::open_real(path)?;
+    let len = f.metadata()?.len();
+    let mut buf = Vec::new();
+    (&mut f).take(head).read_to_end(&mut buf)?;
+    if matches!(ext, "tif" | "tiff") && (buf.len() as u64) < len {
+        tiff_directories(&mut f, &mut buf, len);
+    }
+    Ok(buf)
+}
+
+/// A TIFF read past its start: no buffer larger than this.
+const MAX_SPARSE: u64 = 64 << 20;
+
+/// Reads the TIFF directories (IFD0, its EXIF and GPS directories) and
+/// the values they point to into `buf` at their offsets, when they lie
+/// past what `buf` holds (the gap stays zeros). Best effort.
+fn tiff_directories(f: &mut std::fs::File, buf: &mut Vec<u8>, len: u64) {
+    use std::io::{Seek, SeekFrom};
+    let le = match buf.get(..2) {
+        Some(b"II") => true,
+        Some(b"MM") => false,
+        _ => return,
+    };
+    let head = buf.len() as u64;
+    let u16_at = |b: &[u8], at: usize| b.get(at..at + 2).map(|v| if le { u16::from_le_bytes([v[0], v[1]]) } else { u16::from_be_bytes([v[0], v[1]]) });
+    let u32_at = |b: &[u8], at: usize| {
+        b.get(at..at + 4).map(|v| {
+            let a = [v[0], v[1], v[2], v[3]];
+            if le { u32::from_le_bytes(a) } else { u32::from_be_bytes(a) }
+        })
+    };
+    // makes sure bytes [at, at + n) are read
+    let mut ensure = |buf: &mut Vec<u8>, at: u64, n: u64| -> bool {
+        let end = at.saturating_add(n);
+        if end > len || end > MAX_SPARSE {
+            return false;
+        }
+        if end <= head {
+            return true;
+        }
+        if (buf.len() as u64) < end {
+            buf.resize(end as usize, 0);
+        }
+        let from = at.max(head);
+        f.seek(SeekFrom::Start(from)).is_ok() && f.read_exact(&mut buf[from as usize..end as usize]).is_ok()
+    };
+    let Some(first) = u32_at(buf, 4) else { return };
+    let mut queue = vec![first as u64];
+    let mut done = 0;
+    while let Some(at) = queue.pop() {
+        done += 1;
+        if done > 8 || at < 8 || !ensure(buf, at, 2) {
+            continue;
+        }
+        let n = u16_at(buf, at as usize).unwrap_or(0) as u64;
+        if n == 0 || n > 1000 || !ensure(buf, at, 2 + 12 * n + 4) {
+            continue;
+        }
+        for i in 0..n {
+            let e = (at + 2 + 12 * i) as usize;
+            let (Some(tag), Some(kind), Some(count), Some(value)) = (u16_at(buf, e), u16_at(buf, e + 2), u32_at(buf, e + 4), u32_at(buf, e + 8)) else {
+                continue;
+            };
+            // the EXIF and GPS directories
+            if matches!(tag, 0x8769 | 0x8825) {
+                queue.push(value as u64);
+            }
+            let bytes = tiff_unit(kind) * count as u64;
+            if bytes > 4 && bytes <= 64 << 10 {
+                ensure(buf, value as u64, bytes);
+            }
+        }
+    }
+}
+
+/// Bytes per value of a TIFF field type.
+fn tiff_unit(kind: u16) -> u64 {
+    match kind {
+        1 | 2 | 6 | 7 => 1,
+        3 | 8 => 2,
+        4 | 9 | 11 => 4,
+        5 | 10 | 12 => 8,
+        _ => 0,
+    }
 }
 
 /// The EXIF blocks of a photo. The usual containers (JPEG, TIFF, HEIF,
@@ -167,9 +256,13 @@ fn photo_exif(bytes: &[u8], ext: &str, tz_offset: i32, p: &mut Props) {
             _ => None,
         }
     };
-    let when = text(Tag::DateTimeOriginal).or_else(|| text(Tag::DateTimeDigitized)).or_else(|| text(Tag::DateTime));
-    if let Some(t) = when.and_then(|s| exif_minutes(&s)) {
-        p.taken = (t as i64 - tz_offset as i64).clamp(0, u32::MAX as i64) as u32;
+    // the date, and the offset from UTC the camera wrote with it (EXIF 2.31)
+    let dates = [(Tag::DateTimeOriginal, Tag::OffsetTimeOriginal), (Tag::DateTimeDigitized, Tag::OffsetTimeDigitized), (Tag::DateTime, Tag::OffsetTime)];
+    let when = dates.into_iter().find_map(|(date, offset)| Some((exif_minutes(&text(date)?)?, text(offset))));
+    if let Some((t, offset)) = when {
+        // without it: the offset this PC's time zone had on that date
+        let offset = offset.and_then(|o| utc_offset(&o)).or_else(|| local_offset_at(t)).unwrap_or(tz_offset);
+        p.taken = (t as i64 - offset as i64).clamp(0, u32::MAX as i64) as u32;
     }
     let make = text(Tag::Make).unwrap_or_default();
     let model = text(Tag::Model).unwrap_or_default();
@@ -352,6 +445,42 @@ fn exif_minutes(s: &str) -> Option<u32> {
     }
     let days = whereti_query::day_from_civil(y, mo, d);
     u32::try_from(days * 1440 + h * 60 + mi).ok()
+}
+
+/// "+02:00", "-05:30" -> minutes east of UTC.
+fn utc_offset(s: &str) -> Option<i32> {
+    let s = s.trim();
+    let sign = match s.get(..1)? {
+        "+" => 1,
+        "-" => -1,
+        _ => return None,
+    };
+    let h: i32 = s.get(1..3)?.parse().ok()?;
+    let m: i32 = s.get(4..6)?.parse().ok()?;
+    (h <= 14 && m < 60 && s.get(3..4) == Some(":")).then_some(sign * (h * 60 + m))
+}
+
+/// The offset from UTC (minutes east) of this PC's time zone at a local
+/// time (minutes since 1601): summer or winter time as on that date.
+fn local_offset_at(local: u32) -> Option<i32> {
+    use windows_sys::Win32::Foundation::{FILETIME, SYSTEMTIME};
+    use windows_sys::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToFileTime, TzSpecificLocalTimeToSystemTime};
+    let ticks = local as u64 * 600_000_000;
+    let ft = FILETIME { dwLowDateTime: ticks as u32, dwHighDateTime: (ticks >> 32) as u32 };
+    // SAFETY: zeroed POD out-parameters; null is the current time zone
+    unsafe {
+        let mut st: SYSTEMTIME = std::mem::zeroed();
+        let mut utc: SYSTEMTIME = std::mem::zeroed();
+        let mut out: FILETIME = std::mem::zeroed();
+        if FileTimeToSystemTime(&ft, &mut st) == 0
+            || TzSpecificLocalTimeToSystemTime(std::ptr::null(), &st, &mut utc) == 0
+            || SystemTimeToFileTime(&utc, &mut out) == 0
+        {
+            return None;
+        }
+        let utc_min = (((out.dwHighDateTime as u64) << 32 | out.dwLowDateTime as u64) / 600_000_000) as i64;
+        Some((local as i64 - utc_min) as i32)
+    }
 }
 
 fn media(path: &Path, p: &mut Props) {
@@ -584,6 +713,58 @@ mod tests {
     fn exif_dates() {
         assert_eq!(exif_minutes("0000:00:00 00:00:00"), None);
         assert!(exif_minutes("2025:08:14 18:30:05").is_some());
+        assert_eq!(utc_offset("+02:00"), Some(120));
+        assert_eq!(utc_offset("-05:30"), Some(-330));
+        assert_eq!(utc_offset("   :  "), None);
+        // this PC's offset on a date: at most 14 hours
+        let off = local_offset_at(exif_minutes("2025:01:15 12:00:00").unwrap()).unwrap();
+        assert!(off.abs() <= 14 * 60);
+    }
+
+    /// A little-endian TIFF whose directories lie after `gap` bytes of
+    /// pixels: IFD0 (Model, the EXIF directory) and the EXIF directory
+    /// (DateTimeOriginal, OffsetTimeOriginal).
+    fn tiff_with_directories_at(gap: u32) -> Vec<u8> {
+        let mut b = b"II*\0".to_vec();
+        b.extend(gap.to_le_bytes());
+        b.resize(gap as usize, 0);
+        let entry = |b: &mut Vec<u8>, tag: u16, kind: u16, count: u32, value: u32| {
+            b.extend(tag.to_le_bytes());
+            b.extend(kind.to_le_bytes());
+            b.extend(count.to_le_bytes());
+            b.extend(value.to_le_bytes());
+        };
+        // IFD0: 2 entries, then the next-IFD offset (none)
+        let ifd0 = gap;
+        let exif_ifd = ifd0 + 2 + 2 * 12 + 4;
+        let model_at = exif_ifd + 2 + 2 * 12 + 4;
+        let date_at = model_at + 9;
+        let offset_at = date_at + 20;
+        b.extend(2u16.to_le_bytes());
+        entry(&mut b, 0x0110, 2, 9, model_at);
+        entry(&mut b, 0x8769, 4, 1, exif_ifd);
+        b.extend(0u32.to_le_bytes());
+        b.extend(2u16.to_le_bytes());
+        entry(&mut b, 0x9003, 2, 20, date_at);
+        entry(&mut b, 0x9011, 2, 7, offset_at);
+        b.extend(0u32.to_le_bytes());
+        b.extend(b"Camera X\0");
+        b.extend(b"2024:05:01 10:00:00\0");
+        b.extend(b"+03:00\0");
+        b
+    }
+
+    #[test]
+    fn a_tiff_with_its_directories_at_the_end_is_read() {
+        let dir = std::env::temp_dir().join(format!("whereti-tiff-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("scan.tif");
+        std::fs::write(&path, tiff_with_directories_at(2 << 20)).unwrap();
+        let p = read(&path, "tif", 0);
+        assert_eq!(p.camera, "Camera X");
+        // 10:00 at +03:00 is 07:00 UTC, whatever this PC's time zone
+        assert_eq!(p.taken, exif_minutes("2024:05:01 07:00:00").unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -1254,15 +1254,7 @@ fn place_text(path: &Path, ext: &str) -> Option<String> {
     if !PHOTO_EXTS.contains(&ext) && !raw {
         return None;
     }
-    // EXIF is at the start of a JPEG; a HEIC keeps it anywhere in the file
-    let head = if matches!(ext, "heic" | "heif" | "hif" | "avif" | "jxl") {
-        64 << 20
-    } else if raw {
-        16 << 20
-    } else {
-        512 << 10
-    };
-    let bytes = read_head(path, head).ok()?;
+    let bytes = crate::props::photo_bytes(path, ext).ok()?;
     let (lat, lon) = whereti_places::gps(&bytes)?;
     let place = whereti_places::place_of(lat, lon)?;
     Some(format!("{}\n{}", place.label(), place.search_text()))
