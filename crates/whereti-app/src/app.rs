@@ -461,6 +461,7 @@ impl WheretiApp {
         self.file_dialog = None;
         // thumbnails are memory: made again when the grid is shown again
         self.thumbs.clear();
+        self.file_icons.trim();
         ctx.send_viewport_cmd(ViewportCommand::Visible(false));
         self.visible = false;
         // A focused text field blinks its cursor, which wakes the app twice a

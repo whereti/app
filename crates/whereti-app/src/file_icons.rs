@@ -23,6 +23,8 @@ use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, GetIconInfo, HICON, I
 
 /// New icons fetched per frame.
 const PER_FRAME: usize = 6;
+/// Icons kept while the window is hidden.
+const MAX_KEPT: usize = 2000;
 
 pub struct FileIcons {
     cache: HashMap<String, Option<TextureHandle>>,
@@ -40,6 +42,14 @@ impl FileIcons {
     /// Call once per frame.
     pub fn begin_frame(&mut self) {
         self.fetched_this_frame = 0;
+    }
+
+    /// Called when the window hides: programs' own icons are kept per file,
+    /// so after weeks in the tray the cache would only grow.
+    pub fn trim(&mut self) {
+        if self.cache.len() > MAX_KEPT {
+            self.cache.clear();
+        }
     }
 
     /// The icon for `path`; `None` while not fetched yet (or none exists).

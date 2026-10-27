@@ -1011,7 +1011,7 @@ fn shortcut(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
         } else {
             if button(ui, p, tr("Change"), false).clicked() {
                 app.settings.recording = true;
-                if let Some(t) = &app.tray {
+                if let Some(t) = &mut app.tray {
                     t.pause_hotkey(true);
                 }
             }
@@ -1066,7 +1066,7 @@ fn shortcut(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
 
 pub(crate) fn stop_recording(app: &mut WheretiApp) {
     app.settings.recording = false;
-    if let Some(t) = &app.tray {
+    if let Some(t) = &mut app.tray {
         t.pause_hotkey(false);
     }
 }

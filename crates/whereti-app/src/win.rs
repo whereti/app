@@ -248,7 +248,7 @@ pub fn copy_file(path: &str) -> Result<(), String> {
 use windows::core::BOOL;
 use windows::Win32::Foundation::WPARAM as WP;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, VIRTUAL_KEY, VK_MENU,
+    SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, VIRTUAL_KEY, VK_CONTROL,
     VK_RETURN,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -370,9 +370,10 @@ pub fn jump(d: &FileDialog, folder: &str) -> Result<(), String> {
         let _ = SetForeground(d.dialog);
     }
     wait(150);
-    // Alt+D puts the keyboard in the address bar, as in Explorer
-    let d_key = VIRTUAL_KEY(b'D' as u16);
-    let keys = [key(VK_MENU, false), key(d_key, false), key(d_key, true), key(VK_MENU, true)];
+    // Ctrl+L puts the keyboard in the address bar, as in Explorer. Not Alt+D:
+    // in some languages Alt+D is a button's shortcut (Open, Save) instead.
+    let l_key = VIRTUAL_KEY(b'L' as u16);
+    let keys = [key(VK_CONTROL, false), key(l_key, false), key(l_key, true), key(VK_CONTROL, true)];
     // SAFETY: four well-formed keyboard inputs.
     unsafe { SendInput(&keys, std::mem::size_of::<INPUT>() as i32) };
     // only once the address bar really has the keyboard

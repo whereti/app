@@ -97,6 +97,11 @@ pub fn label_for(key: egui::Key, m: egui::Modifiers) -> Option<String> {
         return None;
     }
     let &(_, name, _) = KEYS.iter().find(|k| k.0 == key)?;
+    // Ctrl+Alt is AltGr on many keyboards: Ctrl+Alt+E would take ę or €
+    // from everyone typing them
+    if m.ctrl && m.alt && !m.shift && name.chars().count() == 1 && name.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return None;
+    }
     let mut label = String::new();
     for (on, text) in [(m.ctrl, "Ctrl+"), (m.alt, "Alt+"), (m.shift, "Shift+")] {
         if on {
@@ -165,9 +170,15 @@ impl Tray {
 
     /// While a new shortcut is typed in Settings the old one must not
     /// fire (it would hide the window).
-    pub fn pause_hotkey(&self, paused: bool) {
+    pub fn pause_hotkey(&mut self, paused: bool) {
         if let (Some(m), Some(k)) = (&self.manager, self.registered) {
-            let _ = if paused { m.unregister(k) } else { m.register(k) };
+            if paused {
+                let _ = m.unregister(k);
+            } else if m.register(k).is_err() {
+                // another app took it meanwhile: say there is none
+                self.registered = None;
+                self.hotkey = None;
+            }
         }
     }
 }
