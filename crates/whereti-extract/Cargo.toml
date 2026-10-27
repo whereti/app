@@ -14,7 +14,7 @@ outlook-pst = "1.2.0"
 mail-parser = { version = "0.11.9", features = ["full_encoding"] }
 pdf-extract = "0.12.1"
 quick-xml = "0.42.0"
-whereti-query = { version = "0.9.3", path = "../whereti-query" }
+whereti-query = { version = "0.9.4", path = "../whereti-query" }
 sevenz-rust2 = { version = "0.24.1", default-features = false }
 tokenizers = { version = "0.22.2", default-features = false, features = ["fancy-regex"] }
 ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "load-dynamic", "api-31"] }
