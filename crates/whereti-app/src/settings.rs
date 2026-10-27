@@ -841,7 +841,7 @@ fn support(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
                             Some(tr("This does not look like a whereti key. Copy all of it, from WHERETI- to the end.").into())
                     }
                     Err(crate::license::LicenseError::BadSignature) => {
-                        app.settings.license_error = Some(tr("This key is not valid. Write to contact@whereti.com and we will sort it out.").into())
+                        app.settings.license_error = Some(tr("This key is not valid. Write to contact@softwarehive.ro and we will sort it out.").into())
                     }
                 }
             }
