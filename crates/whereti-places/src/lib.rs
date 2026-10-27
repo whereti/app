@@ -146,6 +146,33 @@ fn km(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
     2.0 * 6371.0 * a.sqrt().asin()
 }
 
+/// Rings of cells looked at, at most (near the poles a cell is only a few
+/// km wide).
+const MAX_RING: i16 = 60;
+
+/// How far (km) the cells up to `ring` around the cell at `clat` surely
+/// reach from any point of it. A place `d` km away is at most d/111
+/// degrees of latitude off, so `ring` covers it in latitude while
+/// d <= ring x 111, and in longitude while d <= ring x (a degree of
+/// longitude at the farthest latitude it can have): the largest such d.
+fn ring_reach(clat: i16, ring: i16) -> f64 {
+    let pole_side = (clat as f64).abs().max((clat as f64 + 1.0).abs());
+    let fits = |d: f64| {
+        let lat = (pole_side + d / 111.0).min(89.9);
+        d <= ring as f64 * 111.0 && d <= ring as f64 * 111.0 * lat.to_radians().cos()
+    };
+    let (mut lo, mut hi) = (0.0, ring as f64 * 111.0);
+    for _ in 0..30 {
+        let mid = (lo + hi) / 2.0;
+        if fits(mid) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
+}
+
 /// The town, region and country at a position.
 pub fn place_of(lat: f64, lon: f64) -> Option<Place> {
     if !(-90.0..=90.0).contains(&lat) || !(-180.0..=180.0).contains(&lon) {
@@ -155,9 +182,9 @@ pub fn place_of(lat: f64, lon: f64) -> Option<Place> {
     let (clat, clon) = cell(lat, lon);
     // (distance to the place's edge, to its centre, which)
     let mut best: Option<(f64, f64, u32)> = None;
-    // the cells around, wider until something is found (a degree of
-    // longitude is narrow near the poles, so look at least two rings out)
-    for ring in 0..=4i16 {
+    // the cells around, wider until something is found; a degree of
+    // longitude is narrow far from the equator, so more rings there
+    for ring in 0..=MAX_RING {
         for dlat in -ring..=ring {
             for dlon in -ring..=ring {
                 if dlat.abs() != ring && dlon.abs() != ring {
@@ -180,7 +207,8 @@ pub fn place_of(lat: f64, lon: f64) -> Option<Place> {
             }
         }
         // a nearer place cannot be further out than this ring reaches
-        if best.is_some_and(|b| b.0 + 20.0 < ring as f64 * 100.0) && ring >= 1 {
+        let reach = ring_reach(clat, ring);
+        if ring >= 1 && (best.is_some_and(|b| b.0 + 20.0 < reach) || reach > REGION_KM + 20.0) {
             break;
         }
     }
@@ -261,6 +289,18 @@ mod tests {
         // near the date line, and in the south and west
         assert!(place_of(-36.8485, 174.7633).unwrap().label().contains("New Zealand"));
         assert!(place_of(-22.9068, -43.1729).unwrap().label().contains("Brazil"));
+    }
+
+    #[test]
+    fn rings_reach_less_far_from_the_equator() {
+        // near the equator a ring is a degree: ~111 km
+        assert!((ring_reach(0, 1) - 111.0).abs() < 2.0);
+        // in the north of Norway a degree of longitude is ~40 km
+        let north = ring_reach(69, 2);
+        assert!(north > 40.0 && north < 100.0, "{north}");
+        assert!(ring_reach(69, 20) > 300.0);
+        // the nearest town is found far in the north too (Tromsø)
+        assert!(place_of(69.65, 18.96).unwrap().label().contains("Norway"));
     }
 
     #[test]
