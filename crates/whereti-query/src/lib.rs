@@ -4,10 +4,13 @@
 //! raport 2024            AND (both in the name)
 //! raport | factura       OR          !tmp      NOT
 //! "nume exact.txt"       literal     *.pdf     wildcard (whole name)
-//! ext:pdf;docx           size:>10mb  size:1kb..1mb  size:large
-//! dm:today  dm:lastweek  dm:2024-01..2024-06
+//! ext:pdf;docx           size:>10mb  size:1kb..1mb  size:10mb..  size:large
+//! dm:today  dm:lastweek  dm:2024-01..2024-06  dm:2024..
 //! path:D:\proiecte       proiecte\whereti (a backslash means "match the path")
-//! folder:  file:         regex:^IMG_\d{4}\.jpg$
+//! C:\Users  D:           a drive letter is a path, not c: (content)
+//! D:\poze\*.jpg          folders as a path, the last part as a wildcard
+//! folder:  file:         regex:^IMG_\d{4}\.jpg$   regex:^(IMG|DSC)_
+//!                        (a | inside regex: is part of it; quote spaces)
 //! taken:2025-08  camera:canon  width:>4000  height:<1000
 //! artist:queen  album:abbey  duration:>5m  author:popescu
 //! mine:                  only the user's own files: no system, hidden,
@@ -100,29 +103,48 @@ impl Query {
 pub fn parse(input: &str, ctx: &DateCtx) -> Query {
     let mut query = Query::default();
     let mut join_next = false;
+    let mut negate_next = false;
     for token in lex(input) {
         if token.alternatives.len() == 1 && token.alternatives[0].is_bare_pipe() {
             join_next = !query.clauses.is_empty();
             continue;
         }
-        let mut negated = false;
+        // a lone `!` negates the next word: `! tmp` = `!tmp`
+        if token.alternatives.len() == 1 && token.alternatives[0].is_bare_bang() {
+            negate_next = true;
+            continue;
+        }
+        let mut negated = std::mem::take(&mut negate_next);
         let mut terms = Vec::new();
+        // A clause is OR-ed terms or a negated OR, so `a | !b` cannot be
+        // said exactly: the negated part is kept as its own `!b` clause
+        // (a AND NOT b, a narrower result than a OR NOT b).
+        let mut negated_alts = Vec::new();
         for (i, mut alt) in token.alternatives.into_iter().enumerate() {
-            if i == 0 && alt.quote_at != Some(0) && alt.text.starts_with('!') {
-                negated = true;
+            let bang = alt.quote_at != Some(0) && alt.text.len() > 1 && alt.text.starts_with('!');
+            if bang {
                 alt.text.remove(0);
                 alt.quote_at = alt.quote_at.map(|q| q - 1);
             }
-            if let Some(t) = parse_alternative(&alt, ctx) {
+            let Some(t) = parse_alternative(&alt, ctx) else { continue };
+            if bang && i > 0 {
+                negated_alts.push(t);
+            } else {
+                negated |= bang;
                 terms.push(t);
             }
         }
-        if terms.is_empty() {
+        if terms.is_empty() && negated_alts.is_empty() {
             continue;
         }
-        match query.clauses.last_mut() {
-            Some(last) if join_next && !last.negated && !negated => last.any_of.extend(terms),
-            _ => query.clauses.push(Clause { negated, any_of: terms }),
+        if !terms.is_empty() {
+            match query.clauses.last_mut() {
+                Some(last) if join_next && !last.negated && !negated => last.any_of.extend(terms),
+                _ => query.clauses.push(Clause { negated, any_of: terms }),
+            }
+        }
+        for t in negated_alts {
+            query.clauses.push(Clause { negated: true, any_of: vec![t] });
         }
         join_next = false;
     }
@@ -143,6 +165,17 @@ impl Alt {
     fn is_bare_pipe(&self) -> bool {
         self.pipe_only
     }
+
+    fn is_bare_bang(&self) -> bool {
+        self.text == "!" && self.quote_at.is_none()
+    }
+
+    /// Inside a `regex:` value a `|` belongs to the expression
+    /// (`regex:^(IMG|DSC)_`); a space still needs quotes (`regex:"a b"`).
+    fn in_regex(&self) -> bool {
+        let t = self.text.strip_prefix('!').unwrap_or(&self.text);
+        self.quote_at != Some(0) && t.get(..6).is_some_and(|p| p.eq_ignore_ascii_case("regex:"))
+    }
 }
 
 struct Token {
@@ -155,32 +188,42 @@ fn lex(input: &str) -> Vec<Token> {
     let mut cur = Alt::default();
     let mut in_quotes = false;
     let mut saw_any = false;
+    // the word ended with `|`: `raport| factura` joins like `raport | factura`
+    let mut ends_with_pipe = false;
+    let pipe = || Token { alternatives: vec![Alt { pipe_only: true, ..Default::default() }] };
     for c in input.chars() {
         match c {
             '"' => {
                 in_quotes = !in_quotes;
                 cur.quote_at.get_or_insert(cur.text.len());
                 saw_any = true;
+                ends_with_pipe = false;
             }
             c if c.is_whitespace() && !in_quotes => {
                 if saw_any {
                     alts.push(std::mem::take(&mut cur));
                     tokens.push(Token { alternatives: std::mem::take(&mut alts) });
+                    if ends_with_pipe {
+                        tokens.push(pipe());
+                    }
                     saw_any = false;
                 }
+                ends_with_pipe = false;
             }
-            '|' if !in_quotes => {
+            '|' if !in_quotes && !cur.in_regex() => {
                 if !saw_any && alts.is_empty() {
                     // standalone `|` between two words
-                    tokens.push(Token { alternatives: vec![Alt { pipe_only: true, ..Default::default() }] });
+                    tokens.push(pipe());
                 } else {
                     alts.push(std::mem::take(&mut cur));
                     saw_any = true;
+                    ends_with_pipe = true;
                 }
             }
             c => {
                 cur.text.push(c);
                 saw_any = true;
+                ends_with_pipe = false;
             }
         }
     }
@@ -208,8 +251,14 @@ fn parse_alternative(alt: &Alt, ctx: &DateCtx) -> Option<Term> {
         let prefix = text[..colon].to_ascii_lowercase();
         let value = &text[colon + 1..];
         let value_quoted = alt.quote_at.is_some();
-        if let Some(t) = parse_function(&prefix, value, value_quoted, ctx) {
-            return Some(t);
+        // `C:\Users`, `c:/x`, `D:`: a drive, not `c:` (content)
+        let drive = colon == 1
+            && text.as_bytes()[0].is_ascii_alphabetic()
+            && (value.is_empty() || value.starts_with(['\\', '/']));
+        if !drive {
+            if let Some(t) = parse_function(&prefix, value, value_quoted, ctx) {
+                return Some(t);
+            }
         }
     }
     if alt.quote_at == Some(0) {
@@ -219,8 +268,15 @@ fn parse_alternative(alt: &Alt, ctx: &DateCtx) -> Option<Term> {
 }
 
 fn plain_term(text: &str) -> Term {
-    if text.contains(['\\', '/']) {
-        path_term(text)
+    if text.len() == 2 && text.as_bytes()[0].is_ascii_alphabetic() && text.ends_with(':') {
+        // `D:` alone: everything on that drive
+        Term::Path(fold(text))
+    } else if text.contains(['\\', '/']) {
+        if text.contains(['*', '?']) {
+            path_glob(text)
+        } else {
+            path_term(text)
+        }
     } else if text.contains(['*', '?']) {
         Term::Glob(fold(text))
     } else {
@@ -232,15 +288,57 @@ fn path_term(text: &str) -> Term {
     Term::Path(fold(&text.replace('/', "\\")))
 }
 
+/// `D:\poze\*.jpg`: the folders as a path (`d:\poze\`, so its subfolders
+/// too) and the last part as a whole-name wildcard. A folder with a
+/// wildcard is left out: `d:\*\vacanta\*.jpg` is `*.jpg` somewhere under
+/// `d:\` and under a folder named `vacanta`.
+fn path_glob(text: &str) -> Term {
+    let folded = fold(&text.replace('/', "\\"));
+    let folded = folded.trim_end_matches('\\');
+    let (head, last) = folded.rsplit_once('\\').unwrap_or(("", folded));
+    let mut terms = Vec::new();
+    // runs of folders without wildcards; the first one anchors at the start
+    let mut run: Vec<&str> = Vec::new();
+    let mut first = true;
+    let parts = if head.is_empty() { Vec::new() } else { head.split('\\').collect() };
+    for part in parts.into_iter().map(Some).chain([None]) {
+        match part {
+            Some(p) if !p.contains(['*', '?']) => run.push(p),
+            _ => {
+                let joined = run.join("\\");
+                if !joined.is_empty() {
+                    terms.push(Term::Path(if first { format!("{joined}\\") } else { format!("\\{joined}\\") }));
+                }
+                run.clear();
+                first = false;
+            }
+        }
+    }
+    terms.push(Term::Glob(last.to_string()));
+    if terms.len() == 1 {
+        terms.remove(0)
+    } else {
+        Term::All(terms)
+    }
+}
+
 fn parse_function(prefix: &str, value: &str, quoted: bool, ctx: &DateCtx) -> Option<Term> {
     match prefix {
-        "ext" => Some(Term::Ext(
-            value
+        "ext" => {
+            // `ext:pdf;` is pdf only; `ext:` alone means "no extension"
+            let mut exts: Vec<String> = value
                 .split([';', ','])
                 .map(|e| fold(e.trim().trim_start_matches('.')))
-                .collect(),
-        )),
-        "path" if !value.is_empty() => Some(path_term(value)),
+                .filter(|e| !e.is_empty())
+                .collect();
+            if exts.is_empty() {
+                exts.push(String::new());
+            }
+            Some(Term::Ext(exts))
+        }
+        "path" if !value.is_empty() => {
+            Some(if !quoted && value.contains(['*', '?']) { path_glob(value) } else { path_term(value) })
+        }
         "size" => parse_size(value).map(|(min, max)| Term::Size { min, max }),
         "dm" | "datemodified" => date::parse_range(value, ctx).map(|(min, max)| Term::Modified { min, max }),
         "regex" if !value.is_empty() => Some(Term::Regex(value.to_string())),
@@ -367,14 +465,24 @@ fn parse_size(v: &str) -> Option<(u64, u64)> {
         return named;
     }
     if let Some((a, b)) = v.split_once("..") {
-        let (lo, _) = size_value(a)?;
-        let (hi, unit) = size_value(b)?;
-        let hi = hi.saturating_add(unit.saturating_sub(1));
+        // `10mb..` and `..10mb` are open ends
+        if a.trim().is_empty() && b.trim().is_empty() {
+            return None;
+        }
+        let lo = if a.trim().is_empty() { 0 } else { size_value(a)?.0 };
+        let hi = if b.trim().is_empty() {
+            u64::MAX
+        } else {
+            // an upper bound covers its last digit, or a tenth of the unit
+            // for a whole number (`..5mb` = up to what shows as "5.0 MB")
+            let (n, unit, decimals) = size_value(b)?;
+            n.saturating_add(step(unit, decimals.max(1)) - 1)
+        };
         return (lo <= hi).then_some((lo, hi));
     }
     for op in [">=", "<=", ">", "<", "="] {
         if let Some(rest) = v.strip_prefix(op) {
-            let (n, _) = size_value(rest)?;
+            let (n, _, _) = size_value(rest)?;
             return Some(match op {
                 ">=" => (n, u64::MAX),
                 "<=" => (0, n),
@@ -384,15 +492,23 @@ fn parse_size(v: &str) -> Option<(u64, u64)> {
             });
         }
     }
-    let (n, unit) = size_value(&v)?;
-    Some((n, n.saturating_add(unit.saturating_sub(1))))
+    // "5mb" is roughly 5 MB (5.0 to 5.99 MB); "1.5gb" is 1.5 to 1.59 GB
+    let (n, unit, decimals) = size_value(&v)?;
+    Some((n, n.saturating_add(step(unit, decimals) - 1)))
 }
 
-/// Parses "10mb" / "1.5 GB" / "300" -> (bytes, unit size).
-fn size_value(s: &str) -> Option<(u64, u64)> {
+/// The size one step of the last digit stands for: a whole unit, or a
+/// tenth of it after one decimal, and so on (at least one byte).
+fn step(unit: u64, decimals: u32) -> u64 {
+    (unit / 10u64.saturating_pow(decimals)).max(1)
+}
+
+/// Parses "10mb" / "1.5 GB" / "300" -> (bytes, unit size, decimals typed).
+fn size_value(s: &str) -> Option<(u64, u64, u32)> {
     let s = s.trim();
     let split = s.find(|c: char| !(c.is_ascii_digit() || c == '.')).unwrap_or(s.len());
     let (num, unit) = s.split_at(split);
+    let decimals = num.split_once('.').map_or(0, |(_, f)| f.len() as u32);
     let num: f64 = num.parse().ok()?;
     let unit_size = match unit.trim() {
         "" | "b" => 1,
@@ -405,7 +521,7 @@ fn size_value(s: &str) -> Option<(u64, u64)> {
     if !num.is_finite() || num < 0.0 {
         return None;
     }
-    Some(((num * unit_size as f64) as u64, unit_size))
+    Some(((num * unit_size as f64) as u64, unit_size, decimals))
 }
 
 #[cfg(test)]
@@ -474,12 +590,127 @@ mod tests {
     fn sizes() {
         assert_eq!(parse_size(">10mb"), Some((10 * MB + 1, u64::MAX)));
         assert_eq!(parse_size("<1kb"), Some((0, 1023)));
-        assert_eq!(parse_size("1kb..1mb"), Some((KB, 2 * MB - 1)));
+        // an upper bound reaches a tenth of its unit past the value, not a whole unit
+        assert_eq!(parse_size("1kb..1mb"), Some((KB, MB + MB / 10 - 1)));
+        assert_eq!(parse_size("1kb..1.25mb"), Some((KB, MB + MB / 4 + MB / 100 - 1)));
+        assert_eq!(parse_size("..300"), Some((0, 300)));
+        // a bare whole number is roughly that size, a fraction is tighter
         assert_eq!(parse_size("10mb"), Some((10 * MB, 11 * MB - 1)));
-        assert_eq!(parse_size("1.5gb"), Some((GB + GB / 2, GB + GB / 2 + GB - 1)));
+        assert_eq!(parse_size("1.5gb"), Some((GB + GB / 2, GB + GB / 2 + GB / 10 - 1)));
+        assert_eq!(parse_size("300"), Some((300, 300)));
         assert_eq!(parse_size("large"), Some((MB, 16 * MB - 1)));
         assert_eq!(parse_size("<0"), None);
         assert_eq!(parse_size("-5mb"), None);
+    }
+
+    #[test]
+    fn open_ended_sizes() {
+        assert_eq!(parse_size("10mb.."), Some((10 * MB, u64::MAX)));
+        assert_eq!(parse_size("..10mb"), Some((0, 10 * MB + MB / 10 - 1)));
+        assert_eq!(parse_size(".."), None);
+        assert_eq!(one("size:1gb.."), Term::Size { min: GB, max: u64::MAX });
+    }
+
+    #[test]
+    fn drive_letters_are_paths_not_content() {
+        assert_eq!(one(r"C:\Users\ana\Documents"), Term::Path(r"c:\users\ana\documents".into()));
+        assert_eq!(one(r"c:\windows"), Term::Path(r"c:\windows".into()));
+        assert_eq!(one("c:/windows"), Term::Path(r"c:\windows".into()));
+        assert_eq!(one("c:"), Term::Path("c:".into()));
+        assert_eq!(one("D:"), Term::Path("d:".into()));
+        assert_eq!(one(r#""C:\Program Files""#), Term::Path(r"c:\program files".into()));
+        // still content when a word follows
+        assert_eq!(one("c:factura"), Term::Content("factura".into()));
+        assert_eq!(one("content:raport"), Term::Content("raport".into()));
+    }
+
+    #[test]
+    fn a_bar_at_either_end_of_a_word_still_means_or() {
+        for s in ["raport| factura", "raport |factura", "raport | factura", "raport|factura"] {
+            let c = q(s);
+            assert_eq!(c.len(), 1, "{s}: {c:?}");
+            assert_eq!(c[0].any_of, vec![Term::Text("raport".into()), Term::Text("factura".into())], "{s}");
+        }
+        let c = q("raport| factura 2024");
+        assert_eq!(c.len(), 2);
+    }
+
+    #[test]
+    fn a_bar_inside_a_regex_belongs_to_it() {
+        assert_eq!(one(r"regex:^(IMG|DSC)_\d+"), Term::Regex(r"^(IMG|DSC)_\d+".into()));
+        assert_eq!(one(r"REGEX:a|b"), Term::Regex("a|b".into()));
+        assert_eq!(one(r#"regex:"^a b|c""#), Term::Regex("^a b|c".into()));
+        let c = q(r"!regex:^(a|b)$");
+        assert!(c[0].negated);
+        assert_eq!(c[0].any_of, vec![Term::Regex("^(a|b)$".into())]);
+        // a standalone bar still joins a regex with a word
+        let c = q("regex:^x | raport");
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].any_of.len(), 2);
+    }
+
+    #[test]
+    fn wildcards_in_a_path() {
+        assert_eq!(
+            one(r"D:\poze\*.jpg"),
+            Term::All(vec![Term::Path(r"d:\poze\".into()), Term::Glob("*.jpg".into())])
+        );
+        assert_eq!(
+            one("poze/IMG_????.jpg"),
+            Term::All(vec![Term::Path(r"poze\".into()), Term::Glob("img_????.jpg".into())])
+        );
+        assert_eq!(
+            one(r"path:D:\poze\*.jpg"),
+            Term::All(vec![Term::Path(r"d:\poze\".into()), Term::Glob("*.jpg".into())])
+        );
+        assert_eq!(
+            one(r"d:\*\vacanta\*.jpg"),
+            Term::All(vec![
+                Term::Path(r"d:\".into()),
+                Term::Path(r"\vacanta\".into()),
+                Term::Glob("*.jpg".into())
+            ])
+        );
+        assert_eq!(one(r"*\*.jpg"), Term::Glob("*.jpg".into()));
+        assert_eq!(
+            one(r"\poze\*"),
+            Term::All(vec![Term::Path(r"\poze\".into()), Term::Glob("*".into())])
+        );
+        // quoted: literal
+        assert_eq!(one(r#"path:"D:\a*b""#), Term::Path(r"d:\a*b".into()));
+    }
+
+    #[test]
+    fn empty_extensions_are_dropped() {
+        assert_eq!(one("ext:pdf;"), Term::Ext(vec!["pdf".into()]));
+        assert_eq!(one("ext:;pdf,,docx"), Term::Ext(vec!["pdf".into(), "docx".into()]));
+        assert_eq!(one("ext:"), Term::Ext(vec![String::new()]));
+    }
+
+    #[test]
+    fn negation_next_to_a_bar() {
+        // a lone `!` negates the next word
+        let c = q("a | ! b");
+        assert_eq!(c.len(), 2, "{c:?}");
+        assert!(!c[0].negated && c[1].negated);
+        assert_eq!(c[1].any_of, vec![Term::Text("b".into())]);
+        let c = q("! tmp raport");
+        assert!(c[0].negated);
+        assert!(!c[1].negated);
+        // `a | !b` and `a|!b` cannot be one OR clause: a AND NOT b, never "!b" as text
+        for s in ["a | !b", "a|!b"] {
+            let c = q(s);
+            assert_eq!(c.len(), 2, "{s}: {c:?}");
+            assert_eq!(c[0], Clause { negated: false, any_of: vec![Term::Text("a".into())] });
+            assert_eq!(c[1], Clause { negated: true, any_of: vec![Term::Text("b".into())] });
+        }
+        // `!a|b` negates the whole group, as before
+        let c = q("!a|b");
+        assert_eq!(c.len(), 1);
+        assert!(c[0].negated);
+        assert_eq!(c[0].any_of.len(), 2);
+        // a lone `!` at the end is ignored
+        assert_eq!(q("raport !").len(), 1);
     }
 
     #[test]
