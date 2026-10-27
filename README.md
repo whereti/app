@@ -42,7 +42,8 @@ you work, your past searches: all of it stays on your PC, and every switch in
 Settings that learns something also forgets it. The only connections it makes:
 one update check a day (sending only its version number, can be turned off),
 and, only if you turn them on, a one-time download of the photo model and of
-the search-by-meaning model from Hugging Face. No accounts, no telemetry, no
+the search-by-meaning model from Hugging Face (or, if that fails, from an
+unchanged copy in this repository's `models-1` release). No accounts, no telemetry, no
 ads.
 
 ## How it is built

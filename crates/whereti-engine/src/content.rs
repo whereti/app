@@ -128,6 +128,37 @@ const MODEL_FILE: &str = "clip-vit-b32-vision-int8.onnx";
 const MODEL_URL: &str = "https://huggingface.co/Xenova/clip-vit-base-patch32/resolve/d15189d7028b43f1d3e65039190477f6af591c2a/onnx/vision_model_quantized.onnx";
 const MODEL_SHA256: &str = "583fd1110a514667812fee7d684952aaf82a99b959760c8d7dca7e0ab9839299";
 const MODEL_SIZE: u64 = 89_117_001;
+/// An unchanged copy of the optional models (whereti/app, release
+/// `models-1`), used only when Hugging Face cannot give a file: the maker
+/// may take a model down, or a network may block huggingface.co. A file is
+/// kept only if its size and SHA-256 match, wherever it came from.
+pub(crate) const MODELS_COPY: &str = "https://github.com/whereti/app/releases/download/models-1/";
+
+/// Downloads a model file from `urls` in order: the first copy with the
+/// right size and SHA-256 wins. `progress` gets the bytes of the current try.
+pub(crate) fn fetch_model(
+    urls: &[String],
+    agent: &str,
+    size: u64,
+    sha256: &str,
+    progress: &mut dyn FnMut(u64),
+) -> Result<Vec<u8>, String> {
+    let mut last = String::from("no source for the model");
+    for url in urls {
+        match whereti_net::http_get(url, agent, size + 1, &mut |done, _| progress(done)) {
+            Ok((200, bytes)) => {
+                if bytes.len() as u64 == size && whereti_net::sha256_hex(&bytes)? == sha256 {
+                    return Ok(bytes);
+                }
+                last = "the model did not arrive whole".into();
+            }
+            Ok((status, _)) => last = format!("the server answered {status}"),
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
+}
+
 /// Photos larger than this are not read for what is in them.
 const MAX_TAGGED: u64 = 64 << 20;
 
@@ -310,18 +341,13 @@ impl Content {
                         continue;
                     }
                     let mut last = 0u64;
-                    let (status, bytes) = whereti_net::http_get(&crate::meaning::url(f), &agent, f.size + 1, &mut |done, _| {
-                        if done - last >= 1 << 20 || done == f.size {
+                    let urls = [crate::meaning::url(f), format!("{MODELS_COPY}{}", f.name)];
+                    let bytes = fetch_model(&urls, &agent, f.size, f.sha256, &mut |done| {
+                        if done.abs_diff(last) >= 1 << 20 || done == f.size {
                             last = done;
                             *me.meaning_state.lock() = format!("downloading:{}/{total}", before + done);
                         }
                     })?;
-                    if status != 200 {
-                        return Err(format!("the server answered {status}"));
-                    }
-                    if bytes.len() as u64 != f.size || whereti_net::sha256_hex(&bytes)? != f.sha256 {
-                        return Err("the model did not arrive whole".into());
-                    }
                     let dir = path.parent().expect("models dir");
                     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
                     let part = path.with_extension("part");
@@ -456,18 +482,13 @@ impl Content {
             let result = (|| -> Result<(), String> {
                 let agent = format!("whereti/{}", env!("CARGO_PKG_VERSION"));
                 let mut last = 0u64;
-                let (status, bytes) = whereti_net::http_get(MODEL_URL, &agent, MODEL_SIZE + 1, &mut |done, _| {
-                    if done - last >= 1 << 20 || done == MODEL_SIZE {
+                let urls = [MODEL_URL.to_string(), format!("{MODELS_COPY}{MODEL_FILE}")];
+                let bytes = fetch_model(&urls, &agent, MODEL_SIZE, MODEL_SHA256, &mut |done| {
+                    if done.abs_diff(last) >= 1 << 20 || done == MODEL_SIZE {
                         last = done;
                         *me.tags_state.lock() = format!("downloading:{done}/{MODEL_SIZE}");
                     }
                 })?;
-                if status != 200 {
-                    return Err(format!("the server answered {status}"));
-                }
-                if bytes.len() as u64 != MODEL_SIZE || whereti_net::sha256_hex(&bytes)? != MODEL_SHA256 {
-                    return Err("the model did not arrive whole".into());
-                }
                 let path = model_path();
                 let dir = path.parent().expect("models dir");
                 std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
@@ -1781,5 +1802,25 @@ mod tests {
         let again = load_crashed(&dir, &|_| {});
         assert_eq!(again.len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod copy_tests {
+    /// Hugging Face gone (a revision that does not exist): the copy on GitHub
+    /// is used, checked by size and SHA-256. Needs the network:
+    /// `cargo test -p whereti-engine -- --ignored`.
+    #[test]
+    #[ignore]
+    fn the_models_copy_steps_in_when_hugging_face_fails() {
+        let f = &crate::meaning::FILES[1];
+        let urls = [
+            "https://huggingface.co/Xenova/multilingual-e5-small/resolve/0000000000000000000000000000000000000000/tokenizer.json".to_string(),
+            format!("{}{}", super::MODELS_COPY, f.name),
+        ];
+        let bytes = super::fetch_model(&urls, "whereti-test", f.size, f.sha256, &mut |_| {}).unwrap();
+        assert_eq!(bytes.len() as u64, f.size);
+        // a wrong hash is refused from every source
+        assert!(super::fetch_model(&urls[1..], "whereti-test", f.size, &"0".repeat(64), &mut |_| {}).is_err());
     }
 }
