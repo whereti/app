@@ -46,7 +46,12 @@ fn main() {
     if has("--do-install") || has("--do-uninstall") {
         let result = if has("--do-install") { ops::install(&mut |_| {}) } else { ops::uninstall(&mut |_| {}) };
         if let (Err(e), Some(path)) = (&result, report) {
-            let _ = std::fs::write(path, e);
+            // a new file only: this runs elevated, and the path comes from
+            // the unelevated half, so it must never overwrite anything
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new().write(true).create_new(true).open(path) {
+                let _ = f.write_all(e.as_bytes());
+            }
         }
         std::process::exit(if result.is_ok() { 0 } else { 1 });
     }

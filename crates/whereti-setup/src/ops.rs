@@ -138,6 +138,9 @@ pub fn install(log: &mut dyn FnMut(&str)) -> Result<(), String> {
         let bytes = std::fs::read(&me).map_err(|e| format!("cannot read the installer: {e}"))?;
         write_file(&uninstaller, &bytes)?;
     }
+    // listed in Settings > Apps before anything can fail: what is on disk
+    // can always be removed from there
+    register_uninstall(&dir)?;
 
     block_reader_network(&dir);
 
@@ -150,7 +153,6 @@ pub fn install(log: &mut dyn FnMut(&str)) -> Result<(), String> {
 
     log("Adding whereti to the Start menu…");
     shortcut(&start_menu_link(), &dir.join("whereti.exe"))?;
-    register_uninstall(&dir)?;
     Ok(())
 }
 
@@ -511,9 +513,13 @@ pub fn run_elevated(args: &str) -> Result<(), String> {
 /// The user's settings (`%APPDATA%\whereti`). Runs in the user's own,
 /// non-elevated part: the elevated one may be another account's profile.
 pub fn remove_user_settings() {
-    if let Some(appdata) = std::env::var_os("APPDATA") {
-        let _ = std::fs::remove_dir_all(PathBuf::from(appdata).join("whereti"));
+    // settings, license, history; and the cached listing of network folders
+    for var in ["APPDATA", "LOCALAPPDATA"] {
+        if let Some(base) = std::env::var_os(var) {
+            let _ = std::fs::remove_dir_all(PathBuf::from(base).join("whereti"));
+        }
     }
+    set_autostart(false);
 }
 
 #[cfg(test)]
