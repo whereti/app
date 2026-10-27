@@ -964,6 +964,17 @@ pub const ENTRIES: &[Entry] = &[
         ro: "Excluderile au fost salvate. Indexul se reconstruiește.",
     },
     Entry {
+        en: "A whole drive cannot be left out. Choose a folder on it.",
+        note: "Brief notice (toast) in Settings when the user picks a drive's root (like D:) as a folder to skip.",
+        de: "Ein ganzes Laufwerk kann nicht ausgelassen werden. Wählen Sie einen Ordner darauf.",
+        es: "No se puede omitir una unidad entera. Elige una carpeta dentro de ella.",
+        fr: "Un lecteur entier ne peut pas être exclu. Choisissez un dossier sur ce lecteur.",
+        it: "Non si può escludere un'intera unità. Scegli una cartella al suo interno.",
+        pl: "Nie można pominąć całego dysku. Wybierz folder na nim.",
+        pt_br: "Não é possível ignorar uma unidade inteira. Escolha uma pasta nela.",
+        ro: "Nu poți lăsa deoparte un disc întreg. Alege un folder de pe el.",
+    },
+    Entry {
         en: "Could not save the exclusions: {e}",
         note: "Error notice (toast) in Settings when saving the skipped folders fails; {e} is a technical error message.",
         de: "Die Ausnahmen konnten nicht gespeichert werden: {e}",

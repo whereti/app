@@ -577,7 +577,10 @@ fn search(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
         }
         if button(ui, p, tr("Add a folder…"), false).clicked() {
             if let Some(path) = app.hwnd.and_then(crate::win::pick_folder) {
-                if !app.settings.exclusions.iter().any(|x| x.eq_ignore_ascii_case(&path)) {
+                // a drive's root (D:\): the service would refuse the whole list
+                if path.trim_end_matches('\\').len() <= 2 {
+                    app.flash(tr("A whole drive cannot be left out. Choose a folder on it."));
+                } else if !app.settings.exclusions.iter().any(|x| x.eq_ignore_ascii_case(&path)) {
                     app.settings.exclusions.push(path);
                     changed = true;
                 }
