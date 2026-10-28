@@ -144,7 +144,10 @@ pub fn load(path: &Path) -> io::Result<NameIndex> {
         return Err(bad("not a whereti index file"));
     }
     let version = read_u32(&mut r)?;
-    if version != VERSION {
+    // v4 has the same layout: only a few rare letters (ligatures, the long
+    // s, the final sigma) were folded differently, which the next compaction
+    // folds anew. Rebuilding for them would lose the user's exclusions.
+    if version != VERSION && version != 4 {
         return Err(bad(&format!("index format v{version}, expected v{VERSION} (rebuild needed)")));
     }
     let count = read_u32(&mut r)?;

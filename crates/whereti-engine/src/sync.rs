@@ -255,7 +255,10 @@ pub fn follow_journal<M: From<JournalMsg> + Send + 'static>(
     let vol = match Volume::open(letter, false) {
         Ok(vol) => vol,
         Err(e) => {
-            let _ = tx.send(JournalMsg { letter, journal_id, changes: Vec::new(), next: pos, error: Some(e.to_string()) }.into());
+            // stopped meanwhile (the open was cancelled): no error to report
+            if !stop.load(Ordering::SeqCst) {
+                let _ = tx.send(JournalMsg { letter, journal_id, changes: Vec::new(), next: pos, error: Some(e.to_string()) }.into());
+            }
             return;
         }
     };

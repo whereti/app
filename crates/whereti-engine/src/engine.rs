@@ -688,6 +688,7 @@ impl Worker {
     fn startup(&mut self) -> Result<(), String> {
         let t = Instant::now();
         self.shared.set_state("loading");
+        let mut built = false;
         let index = match snapshot::load(&self.cfg.index_path) {
             Ok(mut idx) => {
                 self.log(format!(
@@ -704,6 +705,7 @@ impl Worker {
                 self.shared.set_state("indexing");
                 let idx = self.build_fresh()?;
                 self.dirty = true;
+                built = true;
                 idx
             }
         };
@@ -781,6 +783,12 @@ impl Worker {
         self.follow_all();
         self.shared.set_state("ready");
         self.log(format!("ready in {} ms", t.elapsed().as_millis()));
+        // a fresh index on disk at once: a crash would otherwise build it again
+        if built {
+            if let Err(e) = self.save() {
+                self.log(format!("could not save the new index: {e}"));
+            }
+        }
         if upgrade_defaults {
             self.log("default exclusions updated: generated folders (node_modules, .git, caches…) are left out");
             self.reconfigure(default_exclusions(self.cfg.include_windows));
@@ -869,7 +877,8 @@ impl Worker {
                 continue; // or let go for a removal meanwhile
             }
             if let Some(err) = mine.iter().find_map(|m| m.error.as_ref()) {
-                self.followers.remove(&letter);
+                // stopped, not just forgotten: a newer reader must not run on unseen
+                self.stop_reader(letter);
                 if walk::drives().iter().any(|d| d.letter == letter) {
                     self.log(format!("{err} → full rescan"));
                 } else {
@@ -998,6 +1007,7 @@ impl Worker {
             let guard = self.shared.index.read();
             let idx = guard.as_ref().expect("index");
             save_skipped(&self.cfg.index_path, idx.skipped_by_drive());
+            save_exclusions(&self.cfg.index_path, idx.exclusions());
             snapshot::save(idx, &self.cfg.index_path)
                 .map_err(|e| format!("cannot save {}: {e}", self.cfg.index_path.display()))?
         };
@@ -1063,13 +1073,14 @@ impl Worker {
                 let idx = guard.as_ref().expect("index");
                 self.pool.install(|| idx.rebuild(fresh, &gone))
             };
+            // by letter while the volumes are still the old ones
+            let open_before = self.open_by_letter();
             self.set_index(rebuilt);
             for l in &gone {
                 self.walks.remove(l);
                 self.retry.remove(l);
                 self.unrelease(*l);
             }
-            let open_before = self.open_by_letter();
             self.reopen();
             for v in 0..self.vols.len() {
                 let l = self.letter(v);
@@ -1365,19 +1376,32 @@ impl Worker {
                 changed.push(d.letter);
             }
         }
+        let mut other_disk: Vec<char> = Vec::new();
         for &(l, serial) in &indexed {
             match present.iter().find(|d| d.letter == l) {
                 None => changed.push(l),
                 Some(_) if self.released.contains_key(&l) => {}
+                // another disk under the same letter: at once, whatever the
+                // one before it was waiting for
+                Some(d) if !walk::same_volume(d.serial, serial) => {
+                    other_disk.push(l);
+                    changed.push(l);
+                }
                 // could not be scanned last time: waits its turn
                 Some(_) if !due(l) => {}
-                // another disk under the same letter
-                Some(d) if !walk::same_volume(d.serial, serial) => changed.push(l),
                 // could not be scanned last time: its turn again
                 Some(_) if self.retry.contains_key(&l) => changed.push(l),
                 Some(_) => {}
             }
         }
+        for l in other_disk {
+            self.retry.remove(&l);
+        }
+        // a drive gone and not in the index waits for nothing any more
+        self.retry.retain(|l, _| present.iter().any(|d| d.letter == *l) || indexed.iter().any(|(il, _)| il == l));
+        // an NTFS drive whose volume could not be opened last time (a moment's
+        // failure): opened again, and its journal followed from where it was
+        self.reopen_missing(&present, &changed);
         if changed.is_empty() {
             return;
         }
@@ -1385,6 +1409,44 @@ impl Worker {
         changed.dedup();
         self.log(format!("drives changed: {}", letters_text(&changed)));
         self.rescan(&changed);
+    }
+
+    /// Opens again the NTFS volumes left without a handle (`vols[v]` none)
+    /// that are present, followed, and not waiting for anything else.
+    fn reopen_missing(&mut self, present: &[Drive], changed: &[char]) {
+        let infos: Vec<_> = self.shared.index.read().as_ref().expect("index").volumes().to_vec();
+        let mut opened = false;
+        for (v, info) in infos.iter().enumerate() {
+            let l = info.letter();
+            if v >= self.vols.len() || self.vols[v].is_some() || info.journal_id == WALKED {
+                continue;
+            }
+            if changed.contains(&l) || self.released.contains_key(&l) || self.retry.contains_key(&l) {
+                continue;
+            }
+            if !present.iter().any(|d| d.letter == l) {
+                continue;
+            }
+            let Ok(vol) = Volume::open(l, false) else { continue };
+            if !walk::same_volume(vol.ntfs.volume_serial_number as u64, info.serial) {
+                continue; // another disk: the drive check rescans it
+            }
+            if let Some(r) = &self.removal {
+                if let Some(n) = r.watch(vol.letter, vol.raw_handle()) {
+                    self.notify.insert(vol.letter, n);
+                }
+            }
+            self.journal_max[v] = vol.query_usn_journal().map_or(0, |j| j.maximum_size);
+            self.vols[v] = Some(vol);
+            // its old reader's messages were dropped meanwhile: a new one
+            // replays from the position the index has
+            self.stop_reader(l);
+            self.log(format!("{l}: opened again"));
+            opened = true;
+        }
+        if opened {
+            self.follow_all();
+        }
     }
 
     /// Walks drives without a journal again when it is their turn, and
@@ -1471,7 +1533,16 @@ impl Worker {
             return Err("no drive to index".into());
         }
         let windows = (!self.cfg.include_windows).then(|| std::env::var("SystemRoot").ok()).flatten();
-        let (idx, stats) = build(scans, &Exclusions::defaults(windows.as_deref()));
+        // the user's exclusions when the index could not be read (damaged,
+        // or of a format this version does not read), else the defaults
+        let exclusions = match load_exclusions(&self.cfg.index_path) {
+            Some(paths) => {
+                self.log(format!("the {} saved exclusions are kept", paths.len()));
+                Exclusions { paths }
+            }
+            None => Exclusions::defaults(windows.as_deref()),
+        };
+        let (idx, stats) = build(scans, &exclusions);
         self.log(format!(
             "built the index: {} entries ({} excluded) in {} ms",
             stats.kept,
@@ -1546,6 +1617,21 @@ fn system_drive() -> char {
 /// What each exclusion left out, kept beside the index (`<index>.skipped`,
 /// one `drive<TAB>count<TAB>rule` per line): an index loaded from disk does
 /// not carry it.
+/// The exclusions, beside the index: one per line (written whole).
+fn save_exclusions(index_path: &std::path::Path, paths: &[String]) {
+    let text: String = paths.iter().map(|p| format!("{p}\n")).collect();
+    let tmp = index_path.with_extension("exclusions.tmp");
+    if std::fs::write(&tmp, text).is_ok() {
+        let _ = std::fs::rename(&tmp, index_path.with_extension("exclusions"));
+    }
+}
+
+fn load_exclusions(index_path: &std::path::Path) -> Option<Vec<String>> {
+    let text = std::fs::read_to_string(index_path.with_extension("exclusions")).ok()?;
+    let paths: Vec<String> = text.lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect();
+    validate_exclusions(&paths).ok()
+}
+
 fn save_skipped(index_path: &std::path::Path, counts: &[(char, String, u64)]) {
     let text: String = counts.iter().map(|(l, r, n)| format!("{l}\t{n}\t{r}\n")).collect();
     let _ = std::fs::write(index_path.with_extension("skipped"), text);
