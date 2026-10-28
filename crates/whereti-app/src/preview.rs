@@ -115,7 +115,8 @@ impl Preview {
                 Content::Folder { entries, .. } => entries.iter().any(|e| crate::app::has_cjk(&e.0)),
                 _ => false,
             };
-            self.cache.retain(|c| c.key != loaded.key);
+            // (the same file as it was before goes too)
+            self.cache.retain(|c| c.key.0 != loaded.key.0);
             self.cache.push_back(loaded);
             // the oldest go first, beyond so many or so much
             let mut bytes: usize = self.cache.iter().map(|c| c.content.bytes()).sum();
