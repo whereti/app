@@ -1513,4 +1513,15 @@ pub const ENTRIES: &[Entry] = &[
         pt_br: "Alterado entre duas datas",
         ro: "Modificat între două date",
     },
+    Entry {
+        en: "Opening…",
+        note: "Status line while a file on a network folder or NAS is being opened (it can take a few seconds).",
+        de: "Wird geöffnet…",
+        es: "Abriendo…",
+        fr: "Ouverture…",
+        it: "Apertura in corso…",
+        pl: "Otwieranie…",
+        pt_br: "Abrindo…",
+        ro: "Se deschide…",
+    },
 ];

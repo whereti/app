@@ -191,19 +191,33 @@ pub fn pick_folder(owner: HWND) -> Option<String> {
 
 use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL};
 use windows::Win32::UI::Shell::{
-    FileOperation, IFileOperation, IFileOperationProgressSink, FOFX_ADDUNDORECORD, FOFX_RECYCLEONDELETE, FOF_ALLOWUNDO,
-    FOF_WANTNUKEWARNING,
+    FileOperation, IFileOperation, IFileOperationProgressSink, FILEOPERATION_FLAGS, FOFX_ADDUNDORECORD, FOFX_RECYCLEONDELETE,
+    FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_WANTNUKEWARNING,
 };
 
 /// Runs one Explorer file operation (with Explorer's own dialogs, and an
 /// entry in Explorer's undo). `Ok(false)`: the user cancelled it.
-fn file_operation(hwnd: HWND, add: impl FnOnce(&IFileOperation) -> windows::core::Result<()>) -> Result<bool, String> {
-    // SAFETY: COM calls on the UI thread (COM is initialised by winit).
+/// `owner`: the window its dialogs belong to; none on a thread of its own
+/// (a window of another thread would tie the two threads' input together).
+/// `asked`: the user already said yes in whereti, so Windows does not ask again.
+fn file_operation(
+    owner: Option<HWND>,
+    asked: bool,
+    add: impl FnOnce(&IFileOperation) -> windows::core::Result<()>,
+) -> Result<bool, String> {
+    let flags: FILEOPERATION_FLAGS = if asked {
+        FOF_ALLOWUNDO | FOFX_RECYCLEONDELETE | FOFX_ADDUNDORECORD | FOF_NOCONFIRMATION
+    } else {
+        FOF_ALLOWUNDO | FOFX_RECYCLEONDELETE | FOFX_ADDUNDORECORD | FOF_WANTNUKEWARNING
+    };
+    // SAFETY: COM calls on a thread where COM is initialised (by winit on
+    // the UI thread; by the caller on others).
     unsafe {
         let op: IFileOperation = CoCreateInstance(&FileOperation, None, CLSCTX_ALL).map_err(|e| e.message())?;
-        op.SetOperationFlags(FOF_ALLOWUNDO | FOFX_RECYCLEONDELETE | FOFX_ADDUNDORECORD | FOF_WANTNUKEWARNING)
-            .map_err(|e| e.message())?;
-        op.SetOwnerWindow(hwnd).map_err(|e| e.message())?;
+        op.SetOperationFlags(flags).map_err(|e| e.message())?;
+        if let Some(hwnd) = owner {
+            op.SetOwnerWindow(hwnd).map_err(|e| e.message())?;
+        }
         add(&op).map_err(|e| e.message())?;
         op.PerformOperations().map_err(|e| e.message())?;
         Ok(!op.GetAnyOperationsAborted().map_err(|e| e.message())?.as_bool())
@@ -212,25 +226,29 @@ fn file_operation(hwnd: HWND, add: impl FnOnce(&IFileOperation) -> windows::core
 
 /// Moves a file or folder to the Recycle Bin, as Delete does in Explorer
 /// (Windows asks first if the user set it so, and warns when the item is
-/// too large for the Bin or on a drive without one).
-pub fn recycle(hwnd: HWND, path: &str) -> Result<bool, String> {
+/// too large for the Bin or on a drive without one). `permanent`: on a
+/// drive without a Recycle Bin, after the user said yes in whereti; then
+/// Windows does not ask a second time.
+pub fn recycle(owner: Option<HWND>, path: &str, permanent: bool) -> Result<bool, String> {
     let item = shell_item(path)?;
     // SAFETY: a valid shell item; no progress sink.
-    file_operation(hwnd, |op| unsafe { op.DeleteItem(&item, None::<&IFileOperationProgressSink>) })
+    file_operation(owner, permanent, |op| unsafe { op.DeleteItem(&item, None::<&IFileOperationProgressSink>) })
 }
 
 /// Renames a file or folder in place (`name`: the new name only).
-pub fn rename(hwnd: HWND, path: &str, name: &str) -> Result<bool, String> {
+pub fn rename(owner: Option<HWND>, path: &str, name: &str) -> Result<bool, String> {
     let item = shell_item(path)?;
     // SAFETY: a valid shell item and name; no progress sink.
-    file_operation(hwnd, |op| unsafe { op.RenameItem(&item, &HSTRING::from(name), None::<&IFileOperationProgressSink>) })
+    file_operation(owner, false, |op| unsafe { op.RenameItem(&item, &HSTRING::from(name), None::<&IFileOperationProgressSink>) })
 }
 
 /// Puts the file itself on the clipboard, as Ctrl+C does in Explorer:
-/// pasting in a folder, a mail or a chat pastes the file.
+/// pasting in a folder, a mail or a chat pastes the file. On a thread
+/// where OLE is initialised.
 pub fn copy_file(path: &str) -> Result<(), String> {
     let item = shell_item(path)?;
-    // SAFETY: COM calls on the UI thread; flushing keeps the data after whereti quits.
+    // SAFETY: COM calls on an OLE thread; flushing keeps the data after
+    // whereti quits (or this thread ends).
     unsafe {
         let data: IDataObject = item.BindToHandler(None::<&IBindCtx>, &BHID_DataObject).map_err(|e| e.message())?;
         windows::Win32::System::Ole::OleSetClipboard(&data).map_err(|e| e.message())?;

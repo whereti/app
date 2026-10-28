@@ -25,6 +25,28 @@ pub fn open(path: &str) -> Result<(), String> {
     }
 }
 
+/// Opens a file or folder with its default program, from a thread of its
+/// own that ends right after (a NAS asleep may hold it a while): Windows
+/// finishes starting the program before this returns. COM must be
+/// initialised on the thread.
+pub fn open_and_wait(path: &str) -> Result<(), String> {
+    use windows_sys::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOASYNC, SHELLEXECUTEINFOW};
+    let (verb, file) = (wide("open"), wide(path));
+    // SAFETY: zeroed struct with its size set; the strings outlive the call.
+    let mut info: SHELLEXECUTEINFOW = unsafe { std::mem::zeroed() };
+    info.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
+    info.fMask = SEE_MASK_NOASYNC;
+    info.lpVerb = verb.as_ptr();
+    info.lpFile = file.as_ptr();
+    info.nShow = SW_SHOWNORMAL;
+    // SAFETY: a valid struct.
+    if unsafe { ShellExecuteExW(&mut info) } != 0 {
+        Ok(())
+    } else {
+        Err(format!("Windows could not open {path}"))
+    }
+}
+
 /// Opens Explorer with the item selected.
 pub fn reveal(path: &str) -> Result<(), String> {
     std::process::Command::new("explorer.exe")

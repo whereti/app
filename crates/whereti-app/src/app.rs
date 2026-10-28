@@ -194,6 +194,8 @@ pub struct WheretiApp {
     help_open: bool,
     /// Where the search field is, to place the "?" panel under it.
     search_rect: Rect,
+    /// File actions on network files, done off this thread.
+    background: Background,
 }
 
 impl WheretiApp {
@@ -276,6 +278,7 @@ impl WheretiApp {
             confetti: None,
             help_open: false,
             search_rect: Rect::NOTHING,
+            background: Background::new(ctx),
             snippets: {
                 let wake_ctx = ctx.clone();
                 crate::snippets::Snippets::start(move || wake_ctx.request_repaint())
@@ -687,6 +690,16 @@ impl WheretiApp {
             crate::launch::open(&path)
         } else if reveal {
             shell::reveal(&path)
+        } else if crate::win::is_network_path(&path) {
+            // a NAS asleep can take a while to answer: opened off this
+            // thread, and the window goes once it is open
+            let generation = self.generation;
+            self.background.run(move || {
+                let result = shell::open_and_wait(&path);
+                Finished::Opened { path, generation, result }
+            });
+            self.flash(tr("Opening…"));
+            return;
         } else {
             shell::open(&path)
         };
@@ -914,16 +927,19 @@ impl WheretiApp {
             self.remember_search();
         }
         if copy {
-            match crate::win::copy_file(&path) {
-                Ok(()) => self.flash(tr("Copied: paste it in a folder, an e-mail or a chat")),
-                Err(e) => self.flash(e),
+            if crate::win::is_network_path(&path) {
+                let path = path.clone();
+                self.background.run(move || Finished::Copied(crate::win::copy_file(&path)));
+            } else {
+                let result = crate::win::copy_file(&path);
+                self.copied(result);
             }
         }
         if rename {
             let name = path.rsplit('\\').next().unwrap_or("").to_string();
             if !name.is_empty() && !name.ends_with(':') {
                 let is_dir = self.rows[self.selected].is_dir;
-                self.renaming = Some(Renaming { path, name, is_dir, fresh: true, error: None });
+                self.renaming = Some(Renaming { path, name, is_dir, fresh: true, error: None, busy: false });
             }
         } else if delete {
             if crate::win::is_network_path(&path) {
@@ -935,11 +951,35 @@ impl WheretiApp {
         }
     }
 
+    /// Ctrl+C on a file: how it went.
+    fn copied(&mut self, result: Result<(), String>) {
+        match result {
+            Ok(()) => self.flash(tr("Copied: paste it in a folder, an e-mail or a chat")),
+            Err(e) => self.flash(e),
+        }
+    }
+
     /// Moves `path` to the Recycle Bin (`permanent`: a drive without one,
     /// after the user said yes) and takes it off the list.
     fn delete_file(&mut self, path: &str, permanent: bool) {
+        self.focus_search = true;
+        if crate::win::is_network_path(path) {
+            // a NAS asleep can take a while to answer: off this thread
+            let path = path.to_string();
+            self.background.run(move || {
+                let result = crate::win::recycle(None, &path, permanent);
+                Finished::Deleted { path, permanent, result }
+            });
+            return;
+        }
         let Some(hwnd) = self.hwnd else { return };
-        match crate::win::recycle(hwnd, path) {
+        let result = crate::win::recycle(Some(hwnd), path, permanent);
+        self.deleted(path, permanent, result);
+    }
+
+    /// A deletion finished: the file goes off the list.
+    fn deleted(&mut self, path: &str, permanent: bool, result: Result<bool, String>) {
+        match result {
             Ok(true) => {
                 if let Some(i) = self.rows.iter().position(|r| r.path == path) {
                     self.remove_row(i);
@@ -949,7 +989,27 @@ impl WheretiApp {
             Ok(false) => {}
             Err(e) => self.flash(e),
         }
-        self.focus_search = true;
+    }
+
+    /// What the file actions done off this thread came back with.
+    fn take_finished(&mut self, ctx: &egui::Context) {
+        while let Ok(done) = self.background.rx.try_recv() {
+            match done {
+                Finished::Opened { path, generation, result } => match result {
+                    Ok(()) => {
+                        crate::usage::record(&path);
+                        // unless the user went on to something else meanwhile
+                        if self.visible && generation == self.generation {
+                            self.hide(ctx);
+                        }
+                    }
+                    Err(e) => self.flash(e),
+                },
+                Finished::Copied(result) => self.copied(result),
+                Finished::Deleted { path, permanent, result } => self.deleted(&path, permanent, result),
+                Finished::Renamed { path, new_path, result } => self.renamed(&path, &new_path, result),
+            }
+        }
     }
 
     /// "Delete permanently?" for a file on a drive without a Recycle Bin.
@@ -1161,28 +1221,63 @@ impl WheretiApp {
         let parent = r.path.rsplit_once('\\').map_or("", |(p, _)| p);
         let new_path = format!("{parent}\\{name}");
         // same name in other letters (raport -> Raport, ș -> Ș) is a rename, not a clash
-        if name.to_lowercase() != old.to_lowercase() && std::path::Path::new(&new_path).exists() {
+        let check = name.to_lowercase() != old.to_lowercase();
+        let path = r.path.clone();
+        if crate::win::is_network_path(&path) {
+            // a NAS asleep can take a while to answer: the check and the
+            // rename are done off this thread; the box waits for them
+            if r.busy {
+                return;
+            }
+            r.busy = true;
+            self.background.run(move || {
+                let result = if check && std::path::Path::new(&new_path).exists() {
+                    Err(tr("There is already a file or folder with this name here.").to_string())
+                } else {
+                    crate::win::rename(None, &path, &name)
+                };
+                Finished::Renamed { path, new_path, result }
+            });
+            return;
+        }
+        if check && std::path::Path::new(&new_path).exists() {
             r.error = Some(tr("There is already a file or folder with this name here.").to_string());
             return;
         }
         let Some(hwnd) = self.hwnd else { return };
-        let path = r.path.clone();
-        match crate::win::rename(hwnd, &path, &name) {
-            Ok(true) => {
-                self.renaming = None;
-                // the row, and (a folder) the rows of what is inside it
-                let inside = format!("{path}\\");
-                for row in self.rows.iter_mut() {
-                    if row.path == path {
-                        row.path = new_path.clone();
-                    } else if row.path.starts_with(&inside) {
-                        row.path = format!("{new_path}{}", &row.path[path.len()..]);
-                    }
+        let result = crate::win::rename(Some(hwnd), &path, &name);
+        self.renamed(&path, &new_path, result);
+    }
+
+    /// A rename finished: the rows follow it, and the box closes (or says
+    /// what went wrong, if it is still open for that file).
+    fn renamed(&mut self, path: &str, new_path: &str, result: Result<bool, String>) {
+        let box_open = self.renaming.as_ref().is_some_and(|r| r.path == path);
+        match result {
+            Ok(done) => {
+                if box_open {
+                    self.renaming = None;
                 }
-                self.flash(tr("Renamed"));
+                if done {
+                    // the row, and (a folder) the rows of what is inside it
+                    let inside = format!("{path}\\");
+                    for row in self.rows.iter_mut() {
+                        if row.path == path {
+                            row.path = new_path.to_string();
+                        } else if row.path.starts_with(&inside) {
+                            row.path = format!("{new_path}{}", &row.path[path.len()..]);
+                        }
+                    }
+                    self.flash(tr("Renamed"));
+                }
             }
-            Ok(false) => self.renaming = None,
-            Err(e) => r.error = Some(e),
+            Err(e) => match self.renaming.as_mut().filter(|_| box_open) {
+                Some(r) => {
+                    r.error = Some(e);
+                    r.busy = false;
+                }
+                None => self.flash(e),
+            },
         }
     }
 
@@ -2098,6 +2193,7 @@ impl eframe::App for WheretiApp {
             }
         }
         self.apply_updates();
+        self.take_finished(ctx);
         // Enter pressed while the search was on its way: done once its rows
         // are here; dropped if the user typed on (or the typing changed nothing)
         if let Some((reveal, target)) = self.pending_open {
@@ -3227,6 +3323,49 @@ struct Renaming {
     /// Just opened: select the name before the extension.
     fresh: bool,
     error: Option<String>,
+    /// A rename on the network is on its way.
+    busy: bool,
+}
+
+/// A file action done off the window's thread (a NAS asleep can take a
+/// while to answer), and how it went.
+enum Finished {
+    Opened { path: String, generation: u64, result: Result<(), String> },
+    Copied(Result<(), String>),
+    Deleted { path: String, permanent: bool, result: Result<bool, String> },
+    Renamed { path: String, new_path: String, result: Result<bool, String> },
+}
+
+/// Runs file actions on network files on threads of their own.
+struct Background {
+    tx: std::sync::mpsc::Sender<Finished>,
+    rx: std::sync::mpsc::Receiver<Finished>,
+    ctx: egui::Context,
+}
+
+impl Background {
+    fn new(ctx: &egui::Context) -> Background {
+        let (tx, rx) = std::sync::mpsc::channel();
+        Background { tx, rx, ctx: ctx.clone() }
+    }
+
+    /// Runs `job` on a new thread with OLE (and so COM) set up, as
+    /// Explorer's file operations and the clipboard need, and wakes the
+    /// window with what it returns.
+    fn run(&self, job: impl FnOnce() -> Finished + Send + 'static) {
+        let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
+        let _ = std::thread::Builder::new().name("file action".into()).spawn(move || {
+            // SAFETY: once on this new thread, undone below before it ends.
+            let ole = unsafe { windows::Win32::System::Ole::OleInitialize(None) }.is_ok();
+            let done = job();
+            if ole {
+                // SAFETY: pairs the OleInitialize above, on the same thread.
+                unsafe { windows::Win32::System::Ole::OleUninitialize() };
+            }
+            let _ = tx.send(done);
+            ctx.request_repaint();
+        });
+    }
 }
 
 #[cfg(test)]
