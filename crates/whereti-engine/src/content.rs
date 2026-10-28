@@ -58,6 +58,9 @@ const ZIP_TAIL: u64 = 16 << 20;
 /// Characters indexed per file.
 const MAX_CHARS: usize = 1_000_000;
 const COMMIT_EVERY_DOCS: usize = 200;
+/// Documents waiting for their text from which a round reads only text,
+/// photos and meaning coming in the next one.
+const TEXT_FIRST_AT: usize = 20;
 /// Documents whose text is kept for the meaning model between the two
 /// rounds (a few KB each); beyond this, read again.
 const MEANING_KEPT: usize = 50_000;
@@ -1092,9 +1095,11 @@ impl Content {
         // Files that could not be opened lately (an open mailbox) are tried,
         // but do not hold the rest back.
         let is_later = |c: &Candidate| c.meaning_only || c.props_only || c.photo_only || c.media_only || is_picture(&c.path);
+        // text first only when many documents wait (a first reading, a new
+        // folder): a few changed ones are read whole, in one round
         let text_waiting = {
             let locked = self.locked.lock();
-            todo.iter().any(|c| !is_later(c) && !locked.contains_key(&c.key))
+            todo.iter().filter(|c| !is_later(c) && !locked.contains_key(&c.key)).count() >= TEXT_FIRST_AT
         };
         let models_turn = self.models_turn.swap(false, Ordering::Relaxed);
         let models_later = !models_turn && text_waiting && (meaning_now || todo.iter().any(is_later));

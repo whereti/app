@@ -194,7 +194,12 @@ fn put_in_place(dir: &Path, log: &mut dyn FnMut(&str)) -> Result<(), String> {
     // which can still fail: the files on disk can be removed from there
     register_uninstall(dir)?;
 
-    block_reader_network(dir)?;
+    // The reader runs with a restricted token already; the firewall rule
+    // only adds to that. A PC whose firewall cannot take it (turned off by
+    // policy, another firewall) still gets whereti: noted, not fatal.
+    if let Err(e) = block_reader_network(dir) {
+        log(&e);
+    }
 
     log("Installing the search service…");
     let service = dir.join("whereti-service.exe");
