@@ -25,12 +25,15 @@ fn the_worker_cannot_write_after_its_lockdown() {
     // the test itself can write there
     std::fs::write(dir.join("ours.txt"), b"x").unwrap();
     let status = std::process::Command::new(exe()).args(["--probe-lockdown", probe.to_str().unwrap()]).status().unwrap();
-    assert_eq!(status.code(), Some(0), "the worker could still write after its lockdown");
+    let written = probe.exists();
     // the same, started by the broker
     let code = Sandbox::new(exe()).probe_exit(&["--probe-lockdown", probe.to_str().unwrap()]);
+    let written_too = probe.exists();
     let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(status.code(), Some(0), "the worker could still write after its lockdown");
+    assert!(!written, "the worker wrote its file");
     assert_eq!(code, Some(0), "the sandboxed worker could still write");
-    assert!(!probe.exists());
+    assert!(!written_too, "the sandboxed worker wrote its file");
 }
 
 #[test]
