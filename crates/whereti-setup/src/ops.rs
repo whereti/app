@@ -583,6 +583,14 @@ pub fn remove_user_settings() {
             let _ = std::fs::remove_dir_all(PathBuf::from(base).join("whereti"));
         }
     }
+    // installers the updater downloaded (%TEMP%\whereti-update)
+    for entry in std::fs::read_dir(std::env::temp_dir()).into_iter().flatten().flatten() {
+        let name = entry.file_name().to_string_lossy().to_lowercase();
+        if name == "whereti-update" || name.starts_with("whereti-update-") {
+            let p = entry.path();
+            let _ = if p.is_dir() { std::fs::remove_dir_all(&p) } else { std::fs::remove_file(&p) };
+        }
+    }
     set_autostart(false);
 }
 
