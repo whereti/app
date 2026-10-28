@@ -76,6 +76,12 @@ pub fn claim_instance(show: bool) -> Instance {
             Instance::First { show_requests: event }
         } else {
             if show {
+                // this launch may bring a window to the front (the user
+                // started it); the whereti already running may not, unless
+                // allowed: else its window opens behind the others
+                windows_sys::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow(
+                    windows_sys::Win32::UI::WindowsAndMessaging::ASFW_ANY,
+                );
                 SetEvent(event);
             }
             Instance::AlreadyRunning
