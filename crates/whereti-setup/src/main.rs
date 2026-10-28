@@ -31,6 +31,14 @@ use eframe::egui::{
 static VERSION_MARK: &str = concat!("WHERETI-SETUP-VERSION=", env!("CARGO_PKG_VERSION"), "\0");
 
 fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let has = |a: &str| args.iter().any(|x| x.eq_ignore_ascii_case(a));
+    let uninstalling = has("/uninstall") || has("--uninstall");
+    // an install with administrator rights holds its own file before
+    // anything else: what it copies as uninstall.exe is what runs now
+    if has("--do-install") || (!uninstalling && !has("--do-uninstall") && ops::is_elevated()) {
+        ops::hold_self();
+    }
     // keep the mark in the file even if nothing reads it here
     std::hint::black_box(VERSION_MARK);
     // DLLs loaded from here on (by egui, by Windows on our behalf) come
@@ -38,8 +46,6 @@ fn main() {
     ops::dlls_from_system32_only();
     // the installer speaks the Windows display language
     whereti_i18n::set(whereti_i18n::Lang::system());
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let has = |a: &str| args.iter().any(|x| x.eq_ignore_ascii_case(a));
     let report = args.iter().position(|a| a == "--report").and_then(|i| args.get(i + 1)).cloned();
 
     // the elevated half: do the work, write what went wrong, exit
@@ -56,13 +62,20 @@ fn main() {
         std::process::exit(if result.is_ok() { 0 } else { 1 });
     }
 
-    let uninstalling = has("/uninstall") || has("--uninstall");
     if has("/S") || has("/silent") {
         let result = if uninstalling { silent_uninstall() } else { silent_install() };
         // `/open`: an update started from whereti itself, which the install
-        // closed; open the new version so the user is back where they were
-        if result.is_ok() && !uninstalling && has("/open") {
+        // closed; open whereti again so the user is back where they were,
+        // the new version or, if the update failed, the one still there.
+        // (Already running: it only shows its window.)
+        if !uninstalling && has("/open") {
             ops::open_app();
+            // the user is there, waiting for the update: say what went wrong
+            if let Err(e) = &result {
+                if e != "cancelled" {
+                    show_error(&format!("{}\n\n{e}", tr("Something went wrong")));
+                }
+            }
         }
         std::process::exit(if result.is_ok() { 0 } else { 1 });
     }

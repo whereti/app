@@ -84,18 +84,36 @@ const FIREWALL_RULE: &str = "whereti document reader (no network)";
 
 /// The document reader never needs the network: Windows Firewall blocks
 /// it, so a document that took it over cannot send anything out.
-fn block_reader_network(dir: &Path) {
+fn block_reader_network(dir: &Path) -> Result<(), String> {
     let netsh = system32().join("netsh.exe");
-    let _ = Command::new(&netsh).args(["advfirewall", "firewall", "delete", "rule", &format!("name={FIREWALL_RULE}")]).output();
+    // none to delete on a first install: that answer does not matter
+    let _ = hidden(&netsh).args(["advfirewall", "firewall", "delete", "rule", &format!("name={FIREWALL_RULE}")]).output();
     let program = format!("program={}", dir.join("whereti-extract.exe").display());
-    let _ = Command::new(&netsh)
+    let out = hidden(&netsh)
         .args(["advfirewall", "firewall", "add", "rule", &format!("name={FIREWALL_RULE}"), "dir=out", "action=block", &program, "enable=yes", "profile=any"])
-        .output();
+        .output()
+        .map_err(|e| format!("cannot run {}: {e}", netsh.display()))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        // netsh says what went wrong on its standard output
+        let msg = format!("{} {}", String::from_utf8_lossy(&out.stdout).trim(), String::from_utf8_lossy(&out.stderr).trim());
+        Err(format!("cannot add the Windows Firewall rule that keeps the document reader off the network: {}", msg.trim()))
+    }
 }
 
 fn unblock_reader_network() {
     let netsh = system32().join("netsh.exe");
-    let _ = Command::new(&netsh).args(["advfirewall", "firewall", "delete", "rule", &format!("name={FIREWALL_RULE}")]).output();
+    let _ = hidden(&netsh).args(["advfirewall", "firewall", "delete", "rule", &format!("name={FIREWALL_RULE}")]).output();
+}
+
+/// A console program, run without a console window flashing up.
+fn hidden(exe: &Path) -> Command {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let mut c = Command::new(exe);
+    c.creation_flags(CREATE_NO_WINDOW);
+    c
 }
 
 /// The version already installed, if any (from Settings → Apps).
@@ -119,41 +137,141 @@ pub fn installed_version() -> Option<String> {
 
 // ---------------------------------------------------------------- install (elevated)
 
+/// Programs older versions installed that this one no longer carries:
+/// removed on an update. Only names whereti itself put there (none yet).
+const RETIRED: [&str; 0] = [];
+
 pub fn install(log: &mut dyn FnMut(&str)) -> Result<(), String> {
     let dir = install_dir();
+    // found now, before anything is stopped
+    if !is_uninstaller(&dir)? {
+        own_file()?;
+    }
+    let _one = one_at_a_time()?;
     log("Stopping the running whereti…");
     stop_service();
     close_running(&dir);
     remove_leftovers(&dir);
 
-    log("Copying the files…");
-    std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
-    for (name, packed) in PAYLOAD {
-        let bytes = unpack(packed).map_err(|e| format!("the installer is damaged ({name}: {e})"))?;
-        write_file(&dir.join(name), &bytes)?;
+    if let Err(e) = put_in_place(&dir, log) {
+        // never leave whereti without its service: start the one there is
+        if service_exists() {
+            let _ = start_service();
+        }
+        return Err(e);
     }
-    let me = std::env::current_exe().map_err(|e| e.to_string())?;
-    let uninstaller = dir.join("uninstall.exe");
-    if me != uninstaller {
-        let bytes = std::fs::read(&me).map_err(|e| format!("cannot read the installer: {e}"))?;
-        write_file(&uninstaller, &bytes)?;
-    }
-    // listed in Settings > Apps before anything can fail: what is on disk
-    // can always be removed from there
-    register_uninstall(&dir)?;
 
-    block_reader_network(&dir);
-
-    log("Installing the search service…");
-    let service = dir.join("whereti-service.exe");
-    if !service_exists() {
-        run(&service, &["install"])?;
-    }
-    run(&service, &["start"])?;
+    log("Starting the search service…");
+    start_service()?;
 
     log("Adding whereti to the Start menu…");
     shortcut(&start_menu_link(), &dir.join("whereti.exe"))?;
     Ok(())
+}
+
+/// The files, the entry in Settings > Apps, the firewall rule and the
+/// service's registration: everything but starting it.
+fn put_in_place(dir: &Path, log: &mut dyn FnMut(&str)) -> Result<(), String> {
+    log("Copying the files…");
+    std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    for (name, packed) in PAYLOAD {
+        let bytes = unpack(packed).map_err(|e| format!("the installer is damaged ({name}: {e})"))?;
+        write_file(&dir.join(name), &bytes)?;
+    }
+    for name in RETIRED {
+        let _ = std::fs::remove_file(dir.join(name));
+    }
+    if !is_uninstaller(dir)? {
+        // through the handle held since the start, never by the path again
+        let mut own = own_file()?;
+        let mut bytes = Vec::new();
+        std::io::Seek::seek(&mut own, std::io::SeekFrom::Start(0))
+            .and_then(|_| std::io::Read::read_to_end(&mut own, &mut bytes))
+            .map_err(|e| format!("cannot read the installer: {e}"))?;
+        write_file(&dir.join("uninstall.exe"), &bytes)?;
+    }
+    // listed in Settings > Apps before the firewall rule and the service,
+    // which can still fail: the files on disk can be removed from there
+    register_uninstall(dir)?;
+
+    block_reader_network(dir)?;
+
+    log("Installing the search service…");
+    let service = dir.join("whereti-service.exe");
+    if service_exists() {
+        configure_service(&service)
+    } else {
+        run(&service, &["install"])
+    }
+}
+
+/// Whether this is the installed uninstall.exe itself (run again to
+/// reinstall): then it is not copied over itself.
+fn is_uninstaller(dir: &Path) -> Result<bool, String> {
+    let me = std::env::current_exe().map_err(|e| e.to_string())?;
+    Ok(me.as_os_str().eq_ignore_ascii_case(dir.join("uninstall.exe").as_os_str()))
+}
+
+/// This installer's own file, opened by `hold_self`.
+static OWN_FILE: std::sync::OnceLock<Result<std::fs::File, String>> = std::sync::OnceLock::new();
+
+/// Opens this installer's own file so that no one can change, rename or
+/// delete it while the install runs (read sharing only). The copy of it put
+/// in the install folder (uninstall.exe) is read through this handle, never
+/// again by its path, which a user could swap meanwhile. The elevated
+/// install calls it before anything else.
+pub fn hold_self() {
+    let _ = own_file();
+}
+
+fn own_file() -> Result<&'static std::fs::File, String> {
+    OWN_FILE
+        .get_or_init(|| {
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_SHARE_READ: u32 = 0x1;
+            let me = std::env::current_exe().map_err(|e| format!("cannot read the installer: {e}"))?;
+            std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(FILE_SHARE_READ)
+                .open(&me)
+                .map_err(|e| format!("cannot read the installer: {e}"))
+        })
+        .as_ref()
+        .map_err(Clone::clone)
+}
+
+/// One installer at a time (a double click, an update while the window is
+/// open): a second one waits for the first to finish.
+fn one_at_a_time() -> Result<OneAtATime, String> {
+    use windows::Win32::Foundation::{WAIT_ABANDONED, WAIT_OBJECT_0};
+    use windows::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
+    // SAFETY: a named mutex we create or open, closed by OneAtATime or here.
+    unsafe {
+        // cannot be made: go on rather than refuse to install
+        let Ok(h) = CreateMutexW(None, false, w!(r"Global\whereti-setup")) else { return Ok(OneAtATime(None)) };
+        match WaitForSingleObject(h, 120_000) {
+            WAIT_OBJECT_0 | WAIT_ABANDONED => Ok(OneAtATime(Some(h))),
+            _ => {
+                let _ = CloseHandle(h);
+                Err("another whereti setup is still running: let it finish, then try again".into())
+            }
+        }
+    }
+}
+
+struct OneAtATime(Option<HANDLE>);
+
+impl Drop for OneAtATime {
+    fn drop(&mut self) {
+        use windows::Win32::System::Threading::ReleaseMutex;
+        if let Some(h) = self.0 {
+            // SAFETY: the mutex this thread acquired in one_at_a_time.
+            unsafe {
+                let _ = ReleaseMutex(h);
+                let _ = CloseHandle(h);
+            }
+        }
+    }
 }
 
 /// A program from the installer (zstd, see build.rs).
@@ -283,7 +401,7 @@ fn close_running(dir: &Path) {
 }
 
 fn run(exe: &Path, args: &[&str]) -> Result<(), String> {
-    let out = Command::new(exe)
+    let out = hidden(exe)
         .args(args)
         .output()
         .map_err(|e| format!("cannot run {}: {e}", exe.display()))?;
@@ -305,18 +423,124 @@ fn service_exists() -> bool {
 
 /// Stops the service (it saves its index first) and waits for it.
 fn stop_service() {
-    use windows_service::service::{ServiceAccess, ServiceState};
+    use windows_service::service::ServiceAccess;
     use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
     let Ok(m) = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT) else { return };
     let Ok(s) = m.open_service(SERVICE, ServiceAccess::QUERY_STATUS | ServiceAccess::STOP) else { return };
-    let _ = s.stop();
+    stop_and_wait(&s);
+}
+
+/// Waits up to a minute until the service has stopped. One still starting
+/// cannot be told to stop: it is let start first, then stopped. One that
+/// does not stop in time is ended by close_running.
+fn stop_and_wait(s: &windows_service::service::Service) {
+    use windows_service::service::ServiceState;
     let t = Instant::now();
+    let mut asked = false;
     while t.elapsed() < Duration::from_secs(60) {
-        match s.query_status() {
-            Ok(st) if st.current_state == ServiceState::Stopped => break,
-            Err(_) => break,
+        match s.query_status().map(|st| st.current_state) {
+            Ok(ServiceState::Stopped) | Err(_) => return,
+            Ok(ServiceState::Running | ServiceState::Paused) if !asked => asked = s.stop().is_ok(),
+            _ => {}
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// Starts the service and waits until it runs. One already running was
+/// started from files that may have been replaced since (Windows restarts
+/// the service a few seconds after close_running ended it), so it is
+/// restarted: the version just installed is the one that runs.
+fn start_service() -> Result<(), String> {
+    use windows_service::service::{ServiceAccess, ServiceState};
+    use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+    const ERROR_SERVICE_ALREADY_RUNNING: i32 = 1056;
+    let m = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT).map_err(scm_text)?;
+    let s = m
+        .open_service(SERVICE, ServiceAccess::QUERY_STATUS | ServiceAccess::START | ServiceAccess::STOP)
+        .map_err(|e| format!("cannot open the search service: {}", scm_text(e)))?;
+    stop_and_wait(&s);
+    match s.start::<&str>(&[]) {
+        Ok(()) => {}
+        // started by someone else this very moment, from the files now in place
+        Err(e) if scm_code(&e) == Some(ERROR_SERVICE_ALREADY_RUNNING) => return Ok(()),
+        Err(e) => return Err(format!("cannot start the search service: {}", scm_text(e))),
+    }
+    let t = Instant::now();
+    while t.elapsed() < Duration::from_secs(30) {
+        match s.query_status().map(|st| st.current_state) {
+            Ok(ServiceState::Running) => return Ok(()),
+            Ok(ServiceState::Stopped) => {
+                let log = data_dir().join("service.log");
+                return Err(format!("the search service stopped right after it started (see {})", log.display()));
+            }
+            Err(e) => return Err(format!("cannot start the search service: {}", scm_text(e))),
             _ => std::thread::sleep(Duration::from_millis(200)),
         }
+    }
+    // still starting: Windows goes on with it
+    Ok(())
+}
+
+/// On an update the service is registered already: its program and its
+/// start are set again as a first install sets them, so it runs the
+/// program just installed even if an older whereti or someone changed them.
+fn configure_service(exe: &Path) -> Result<(), String> {
+    use windows_service::service::{ServiceAccess, ServiceErrorControl, ServiceInfo, ServiceStartType, ServiceType};
+    use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+    let fail = |e| format!("cannot set up the search service: {}", scm_text(e));
+    let m = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT).map_err(fail)?;
+    let s = m.open_service(SERVICE, ServiceAccess::QUERY_CONFIG | ServiceAccess::CHANGE_CONFIG).map_err(fail)?;
+    let config = s.query_config().map_err(fail)?;
+    let info = ServiceInfo {
+        name: SERVICE.into(),
+        display_name: config.display_name,
+        service_type: ServiceType::OWN_PROCESS,
+        start_type: ServiceStartType::AutoStart,
+        error_control: ServiceErrorControl::Normal,
+        executable_path: exe.to_path_buf(),
+        launch_arguments: vec!["run".into()],
+        dependencies: vec![],
+        // the account stays as `whereti-service install` set it (LocalSystem)
+        account_name: None,
+        account_password: None,
+    };
+    s.change_config(&info).map_err(fail)
+}
+
+/// Removes the service from Windows, through the Service Control Manager:
+/// it works even when whereti-service.exe is already gone.
+fn delete_service() -> Result<(), String> {
+    use windows_service::service::ServiceAccess;
+    use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+    const ERROR_SERVICE_DOES_NOT_EXIST: i32 = 1060;
+    const ERROR_SERVICE_MARKED_FOR_DELETE: i32 = 1072;
+    let fail = |e| format!("cannot remove the search service: {}", scm_text(e));
+    let m = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT).map_err(fail)?;
+    let s = match m.open_service(SERVICE, ServiceAccess::DELETE) {
+        Ok(s) => s,
+        Err(e) if scm_code(&e) == Some(ERROR_SERVICE_DOES_NOT_EXIST) => return Ok(()),
+        Err(e) => return Err(fail(e)),
+    };
+    match s.delete() {
+        Err(e) if scm_code(&e) != Some(ERROR_SERVICE_MARKED_FOR_DELETE) => Err(fail(e)),
+        _ => Ok(()),
+    }
+}
+
+/// The Windows error behind a service call that failed.
+fn scm_code(e: &windows_service::Error) -> Option<i32> {
+    match e {
+        windows_service::Error::Winapi(io) => io.raw_os_error(),
+        _ => None,
+    }
+}
+
+/// What went wrong, in Windows' words ("IO error in winapi call" says nothing).
+fn scm_text(e: windows_service::Error) -> String {
+    match e {
+        windows_service::Error::Winapi(io) => io.to_string(),
+        e => e.to_string(),
     }
 }
 
@@ -391,12 +615,14 @@ fn register_uninstall(dir: &Path) -> Result<(), String> {
 // ---------------------------------------------------------------- uninstall (elevated)
 
 pub fn uninstall(log: &mut dyn FnMut(&str)) -> Result<(), String> {
+    let _one = one_at_a_time()?;
     let dir = install_dir();
     log("Removing the search service…");
     stop_service();
-    let service = dir.join("whereti-service.exe");
-    if service_exists() && service.is_file() {
-        run(&service, &["uninstall"])?;
+    if let Err(e) = delete_service() {
+        // nothing removed yet: whereti goes on working as it was
+        let _ = start_service();
+        return Err(e);
     }
     close_running(&dir);
     unblock_reader_network();
@@ -416,27 +642,45 @@ pub fn uninstall(log: &mut dyn FnMut(&str)) -> Result<(), String> {
     unsafe {
         let _ = RegDeleteTreeW(HKEY_LOCAL_MACHINE, UNINSTALL_KEY);
     }
-    // The uninstaller removes itself and the folder once it exits: its
-    // window may stay open a while (it says "removed"), so try for 2 minutes.
+    // What cannot be deleted now (the uninstaller still running, a file held
+    // open) is deleted at the next restart, and then the folder if empty.
+    // Renamed first, to a name of its own: a whereti installed again before
+    // that restart keeps its files.
+    for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+        let p = entry.path();
+        if !p.is_file() {
+            continue;
+        }
+        if entry.file_name().to_string_lossy().ends_with(OLD) {
+            delete_at_restart(&p);
+        } else {
+            let aside = aside_name(&p);
+            if std::fs::rename(&p, &aside).is_ok() {
+                delete_at_restart(&aside);
+            }
+        }
+    }
+    if dir.is_dir() {
+        delete_at_restart(&dir);
+    }
+    // The uninstaller's window may stay open a while (it says "removed"):
+    // the folder goes once it closes, tried for 2 minutes.
     // Programs by their full path, run from System32: nothing is looked up
     // in a folder a user could write to.
     let sys = system32();
-    let exe = dir.join("uninstall.exe");
     let script = format!(
-        "for /l %i in (1,1,60) do @if exist \"{exe}\" (del /f /q \"{exe}\" >nul 2>&1 & \"{ping}\" 127.0.0.1 -n 3 >nul) & rmdir /s /q \"{dir}\"",
-        exe = exe.display(),
+        "for /l %i in (1,1,60) do @if exist \"{dir}\\\" (rmdir /s /q \"{dir}\" >nul 2>&1 & if exist \"{dir}\\\" \"{ping}\" 127.0.0.1 -n 3 >nul)",
         ping = sys.join("PING.EXE").display(),
         dir = dir.display()
     );
     {
         use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        let _ = Command::new(sys.join("cmd.exe"))
-            .arg("/c")
+        let _ = hidden(&sys.join("cmd.exe"))
+            // no AutoRun commands from the registry, then the script
+            .args(["/d", "/c"])
             // as written: cmd does not read the \" escapes Rust would add
             .raw_arg(&script)
             .current_dir(&sys)
-            .creation_flags(CREATE_NO_WINDOW)
             .spawn();
     }
     Ok(())
