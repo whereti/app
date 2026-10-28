@@ -1,11 +1,12 @@
 //! Picture thumbnails for the Images grid, from Windows' own thumbnail
 //! cache (what Explorer shows: JPEG, PNG, HEIC, RAW with its codec, video
-//! frames…). Fetched on one background thread, newest request first, so
-//! the tiles on screen come before those scrolled past; the UI thread only
-//! turns finished pixels into textures, a few per frame.
+//! frames…). Fetched on one background thread, only for the tiles on
+//! screen now (a tile scrolled past is not fetched any more); the UI
+//! thread only turns finished pixels into textures, a few per frame.
 
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
+use std::collections::{HashMap, VecDeque};
+use std::sync::mpsc::{channel, Receiver};
+use std::sync::{Arc, Condvar, Mutex};
 
 use eframe::egui::{self, ColorImage, TextureHandle, TextureOptions};
 use windows::core::HSTRING;
@@ -26,41 +27,48 @@ const PER_FRAME: usize = 8;
 
 type Pixels = Option<(usize, usize, Vec<u8>)>;
 
+/// What the thumbnail thread is to fetch: the tiles on screen without one,
+/// in order, and the one it is fetching (until the window has its result).
+#[derive(Default)]
+struct Wanted {
+    paths: Vec<String>,
+    fetching: Option<String>,
+}
+
 pub struct Thumbs {
     cache: HashMap<String, Option<TextureHandle>>,
     /// Oldest first, to drop beyond `KEEP`.
     order: VecDeque<String>,
-    asked: HashSet<String>,
-    tx: Sender<String>,
+    wanted: Arc<(Mutex<Wanted>, Condvar)>,
+    /// The tiles of this frame without a thumbnail yet.
+    asked: Vec<String>,
+    /// The grid was drawn this frame.
+    drawn: bool,
     rx: Receiver<(String, Pixels)>,
 }
 
 impl Thumbs {
     pub fn new(ctx: egui::Context) -> Thumbs {
-        let (tx, jobs) = channel::<String>();
+        let wanted: Arc<(Mutex<Wanted>, Condvar)> = Arc::default();
         let (done, rx) = channel();
+        let w = wanted.clone();
         std::thread::Builder::new()
             .name("thumbnails".into())
             .spawn(move || {
                 // SAFETY: once, on this thread, before any shell call.
                 let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
-                let mut stack: Vec<String> = Vec::new();
                 loop {
-                    // take everything asked so far; the newest first
-                    if stack.is_empty() {
-                        match jobs.recv() {
-                            Ok(p) => stack.push(p),
-                            Err(_) => return,
+                    // the first tile on screen that has none yet
+                    let path = {
+                        let (lock, cv) = &*w;
+                        let mut wanted = lock.lock().unwrap_or_else(|e| e.into_inner());
+                        while wanted.paths.is_empty() {
+                            wanted = cv.wait(wanted).unwrap_or_else(|e| e.into_inner());
                         }
-                    }
-                    loop {
-                        match jobs.try_recv() {
-                            Ok(p) => stack.push(p),
-                            Err(TryRecvError::Empty) => break,
-                            Err(TryRecvError::Disconnected) => return,
-                        }
-                    }
-                    let Some(path) = stack.pop() else { continue };
+                        let path = wanted.paths.remove(0);
+                        wanted.fetching = Some(path.clone());
+                        path
+                    };
                     let pixels = thumbnail(&path);
                     if done.send((path, pixels)).is_err() {
                         return;
@@ -69,10 +77,11 @@ impl Thumbs {
                 }
             })
             .expect("a thread");
-        Thumbs { cache: HashMap::new(), order: VecDeque::new(), asked: HashSet::new(), tx, rx }
+        Thumbs { cache: HashMap::new(), order: VecDeque::new(), wanted, asked: Vec::new(), drawn: false, rx }
     }
 
     /// The thumbnail of `path`; `None` while it is coming (or there is none).
+    /// Asked for until the end of the frame (`end_frame`).
     pub fn get(&mut self, path: &str) -> Option<TextureHandle> {
         if let Some(t) = self.cache.get(path) {
             return t.clone();
@@ -83,17 +92,60 @@ impl Thumbs {
             self.cache.insert(path.to_string(), None);
             return None;
         }
-        if self.asked.insert(path.to_string()) {
-            let _ = self.tx.send(path.to_string());
-        }
+        self.asked.push(path.to_string());
         None
     }
 
-    /// Call once per frame: turns finished thumbnails into textures.
+    /// After the grid is drawn: the thread fetches the tiles on screen now,
+    /// and nothing else.
+    pub fn end_frame(&mut self) {
+        self.drawn = true;
+        let (lock, cv) = &*self.wanted;
+        let mut wanted = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let fetching = wanted.fetching.clone();
+        self.asked.retain(|p| Some(p) != fetching.as_ref());
+        if wanted.paths != self.asked {
+            wanted.paths = std::mem::take(&mut self.asked);
+            cv.notify_one();
+        }
+        self.asked.clear();
+    }
+
+    /// Once per frame, after everything is drawn: a frame without the grid
+    /// stops the fetching, and what still comes is dropped.
+    pub fn after_frame(&mut self) {
+        if !std::mem::take(&mut self.drawn) {
+            self.stop();
+        }
+    }
+
+    /// Nothing more is fetched; results on their way are dropped.
+    fn stop(&mut self) {
+        self.asked.clear();
+        {
+            let mut wanted = self.wanted.0.lock().unwrap_or_else(|e| e.into_inner());
+            wanted.paths.clear();
+            wanted.fetching = None;
+        }
+        while self.rx.try_recv().is_ok() {}
+    }
+
+    /// Call once per frame the grid is drawn, before it: turns finished
+    /// thumbnails into textures.
     pub fn receive(&mut self, ctx: &egui::Context) {
         for _ in 0..PER_FRAME {
             let Ok((path, pixels)) = self.rx.try_recv() else { return };
-            self.asked.remove(&path);
+            {
+                // it may be asked for again (once dropped from the cache)
+                let mut wanted = self.wanted.0.lock().unwrap_or_else(|e| e.into_inner());
+                if wanted.fetching.as_ref() == Some(&path) {
+                    wanted.fetching = None;
+                }
+            }
+            // fetched twice (asked again after a stop): kept once
+            if self.cache.contains_key(&path) {
+                continue;
+            }
             let tex = pixels.map(|(w, h, rgba)| {
                 let image = ColorImage::from_rgba_premultiplied([w, h], &rgba);
                 ctx.load_texture(format!("thumb:{path}"), image, TextureOptions::LINEAR)
@@ -115,11 +167,11 @@ impl Thumbs {
         self.order.retain(|p| p != path);
     }
 
-    /// Drops every texture (the window was hidden).
+    /// Drops every texture and stops fetching (the window was hidden).
     pub fn clear(&mut self) {
         self.cache.clear();
         self.order.clear();
-        self.asked.clear();
+        self.stop();
     }
 }
 

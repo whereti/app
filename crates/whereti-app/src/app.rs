@@ -1893,6 +1893,8 @@ impl WheretiApp {
                 }
             }
         });
+        // only the tiles on screen now are fetched
+        self.thumbs.end_frame();
         self.scroll_offset = out.state.clamped_offset().y;
         self.view_height = out.inner_rect.height();
         self.after_list(ctx, clicked, dragged, menu_for);
@@ -2313,6 +2315,8 @@ impl eframe::App for WheretiApp {
                 Page::Settings => crate::settings::show(self, ui, &p),
                 Page::Welcome => crate::welcome::show(self, ui, &p),
             });
+        // no grid this frame: no thumbnails fetched for it
+        self.thumbs.after_frame();
     }
 }
 
