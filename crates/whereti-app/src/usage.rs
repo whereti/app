@@ -2,7 +2,7 @@
 //! this PC.
 //!
 //! Two sources: the files opened from whereti (counted, in
-//! `%APPDATA%\whereti\usage.txt`) and the files Windows lists as recently
+//! `%LOCALAPPDATA%\whereti\usage.txt`) and the files Windows lists as recently
 //! opened (its Recent shortcuts, from any app). For each search, the ones
 //! whose name holds every word typed go to the service with a weight, and it
 //! ranks them higher among its hits. The service keeps nothing.
@@ -45,9 +45,12 @@ struct Store {
 
 static STORE: Mutex<Store> = Mutex::new(Store { opened: None, recent: Vec::new(), recent_read: None });
 
+const NAME: &str = "usage.txt";
+
+/// On this PC only (older versions kept it in %APPDATA%: moved once).
 fn file() -> PathBuf {
-    let base = std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
-    base.join("whereti").join("usage.txt")
+    static FILE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    FILE.get_or_init(|| crate::shell::local_file(NAME)).clone()
 }
 
 fn now() -> u64 {
@@ -126,6 +129,8 @@ pub fn forget() {
         store.opened = Some(HashMap::new());
     }
     SAVED.delete(&file());
+    // a copy an older version left where it kept it
+    let _ = std::fs::remove_file(crate::shell::roaming_file(NAME));
 }
 
 /// The plain words of a query, folded: what a used file's name must hold.

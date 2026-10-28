@@ -1,5 +1,5 @@
 //! The searches the user made (PLAN.md §60), newest first, in
-//! `%APPDATA%\whereti\searches.txt`. A search is remembered when it was used:
+//! `%LOCALAPPDATA%\whereti\searches.txt`. A search is remembered when it was used:
 //! a result opened, shown in Explorer, dragged, renamed, deleted or copied,
 //! or the window closed on its results. Everything stays on this PC;
 //! Settings > Search turns it off and forgets it.
@@ -17,9 +17,12 @@ const MAX_LEN: usize = 200;
 
 static LIST: Mutex<Option<Vec<String>>> = Mutex::new(None);
 
+const NAME: &str = "searches.txt";
+
+/// On this PC only (older versions kept it in %APPDATA%: moved once).
 fn file() -> PathBuf {
-    let base = std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
-    base.join("whereti").join("searches.txt")
+    static FILE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    FILE.get_or_init(|| crate::shell::local_file(NAME)).clone()
 }
 
 pub fn set_enabled(on: bool) {
@@ -86,6 +89,8 @@ pub fn forget() {
         *l = Some(Vec::new());
     }
     SAVED.delete(&file());
+    // a copy an older version left where it kept it
+    let _ = std::fs::remove_file(crate::shell::roaming_file(NAME));
 }
 
 #[cfg(test)]

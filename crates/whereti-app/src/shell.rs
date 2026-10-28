@@ -230,6 +230,39 @@ pub fn write_whole(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> 
     std::fs::rename(&tmp, path)
 }
 
+/// `%LOCALAPPDATA%\whereti\<name>`, for what belongs to this PC (it does
+/// not travel with a roaming account). A copy an older version kept in
+/// `%APPDATA%\whereti` is moved there first.
+pub fn local_file(name: &str) -> std::path::PathBuf {
+    let local = app_dir("LOCALAPPDATA").join(name);
+    move_once(&roaming_file(name), &local);
+    local
+}
+
+/// Moves `old` to `new` unless `new` is there already.
+fn move_once(old: &std::path::Path, new: &std::path::Path) {
+    if old == new || new.exists() || !old.exists() {
+        return;
+    }
+    if let Some(dir) = new.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    // another drive (a redirected profile): copied whole, then removed
+    let moved = std::fs::rename(old, new).is_ok() || std::fs::read(old).is_ok_and(|bytes| write_whole(new, &bytes).is_ok());
+    if moved {
+        let _ = std::fs::remove_file(old);
+    }
+}
+
+/// Where older versions kept `name`: `%APPDATA%\whereti`.
+pub fn roaming_file(name: &str) -> std::path::PathBuf {
+    app_dir("APPDATA").join(name)
+}
+
+fn app_dir(var: &str) -> std::path::PathBuf {
+    std::env::var_os(var).map(std::path::PathBuf::from).unwrap_or_else(std::env::temp_dir).join("whereti")
+}
+
 /// One saved file, written off the UI thread: only the newest text is
 /// written, and a deletion (Forget) is never undone by a write still on its
 /// way.
@@ -284,6 +317,22 @@ pub fn trace(msg: impl AsRef<str>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_old_file_moves_once() {
+        let root = std::env::temp_dir().join(format!("whereti-move-{}", std::process::id()));
+        let (old, new) = (root.join("roaming").join("a.txt"), root.join("local").join("a.txt"));
+        std::fs::create_dir_all(old.parent().unwrap()).unwrap();
+        std::fs::write(&old, "old").unwrap();
+        move_once(&old, &new);
+        assert_eq!(std::fs::read_to_string(&new).unwrap(), "old");
+        assert!(!old.exists());
+        // the new one is kept: an old copy coming back is not moved over it
+        std::fs::write(&old, "older").unwrap();
+        move_once(&old, &new);
+        assert_eq!(std::fs::read_to_string(&new).unwrap(), "old");
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn romanian_formats() {
