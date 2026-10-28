@@ -1,7 +1,9 @@
 ﻿# Builds the whereti installer: dist\whereti-setup-<version>.exe
 #
 #   .\scripts\package.ps1             development build: nothing is signed,
-#                                     no token is needed
+#                                     no token is needed; it goes to
+#                                     dist\dev\whereti-setup-<version>-dev.exe
+#                                     and never touches a signed one in dist
 #   .\scripts\package.ps1 -Release    production: from a clean, tagged tree,
 #                                     every program signed with the Certum
 #                                     certificate (scripts\sign-windows.ps1)
@@ -30,21 +32,23 @@ $repoRoot = Split-Path -Parent $PSScriptRoot
 function Invoke-Native([string]$What, [scriptblock]$Command) {
     $saved = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
-    try { & $Command 2>&1 | ForEach-Object { "$_" } | Out-Host } finally { $ErrorActionPreference = $saved }
+    # from the repository (rust-toolchain.toml), and back where the caller was
+    Push-Location $repoRoot
+    try { & $Command 2>&1 | ForEach-Object { "$_" } | Out-Host } finally { $ErrorActionPreference = $saved; Pop-Location }
     if ($LASTEXITCODE -ne 0) { throw "$What failed (exit $LASTEXITCODE)" }
 }
-Set-Location $repoRoot
 
-$version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
-$dist = Join-Path $repoRoot "dist"
+$version = (Select-String -Path (Join-Path $repoRoot "Cargo.toml") -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+# a development build has a folder of its own: dist keeps the signed release
+$dist = if ($Release) { Join-Path $repoRoot "dist" } else { Join-Path $repoRoot "dist\dev" }
 $payload = Join-Path $dist "payload"
 $programs = @("whereti.exe", "whereti-service.exe", "whereti-extract.exe", "wt.exe")
 
 if ($Release) {
     # A signed installer must answer for a revision anyone can check out.
-    $dirty = git status --porcelain
+    $dirty = git -C $repoRoot status --porcelain
     if ($dirty) { throw "The working tree has uncommitted changes. Commit them first: a signed release is built from a commit." }
-    $tag = & { $ErrorActionPreference = "Continue"; git describe --exact-match --tags HEAD 2>$null }
+    $tag = & { $ErrorActionPreference = "Continue"; git -C $repoRoot describe --exact-match --tags HEAD 2>$null }
     if (-not $tag) { throw "HEAD is not tagged. Tag the release (e.g. git tag v$version) and build from the tag." }
     if ($tag -ne "v$version") { throw "The tag $tag does not match the version $version in Cargo.toml." }
     # The supporter keys: a release must carry the production public key and
@@ -121,8 +125,12 @@ try {
 } finally {
     Remove-Item Env:\WHERETI_PAYLOAD -ErrorAction SilentlyContinue
 }
-$setup = Join-Path $dist "whereti-setup-$version.exe"
+$setup = Join-Path $dist $(if ($Release) { "whereti-setup-$version.exe" } else { "whereti-setup-$version-dev.exe" })
 Copy-Item (Join-Path $repoRoot "target\release\whereti-setup.exe") $setup
+# What the installer will install is what is in the payload folder (the
+# signed programs in a release), byte for byte: it unpacks and compares them.
+$check = Start-Process -FilePath $setup -ArgumentList "--check-payload `"$payload`"" -Wait -PassThru
+if ($check.ExitCode -ne 0) { throw "The installer does not carry the programs in $payload (exit $($check.ExitCode))." }
 
 if ($Release) {
     & "$PSScriptRoot\sign-windows.ps1" -Path $setup

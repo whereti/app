@@ -274,6 +274,15 @@ impl Drop for OneAtATime {
     }
 }
 
+/// Whether every program packed in this installer is, byte for byte, the
+/// file of the same name in `dir`.
+pub fn payload_matches(dir: &Path) -> bool {
+    PAYLOAD.iter().all(|(name, packed)| match (unpack(packed), std::fs::read(dir.join(name))) {
+        (Ok(inside), Ok(file)) => inside == file,
+        _ => false,
+    })
+}
+
 /// A program from the installer (zstd, see build.rs).
 fn unpack(packed: &[u8]) -> std::io::Result<Vec<u8>> {
     let mut dec = zstd::stream::Decoder::new(packed)?;

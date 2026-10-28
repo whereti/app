@@ -34,6 +34,11 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let has = |a: &str| args.iter().any(|x| x.eq_ignore_ascii_case(a));
     let uninstalling = has("/uninstall") || has("--uninstall");
+    // `--check-payload <dir>`: whether the programs packed inside are exactly
+    // the files in <dir> (scripts/package.ps1 checks the signed ones); exit 0 if so
+    if let Some(dir) = args.iter().position(|a| a == "--check-payload").and_then(|i| args.get(i + 1)) {
+        std::process::exit(if ops::payload_matches(std::path::Path::new(dir)) { 0 } else { 1 });
+    }
     // an install with administrator rights holds its own file before
     // anything else: what it copies as uninstall.exe is what runs now
     if has("--do-install") || (!uninstalling && !has("--do-uninstall") && ops::is_elevated()) {
