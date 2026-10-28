@@ -142,11 +142,11 @@ impl Vectors {
         }
     }
 
-    /// Keeps only the documents `keep` says yes to.
+    /// Keeps only the documents `keep` says yes to. Not worth a write of
+    /// its own (the file is rewritten whole): the next round leaves out
+    /// those documents again, and the next change writes it without them.
     pub fn retain(&mut self, keep: impl Fn(u64) -> bool) {
-        let before = self.map.len();
         self.map.retain(|k, _| keep(*k));
-        self.dirty |= self.map.len() != before;
     }
 
     pub fn clear(&mut self) {
@@ -219,6 +219,30 @@ mod tests {
         let s = Vectors::load(&dir);
         assert_eq!(s.closest(&unit(1), 10), vec![(1, 1.0)]);
         assert!(s.closest(&unit(3), 10).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn files_gone_alone_do_not_rewrite_the_vectors() {
+        let dir = std::env::temp_dir().join(format!("whereti-meaning-gone-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut s = Vectors::load(&dir);
+        s.set(1, vec![vec![1i8; DIMS]]);
+        s.set(2, vec![vec![2i8; DIMS]]);
+        s.save();
+        // a document gone: not written for that alone
+        s.retain(|k| k != 2);
+        s.save();
+        assert!(Vectors::load(&dir).contains(2));
+        // the next change writes it, without the one gone
+        s.set(3, vec![]);
+        s.save();
+        let again = Vectors::load(&dir);
+        assert!(again.contains(1) && again.contains(3) && !again.contains(2));
+        // a document's old vectors removed (it changed): written
+        s.remove(1);
+        s.save();
+        assert!(!Vectors::load(&dir).contains(1));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

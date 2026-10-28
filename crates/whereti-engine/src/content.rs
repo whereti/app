@@ -437,20 +437,23 @@ impl Content {
         match failed {
             None => true,
             Some(t) if t.elapsed() < MODEL_RETRY => false,
-            Some(_) => {
-                let answer = self.model.lock().embed("passage: whereti");
-                match answer {
-                    Ok(_) => {
-                        self.meaning_works();
-                        true
-                    }
-                    Err(e) => {
-                        self.meaning_failure(&e);
-                        false
-                    }
+            Some(_) => match self.meaning_probe() {
+                Ok(()) => {
+                    self.meaning_works();
+                    true
                 }
-            }
+                Err(e) => {
+                    self.meaning_failure(&e);
+                    false
+                }
+            },
         }
+    }
+
+    /// One small question to the meaning model: does it answer?
+    fn meaning_probe(&self) -> Result<(), String> {
+        let answer = self.model.lock().embed("passage: whereti");
+        answer.map(|_| ())
     }
 
     /// Downloads the text model if it is missing (once, in the background).
@@ -513,26 +516,37 @@ impl Content {
         }
     }
 
-    /// The vectors of one document's text (its first pieces).
-    /// `false` when the model failed (the document is tried again later).
+    /// The vectors of one document's text (its first pieces). `false` when
+    /// the model failed (the document is tried again later, its old vectors
+    /// gone: they are of an older text). A piece the model cannot read
+    /// while it still answers is the document's trouble: the document keeps
+    /// what could be read, so it is not read again until it changes.
     fn read_meaning(&self, key: u64, pieces: &[String]) -> bool {
-        let mut vectors = Vec::new();
-        for piece in pieces {
-            let answer = self.model.lock().embed(&format!("passage: {piece}"));
-            match answer {
-                Ok(v) => vectors.push(v),
-                Err(e) => {
-                    self.meaning_failure(&e);
-                    return false;
+        let embed = &mut |piece: &str| self.model.lock().embed(&format!("passage: {piece}"));
+        match embed_pieces(pieces, embed, &mut || self.meaning_probe()) {
+            Ok(vectors) => {
+                if !vectors.is_empty() {
+                    self.meaning_works();
                 }
+                // kept even when empty (no text): such a document is not read again
+                self.vectors.lock().set(key, vectors);
+                true
+            }
+            Err(e) => {
+                self.meaning_failure(&e);
+                self.vectors.lock().remove(key);
+                false
             }
         }
-        if !vectors.is_empty() {
-            self.meaning_works();
+    }
+
+    /// Keeps a document's pieces for the meaning model, so it is not read
+    /// again for them (up to `MEANING_KEPT` documents).
+    fn keep_meaning_text(&self, key: u64, pieces: Vec<String>) {
+        let mut kept = self.meaning_text.lock();
+        if kept.len() < MEANING_KEPT || kept.contains_key(&key) {
+            kept.insert(key, pieces);
         }
-        // kept even when empty (no text): such a document is not read again
-        self.vectors.lock().set(key, vectors);
-        true
     }
 
     /// The question's vector, before the name index is locked (the model
@@ -960,6 +974,7 @@ impl Content {
         // properties and vectors of files gone (or of files never recorded)
         self.props.lock().retain(|k| wanted.contains_key(&k));
         self.vectors.lock().retain(|k| wanted.contains_key(&k));
+        self.meaning_text.lock().retain(|k, _| wanted.contains_key(k));
         // search by meaning turned on: the documents already indexed, again
         // for it; not while the model fails (they would be read for nothing)
         let mut meaning_now = self.meaning_usable();
@@ -1018,7 +1033,8 @@ impl Content {
         if models_later {
             todo.retain(|c| !is_later(c));
         }
-        if !meaning_now {
+        // turned off: the text kept for it goes (while the model only fails, it waits)
+        if !self.meaning_ready() {
             self.meaning_text.lock().clear();
         }
         // The newest files first: what the user works on becomes searchable first.
@@ -1132,7 +1148,8 @@ impl Content {
                     if !meaning_now {
                         break 'file false;
                     }
-                    let kept = self.meaning_text.lock().remove(&c.key);
+                    // the text kept for it stays until the model has read it
+                    let kept = self.meaning_text.lock().get(&c.key).cloned();
                     let pieces = match kept {
                         Some(p) => Some(p),
                         None => extract(&c, sandbox, None, None, &mut Looked::No, &mark)
@@ -1140,8 +1157,11 @@ impl Content {
                             .map(|(_, text)| whereti_extract::meaning::pieces(&text, crate::meaning::PIECES)),
                     };
                     if let Some(pieces) = pieces {
-                        if !self.read_meaning(c.key, &pieces) {
+                        if self.read_meaning(c.key, &pieces) {
+                            self.meaning_text.lock().remove(&c.key);
+                        } else {
                             meaning_now = false;
+                            self.keep_meaning_text(c.key, pieces);
                         }
                     }
                     since_commit += 1;
@@ -1174,17 +1194,17 @@ impl Content {
                     known.insert(c.key, what);
                     since_commit += 1;
                     indexed += 1;
+                    // read again: the text kept for the model is of an older version
+                    self.meaning_text.lock().remove(&c.key);
                     if meaning_now && what.status == Status::Ok && !c.photo_only && !c.media_only && !is_picture(&c.path) {
                         let pieces = whereti_extract::meaning::pieces(&text, crate::meaning::PIECES);
                         if models_later {
                             // for the model, in the next round
                             self.vectors.lock().remove(c.key);
-                            let mut kept = self.meaning_text.lock();
-                            if kept.len() < MEANING_KEPT {
-                                kept.insert(c.key, pieces);
-                            }
+                            self.keep_meaning_text(c.key, pieces);
                         } else if !self.read_meaning(c.key, &pieces) {
                             meaning_now = false; // the model failed: not for the rest of this round
+                            self.keep_meaning_text(c.key, pieces);
                         }
                     } else {
                         // a record reused by another kind of file: no old vectors on it
@@ -1266,7 +1286,12 @@ impl Content {
             }
         }
         index.commit().map_err(|e| e.to_string())?;
-        self.save_side();
+        if models_later {
+            // the vectors are written once, by the round of the models right after (or at stop)
+            self.props.lock().save();
+        } else {
+            self.save_side();
+        }
         self.update_counts(index, known);
         // the text is in: photos and meaning now, without waiting for a change
         if models_later && !self.stopping() {
@@ -2043,6 +2068,24 @@ impl TagRound {
     }
 }
 
+/// The vectors of a document's pieces. A piece that fails while `probe`
+/// (one small question) still works is left out: the document's trouble.
+/// `Err` when the probe fails too: the model's.
+fn embed_pieces(
+    pieces: &[String],
+    embed: &mut dyn FnMut(&str) -> Result<Vec<i8>, String>,
+    probe: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<Vec<Vec<i8>>, String> {
+    let mut vectors = Vec::new();
+    for piece in pieces {
+        match embed(piece) {
+            Ok(v) => vectors.push(v),
+            Err(_) => probe()?,
+        }
+    }
+    Ok(vectors)
+}
+
 /// Why a file was not read now.
 enum Skip {
     /// Gone, locked, no access: in a later round.
@@ -2462,6 +2505,17 @@ mod tests {
         assert!(round.note(4, Looked::Failed("no answer in 20 s".into()), None).model_fails.is_none());
         // new tags replace the ones kept
         assert_eq!(round.note(5, Looked::Tags(vec![]), Some(vec![3])).tags, Vec::<u16>::new());
+    }
+
+    #[test]
+    fn a_piece_the_model_cannot_read_is_the_documents_trouble() {
+        let pieces: Vec<String> = ["one", "bad", "three"].map(String::from).to_vec();
+        let embed = &mut |p: &str| if p == "bad" { Err("bad piece".to_string()) } else { Ok(vec![p.len() as i8]) };
+        // the model still answers: the document keeps the pieces that could be read
+        assert_eq!(embed_pieces(&pieces, embed, &mut || Ok(())), Ok(vec![vec![3], vec![5]]));
+        // it does not: the model's failure, nothing is kept
+        assert_eq!(embed_pieces(&pieces, embed, &mut || Err("no answer in 20 s".into())), Err("no answer in 20 s".into()));
+        assert_eq!(embed_pieces(&[], embed, &mut || Err("never asked".into())), Ok(vec![]));
     }
 
     #[test]
