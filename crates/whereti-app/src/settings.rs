@@ -62,6 +62,8 @@ pub struct SettingsState {
     logo: Option<egui::TextureHandle>,
 }
 
+static SAVED: crate::shell::Saved = crate::shell::Saved::new();
+
 fn settings_file() -> PathBuf {
     let base = std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
     base.join("whereti").join("settings.txt")
@@ -151,11 +153,9 @@ impl SettingsState {
         if self.autostart_offered {
             text.push_str("autostart_offered=yes\n");
         }
-        let path = settings_file();
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        let _ = crate::shell::write_whole(&path, text.as_bytes());
+        // written off the window's thread (Tab toggles the preview, and
+        // writing to disk can take a while): the newest change wins
+        SAVED.save(settings_file(), text);
     }
 
     pub fn apply_theme(&self, ctx: &egui::Context) {
