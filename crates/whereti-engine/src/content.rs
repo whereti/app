@@ -850,9 +850,9 @@ impl Content {
             let _ = std::fs::write(&places_marker, "new index\n");
             let _ = std::fs::write(&unspaced_marker, "new index\n");
         }
-        // Files forgotten to be read again, still in the index: removed from
-        // it if they are gone before that.
-        let mut forgotten: HashSet<u64> = HashSet::new();
+        // Files forgotten to be read again, still in the index as they were:
+        // removed from it if they are gone before that.
+        let mut forgotten: HashMap<u64, Indexed> = HashMap::new();
         let ocr_pass = !ocr_marker.exists();
         if ocr_pass {
             let before = known.len();
@@ -945,7 +945,10 @@ impl Content {
                         self.set_state(&format!("error: {e}"));
                     }
                 }
-                *self.known_keys.write() = known_sizes(&known);
+                // what is in the index: also what waits to be read again
+                let mut sizes = known_sizes(&known);
+                sizes.extend(known_sizes(&forgotten));
+                *self.known_keys.write() = sizes;
             }
             // Wait for the next check.
             let mut wake = self.wake.lock();
@@ -970,7 +973,7 @@ impl Content {
         index: &ContentIndex,
         shared: &Shared,
         known: &mut HashMap<u64, Indexed>,
-        forgotten: &mut HashSet<u64>,
+        forgotten: &mut HashMap<u64, Indexed>,
         sandbox: Option<&Sandbox>,
     ) -> Result<(), String> {
         let t = Instant::now();
@@ -2302,11 +2305,11 @@ fn new_sandbox() -> Option<Sandbox> {
 
 /// Forgets the indexed files `again` says yes to, so the next round reads
 /// them again; they are kept in `forgotten` until then (still in the index).
-fn forget(known: &mut HashMap<u64, Indexed>, forgotten: &mut HashSet<u64>, again: impl Fn(u64, &Indexed) -> bool) {
+fn forget(known: &mut HashMap<u64, Indexed>, forgotten: &mut HashMap<u64, Indexed>, again: impl Fn(u64, &Indexed) -> bool) {
     known.retain(|&k, i| {
         let keep = !again(k, i);
         if !keep {
-            forgotten.insert(k);
+            forgotten.insert(k, *i);
         }
         keep
     });
@@ -2314,8 +2317,8 @@ fn forget(known: &mut HashMap<u64, Indexed>, forgotten: &mut HashSet<u64>, again
 
 /// The keys to remove from the index: files indexed, or forgotten to be
 /// read again, that are no longer wanted.
-fn gone_keys(known: &HashMap<u64, Indexed>, forgotten: &HashSet<u64>, wanted: &impl Fn(u64) -> bool) -> Vec<u64> {
-    let gone: HashSet<u64> = known.keys().chain(forgotten).copied().filter(|&k| !wanted(k)).collect();
+fn gone_keys(known: &HashMap<u64, Indexed>, forgotten: &HashMap<u64, Indexed>, wanted: &impl Fn(u64) -> bool) -> Vec<u64> {
+    let gone: HashSet<u64> = known.keys().chain(forgotten.keys()).copied().filter(|&k| !wanted(k)).collect();
     gone.into_iter().collect()
 }
 
@@ -2650,11 +2653,11 @@ mod tests {
     fn files_forgotten_to_be_read_again_leave_the_index_when_gone() {
         let at = |status| Indexed { size: 1, modified: 1, status };
         let mut known: HashMap<u64, Indexed> = [(1, at(Status::Ok)), (2, at(Status::Empty)), (3, at(Status::Ok))].into();
-        let mut forgotten = HashSet::new();
+        let mut forgotten = HashMap::new();
         forget(&mut known, &mut forgotten, |_, i| i.status == Status::Empty);
         forget(&mut known, &mut forgotten, |k, _| k == 3);
         assert_eq!(known.keys().copied().collect::<Vec<_>>(), [1]);
-        assert_eq!(forgotten, [2, 3].into());
+        assert_eq!(forgotten, [(2, at(Status::Empty)), (3, at(Status::Ok))].into());
         // 2 and 3 deleted before they were read again: still removed from the index
         let mut gone = gone_keys(&known, &forgotten, &|k| k == 1);
         gone.sort();
