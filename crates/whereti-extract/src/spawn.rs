@@ -100,7 +100,7 @@ pub(crate) fn spawn(
     // a restricted token without the logon session (the service's) cannot
     // open the window station it would inherit: it gets one of its own
     let mut desktop: Option<Vec<u16>> = match &token {
-        Some((_, logon)) if !*logon || OWN_DESKTOP.load(std::sync::atomic::Ordering::Relaxed) => Some(worker_desktop()?),
+        Some((_, logon)) if !*logon || OWN_DESKTOP.load(std::sync::atomic::Ordering::Relaxed) => Some(worker_desktop(*logon)?),
         _ => None,
     };
 
@@ -331,17 +331,45 @@ fn allow_all(sids: &[*mut core::ffi::c_void]) -> io::Result<Vec<u64>> {
 #[doc(hidden)]
 pub static OWN_DESKTOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// How long a window station that could not be made stays refused before
+/// it is tried again (not once per spawn, each try costing a spawn's time).
+const DESKTOP_AGAIN: Duration = Duration::from_secs(600);
+
 /// `window station\desktop` for restricted workers, made once by this
 /// process and kept while it runs: only its user, SYSTEM and RESTRICTED may
 /// use them. (user32, which Windows' PDF renderer loads, needs a desktop.)
-fn worker_desktop() -> io::Result<Vec<u16>> {
-    use windows_sys::Win32::System::StationsAndDesktops::{
-        CreateDesktopW, CreateWindowStationW, GetProcessWindowStation, GetUserObjectInformationW, SetProcessWindowStation, UOI_NAME,
-    };
-    static MADE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+/// `logon`: the restricted token keeps the logon session (a user's).
+fn worker_desktop(logon: bool) -> io::Result<Vec<u16>> {
+    static MADE: std::sync::Mutex<Option<Result<String, (std::time::Instant, String)>>> = std::sync::Mutex::new(None);
     let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(name) = made.as_ref() {
-        return Ok(name.encode_utf16().chain([0]).collect());
+    match made.as_ref() {
+        Some(Ok(name)) => return Ok(name.encode_utf16().chain([0]).collect()),
+        Some(Err((at, e))) if at.elapsed() < DESKTOP_AGAIN => return Err(io::Error::other(e.clone())),
+        _ => {}
+    }
+    let result = make_worker_desktop(logon);
+    *made = Some(match &result {
+        Ok(name) => Ok(name.clone()),
+        Err(e) => Err((std::time::Instant::now(), e.to_string())),
+    });
+    result.map(|name| name.encode_utf16().chain([0]).collect())
+}
+
+/// Makes the window station and desktop of `worker_desktop`; their name.
+fn make_worker_desktop(logon: bool) -> io::Result<String> {
+    use windows_sys::Win32::System::StationsAndDesktops::{
+        CloseWindowStation, CreateDesktopW, CreateWindowStationW, GetProcessWindowStation, GetUserObjectInformationW, SetProcessWindowStation,
+        HWINSTA, UOI_NAME,
+    };
+    // CreateWindowStationW fails rather than open one that exists
+    const CWF_CREATE_ONLY: u32 = 1;
+    /// A window station handle, closed unless kept.
+    struct Station(HWINSTA);
+    impl Drop for Station {
+        fn drop(&mut self) {
+            // SAFETY: a handle we opened, not this process's window station.
+            unsafe { CloseWindowStation(self.0) };
+        }
     }
     let user = token_info_of_self(TokenUser)?;
     let mut restricted = well_known(WinRestrictedCodeSid)?;
@@ -371,22 +399,36 @@ fn worker_desktop() -> io::Result<Vec<u16>> {
         }
     }
     let sa = SECURITY_ATTRIBUTES { nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32, lpSecurityDescriptor: psd, bInheritHandle: 0 };
-    let desk: Vec<u16> = "Default".encode_utf16().chain([0]).collect();
-    // SAFETY: NUL-terminated names, valid attributes; the process's own
-    // window station is set back at once. The handles stay open (never
-    // closed) so the window station and desktop live as long as we do.
-    let station = unsafe {
-        // no name: Windows names it after the logon session (a name of our
-        // own needs more rights as a user). A service's logon session has
-        // one already, which it may not open like this: then a name of ours.
-        let mut ws = CreateWindowStationW(std::ptr::null(), 0, GENERIC_ALL, &sa);
+    let own: Vec<u16> = format!("whereti-reader-{}", std::process::id()).encode_utf16().chain([0]).collect();
+    // Only a window station made here has our descriptor. No name: Windows
+    // names it after the logon session (a name of our own needs more rights
+    // as a user). A service's logon session has one already: then a name of
+    // ours. A user's may have one too (another program's), and a user may
+    // not name one: then that one, which the restricted token's logon
+    // session may use, with a desktop of our own in it.
+    let mut shared = false;
+    // SAFETY: NUL-terminated names, valid attributes.
+    let ws = unsafe {
+        let mut ws = CreateWindowStationW(std::ptr::null(), CWF_CREATE_ONLY, GENERIC_ALL, &sa);
         if ws.is_null() {
-            let own: Vec<u16> = format!("whereti-reader-{}", std::process::id()).encode_utf16().chain([0]).collect();
-            ws = CreateWindowStationW(own.as_ptr(), 0, GENERIC_ALL, &sa);
+            ws = CreateWindowStationW(own.as_ptr(), CWF_CREATE_ONLY, GENERIC_ALL, &sa);
         }
-        if ws.is_null() {
-            return Err(os_error("window station"));
+        if ws.is_null() && logon {
+            ws = CreateWindowStationW(std::ptr::null(), 0, GENERIC_ALL, &sa);
+            shared = true;
         }
+        ws
+    };
+    if ws.is_null() {
+        return Err(os_error("window station"));
+    }
+    let station = Station(ws);
+    let desk: Vec<u16> = if shared { own.clone() } else { "Default".encode_utf16().chain([0]).collect() };
+    // SAFETY: a window station we hold, NUL-terminated names, valid
+    // attributes; the process's own window station is set back at once.
+    // Once made, the handles stay open (never closed) so the window station
+    // and desktop live as long as we do.
+    let station_name = unsafe {
         let mut name = [0u16; 256];
         let mut needed = 0u32;
         if GetUserObjectInformationW(ws, UOI_NAME, name.as_mut_ptr().cast(), (name.len() * 2) as u32, &mut needed) == 0 {
@@ -405,9 +447,8 @@ fn worker_desktop() -> io::Result<Vec<u16>> {
         let len = name.iter().position(|&c| c == 0).unwrap_or(name.len());
         String::from_utf16_lossy(&name[..len])
     };
-    let name = format!("{station}\\Default");
-    *made = Some(name.clone());
-    Ok(name.encode_utf16().chain([0]).collect())
+    std::mem::forget(station);
+    Ok(format!("{station_name}\\{}", String::from_utf16_lossy(&desk[..desk.len() - 1])))
 }
 
 /// This process's token information of one class.
