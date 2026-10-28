@@ -543,7 +543,10 @@ fn search(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
         ui.horizontal(|ui| {
             if button(ui, p, tr("Add a folder…"), false).clicked() {
                 if let Some(path) = app.hwnd.and_then(crate::win::pick_folder) {
-                    if !list.iter().any(|x| x.eq_ignore_ascii_case(&path)) {
+                    if crate::win::is_local_drive(&path) {
+                        // walked here too, it would only take memory
+                        app.flash(tr("This folder is on this PC, and whereti searches it already. Add folders on the network or a NAS."));
+                    } else if !list.iter().any(|x| x.eq_ignore_ascii_case(&path)) {
                         list.push(path);
                     }
                 }

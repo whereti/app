@@ -1140,6 +1140,17 @@ pub const ENTRIES: &[Entry] = &[
         ro: "Foldere partajate, un NAS sau o unitate mapată (\\\\nas\\photos, Z:\\). whereti le parcurge o dată pe oră, în numele tău, și le găsește după nume.",
     },
     Entry {
+        en: "This folder is on this PC, and whereti searches it already. Add folders on the network or a NAS.",
+        note: "Brief notice (toast) in Settings > Search > Network folders when the folder chosen is on a disk of this PC, not on the network.",
+        de: "Dieser Ordner ist auf diesem PC, whereti durchsucht ihn bereits. Fügen Sie Ordner im Netzwerk oder auf einem NAS hinzu.",
+        es: "Esta carpeta está en este PC y whereti ya busca en ella. Añade carpetas de la red o de un NAS.",
+        fr: "Ce dossier est sur ce PC, et whereti le parcourt déjà. Ajoutez des dossiers du réseau ou d'un NAS.",
+        it: "Questa cartella è su questo PC e whereti la cerca già. Aggiungi cartelle di rete o di un NAS.",
+        pl: "Ten folder jest na tym komputerze i whereti już go przeszukuje. Dodaj foldery z sieci lub z NAS.",
+        pt_br: "Esta pasta está neste PC, e o whereti já pesquisa nela. Adicione pastas da rede ou de um NAS.",
+        ro: "Folderul e pe acest PC, iar whereti îl caută deja. Adaugă foldere din rețea sau de pe un NAS.",
+    },
+    Entry {
         en: "{folder}: looking through it…",
         note: "Settings > Network folders: a folder being read right now; {folder} is its path.",
         de: "{folder}: wird durchsucht…",

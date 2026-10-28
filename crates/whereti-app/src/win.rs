@@ -434,3 +434,33 @@ pub fn is_network_path(path: &str) -> bool {
     // SAFETY: a NUL-terminated root path.
     unsafe { GetDriveTypeW(&HSTRING::from(format!("{letter}:\\"))) == DRIVE_REMOTE }
 }
+
+/// On a drive of this PC (a disk, a USB stick, a memory card, a CD), which
+/// the service indexes itself. Not a share, a mapped drive, or a letter
+/// not connected now (a mapped drive while the network is away).
+pub fn is_local_drive(path: &str) -> bool {
+    use windows::Win32::Storage::FileSystem::GetDriveTypeW;
+    let Some(letter) = path.chars().next().filter(|c| c.is_ascii_alphabetic() && path[1..].starts_with(':')) else { return false };
+    const REMOVABLE: u32 = 2;
+    const FIXED: u32 = 3;
+    const CDROM: u32 = 5;
+    const RAMDISK: u32 = 6;
+    // SAFETY: a NUL-terminated root path.
+    let kind = unsafe { GetDriveTypeW(&HSTRING::from(format!("{letter}:\\"))) };
+    matches!(kind, REMOVABLE | FIXED | CDROM | RAMDISK)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn drives_of_this_pc_and_of_the_network() {
+        let windows = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into());
+        assert!(is_local_drive(&format!(r"{windows}\Users")));
+        assert!(!is_network_path(&format!(r"{windows}\Users")));
+        assert!(!is_local_drive(r"\\nas\photos"));
+        assert!(is_network_path(r"\\nas\photos"));
+        assert!(!is_local_drive("photos"));
+    }
+}

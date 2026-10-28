@@ -17,8 +17,9 @@ use whereti_query::{fold, glob_match, Query, Term};
 
 /// Every folder is walked again this often.
 const EVERY: Duration = Duration::from_secs(3600);
-/// At most this many entries over all folders (memory stays small).
-const MAX_ENTRIES: usize = 2_000_000;
+/// At most this many entries over all folders, about 100 MB (twice that
+/// while a walk replaces the list): a large photo NAS fits.
+const MAX_ENTRIES: usize = 500_000;
 
 struct Entry {
     path: String,
@@ -91,8 +92,11 @@ pub fn start(wake_ui: impl Fn() + Send + 'static) {
     if STARTED.swap(true, Ordering::SeqCst) {
         return;
     }
+    // a folder on this PC (an older version took one) is the service's to search
     let list: Vec<String> = std::fs::read_to_string(config_file())
-        .map(|t| t.lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect())
+        .map(|t| {
+            t.lines().map(str::trim).filter(|l| !l.is_empty() && !crate::win::is_local_drive(l)).map(String::from).collect()
+        })
         .unwrap_or_default();
     if let Ok(mut f) = FOLDERS.write() {
         *f = list;
@@ -225,26 +229,40 @@ fn walk(root: &Path, out: &mut Vec<Entry>) -> Result<(), String> {
     Ok(())
 }
 
+/// Written line by line (no second copy of the list in memory), to a
+/// temporary file renamed over the cache, so it is never half written.
 fn save_cache() {
-    let Ok(entries) = ENTRIES.read() else { return };
-    let mut text = String::with_capacity(entries.len() * 80);
-    for e in entries.iter() {
-        text.push_str(&format!("{}\t{}\t{}\t{}\n", if e.is_dir { "d" } else { "f" }, e.size, e.modified, e.path));
-    }
-    drop(entries);
+    use std::io::Write;
     let path = cache_file();
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let _ = crate::shell::write_whole(&path, text.as_bytes());
+    let tmp = path.with_extension("tsv.tmp");
+    let written = (|| -> std::io::Result<()> {
+        let mut out = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
+        if let Ok(entries) = ENTRIES.read() {
+            for e in entries.iter() {
+                writeln!(out, "{}\t{}\t{}\t{}", if e.is_dir { "d" } else { "f" }, e.size, e.modified, e.path)?;
+            }
+        }
+        out.into_inner().map_err(|e| e.into_error())?.sync_all()
+    })();
+    if written.is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
+    } else {
+        let _ = std::fs::remove_file(&tmp);
+    }
 }
 
+/// Read line by line, at most `MAX_ENTRIES`.
 fn load_cache() {
-    let Ok(text) = std::fs::read_to_string(cache_file()) else { return };
+    use std::io::BufRead;
+    let Ok(file) = std::fs::File::open(cache_file()) else { return };
     let folders = folders();
     let inside = |p: &str| folders.iter().any(|f| p.starts_with(&format!("{}\\", f.trim_end_matches('\\'))));
-    let entries: Vec<Entry> = text
+    let entries: Vec<Entry> = std::io::BufReader::new(file)
         .lines()
+        .map_while(Result::ok)
         .filter_map(|l| {
             let mut parts = l.splitn(4, '\t');
             let is_dir = parts.next()? == "d";
@@ -254,6 +272,7 @@ fn load_cache() {
             let name = fold(path.rsplit('\\').next().unwrap_or(&path));
             inside(&path).then_some(Entry { path, name, is_dir, size, modified })
         })
+        .take(MAX_ENTRIES)
         .collect();
     if let Ok(mut e) = ENTRIES.write() {
         *e = entries;
