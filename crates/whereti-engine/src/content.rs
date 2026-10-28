@@ -103,6 +103,9 @@ const BUSY_MAX: Duration = Duration::from_secs(15 * 60);
 const HINTS_KEPT: usize = 16;
 /// Opening the content index failed: tried again this often.
 const REOPEN_EVERY: Duration = Duration::from_secs(60);
+/// A file that could not be opened starts no round of its own for this
+/// long after (an open mailbox is written all the time).
+const LOCKED_QUIET: Duration = Duration::from_secs(10 * 60);
 
 pub struct Content {
     /// Set once the index is open (it is opened again later when it could
@@ -152,8 +155,13 @@ pub struct Content {
     /// A model download is under way (one at a time).
     meaning_downloading: AtomicBool,
     tags_downloading: AtomicBool,
-    /// Music and videos (no text: not counted as documents).
-    media_keys: Mutex<HashSet<u64>>,
+    /// Photos and pictures, music and videos: in the index (for where they
+    /// were taken, what is in them, their properties), not documents.
+    not_documents: Mutex<HashSet<u64>>,
+    /// Files that could not be opened (an open Outlook mailbox, no access),
+    /// and when: still tried every round, but they hold back neither the
+    /// photos nor the meaning, nor start rounds of their own for a while.
+    locked: Mutex<HashMap<u64, Instant>>,
     /// Text read for meaning while the documents' text came first: kept
     /// until the model reads it in the next round, so no document is read
     /// twice. Lost on a restart (then read again).
@@ -261,7 +269,8 @@ impl Content {
             tags_failed: Mutex::new(None),
             meaning_downloading: AtomicBool::new(false),
             tags_downloading: AtomicBool::new(false),
-            media_keys: Mutex::new(HashSet::new()),
+            not_documents: Mutex::new(HashSet::new()),
+            locked: Mutex::new(HashMap::new()),
             meaning_text: Mutex::new(HashMap::new()),
             models_turn: AtomicBool::new(false),
             failed_once: Mutex::new(HashMap::new()),
@@ -321,9 +330,15 @@ impl Content {
             .collect();
         let letter = idx.volumes()[vol].letter();
         let known = self.known_keys.read();
+        let locked = self.locked.lock();
         let now = system::date_ctx().now;
         for &r in records {
             let entry = idx.live_entry_of(vol, r);
+            // could not be opened lately (an open mailbox written all the time):
+            // no round of its own for a while; every round still tries it
+            if entry.is_some() && locked.get(&key(letter, r)).is_some_and(|t| t.elapsed() < LOCKED_QUIET) {
+                continue;
+            }
             if let Some(&(size, modified)) = known.get(&key(letter, r)) {
                 if let Some(e) = entry.filter(|&e| !idx.is_dir(e)) {
                     // the same size and date: only read, renamed or its attributes set
@@ -821,10 +836,13 @@ impl Content {
             let _ = std::fs::write(&ocr_marker, "new index\n");
             let _ = std::fs::write(&places_marker, "new index\n");
         }
+        // Files forgotten to be read again, still in the index: removed from
+        // it if they are gone before that.
+        let mut forgotten: HashSet<u64> = HashSet::new();
         let ocr_pass = !ocr_marker.exists();
         if ocr_pass {
             let before = known.len();
-            known.retain(|_, i| !matches!(i.status, Status::Empty | Status::Failed));
+            forget(&mut known, &mut forgotten, |_, i| matches!(i.status, Status::Empty | Status::Failed));
             if known.len() < before {
                 shared.log.log(format!("content: {} documents without text are read again with OCR", before - known.len()));
             }
@@ -844,7 +862,7 @@ impl Content {
                 let guard = shared.index.read();
                 guard.as_ref().map(photo_keys).unwrap_or_default()
             };
-            known.retain(|k, _| !photos.contains(k));
+            forget(&mut known, &mut forgotten, |k, _| photos.contains(&k));
             if known.len() < before {
                 shared.log.log(format!("content: {} photos are read again for where they were taken", before - known.len()));
             }
@@ -875,7 +893,7 @@ impl Content {
                         self.no_sandbox.lock().clear();
                     }
                 }
-                match self.round(index, &shared, &mut known, sandbox.as_ref()) {
+                match self.round(index, &shared, &mut known, &mut forgotten, sandbox.as_ref()) {
                     Ok(()) => {
                         let all_done = self.status.lock().queued == 0 && !self.models_turn.load(Ordering::Relaxed);
                         if ocr_pass && all_done && !ocr_marker.exists() {
@@ -915,6 +933,7 @@ impl Content {
         index: &ContentIndex,
         shared: &Shared,
         known: &mut HashMap<u64, Indexed>,
+        forgotten: &mut HashSet<u64>,
         sandbox: Option<&Sandbox>,
     ) -> Result<(), String> {
         let t = Instant::now();
@@ -929,8 +948,9 @@ impl Content {
             let Some(idx) = guard.as_ref() else { return Ok(()) };
             files_in(idx, &folders, &pictures)
         };
-        // music and videos: no text, not counted as documents
-        *self.media_keys.lock() = wanted.values().filter(|c| c.media_only).map(|c| c.key).collect();
+        // photos, pictures, music and videos: not counted as documents
+        *self.not_documents.lock() = wanted.values().filter(|c| c.media_only || c.photo_only || is_picture(&c.path)).map(|c| c.key).collect();
+        self.locked.lock().retain(|k, _| wanted.contains_key(k));
         let crashed = self.crashed.lock().clone();
         // Recognition on: photos not looked at yet by the model are read again;
         // off: photos that carry tags are read again without them. Kept per
@@ -962,14 +982,14 @@ impl Content {
                     if want_tags { "with" } else { "without" }
                 ));
             }
-            for k in redo {
-                known.remove(&k);
-            }
+            let redo: HashSet<u64> = redo.into_iter().collect();
+            forget(known, forgotten, |k, _| redo.contains(&k));
         }
-        let removed: Vec<u64> = known.keys().filter(|k| !wanted.contains_key(k)).copied().collect();
+        let removed = gone_keys(known, forgotten, &|k| wanted.contains_key(&k));
         for k in &removed {
             index.remove(*k);
             known.remove(k);
+            forgotten.remove(k);
         }
         // properties and vectors of files gone (or of files never recorded)
         self.props.lock().retain(|k| wanted.contains_key(&k));
@@ -995,14 +1015,17 @@ impl Content {
         } else {
             Vec::new()
         };
-        // indexed before properties were read (or read without them): only those
+        // indexed before properties were read (or read without them): only
+        // those; one read again for its meaning gets them then
         let props_missing: Vec<Candidate> = {
             let store = self.props.lock();
+            let for_meaning: HashSet<u64> = meaning_missing.iter().map(|c| c.key).collect();
             wanted
                 .values()
                 .filter(|c| {
                     known.get(&c.key).is_some_and(|i| i.size == c.size && i.modified == c.modified)
                         && !store.contains(c.key)
+                        && !for_meaning.contains(&c.key)
                         && !crashed.contains(&c.key)
                         && crate::props::has_props(&ext_of(&c.path))
                 })
@@ -1026,8 +1049,13 @@ impl Content {
         // their text, quickly; photos and meaning (the slow models) come in
         // the next round, right after. Whatever the user writes becomes
         // searchable in minutes, not after hours of model work.
-        let is_later = |c: &Candidate| c.meaning_only || c.photo_only || is_picture(&c.path);
-        let text_waiting = todo.iter().any(|c| !is_later(c) && !c.props_only && !c.media_only);
+        // Files that could not be opened lately (an open mailbox) are tried,
+        // but do not hold the rest back.
+        let is_later = |c: &Candidate| c.meaning_only || c.props_only || c.photo_only || c.media_only || is_picture(&c.path);
+        let text_waiting = {
+            let locked = self.locked.lock();
+            todo.iter().any(|c| !is_later(c) && !locked.contains_key(&c.key))
+        };
         let models_turn = self.models_turn.swap(false, Ordering::Relaxed);
         let models_later = !models_turn && text_waiting && (meaning_now || todo.iter().any(is_later));
         if models_later {
@@ -1137,34 +1165,41 @@ impl Content {
                         let what = Indexed { size: c.size, modified: c.modified, status: Status::Failed };
                         index.put(c.key, what, "").map_err(|e| e.to_string())?;
                         known.insert(c.key, what);
+                        forgotten.remove(&c.key);
                     }
                     break 'file false;
                 }
                 // the crash marker is set only around what runs in this process
                 // (a sandboxed read cut short by a shutdown is no crash)
                 let mark = |on: bool| self.reading(on.then_some(c.key));
+                // read again for its meaning: its properties only when missing
+                let ext = ext_of(&c.path);
+                let props_wanted = crate::props::has_props(&ext) && !(c.meaning_only && self.props.lock().contains(c.key));
                 if c.meaning_only {
-                    // the model failed meanwhile: not read for nothing
-                    if !meaning_now {
+                    // the model failed meanwhile: not read for nothing (its
+                    // missing properties still are, below)
+                    if !meaning_now && !props_wanted {
                         break 'file false;
                     }
-                    // the text kept for it stays until the model has read it
-                    let kept = self.meaning_text.lock().get(&c.key).cloned();
-                    let pieces = match kept {
-                        Some(p) => Some(p),
-                        None => extract(&c, sandbox, None, None, &mut Looked::No, &mark)
-                            .ok()
-                            .map(|(_, text)| whereti_extract::meaning::pieces(&text, crate::meaning::PIECES)),
-                    };
-                    if let Some(pieces) = pieces {
-                        if self.read_meaning(c.key, &pieces) {
-                            self.meaning_text.lock().remove(&c.key);
-                        } else {
-                            meaning_now = false;
-                            self.keep_meaning_text(c.key, pieces);
+                    if meaning_now {
+                        // the text kept for it stays until the model has read it
+                        let kept = self.meaning_text.lock().get(&c.key).cloned();
+                        let pieces = match kept {
+                            Some(p) => Some(p),
+                            None => extract(&c, sandbox, None, None, &mut Looked::No, &mark)
+                                .ok()
+                                .map(|(_, text)| whereti_extract::meaning::pieces(&text, crate::meaning::PIECES)),
+                        };
+                        if let Some(pieces) = pieces {
+                            if self.read_meaning(c.key, &pieces) {
+                                self.meaning_text.lock().remove(&c.key);
+                            } else {
+                                meaning_now = false;
+                                self.keep_meaning_text(c.key, pieces);
+                            }
                         }
+                        since_commit += 1;
                     }
-                    since_commit += 1;
                 } else if !c.props_only {
                     // a photo unchanged since the model looked at it keeps those tags
                     // while the model gives none now (off for a while, failing)
@@ -1174,7 +1209,10 @@ impl Content {
                     let read = match extract(&c, sandbox, tagger.as_mut(), kept.as_deref(), &mut looked, &mark) {
                         Ok(r) => r,
                         // gone, locked, no access: in a later round (nothing is kept of it)
-                        Err(Skip::Later) => break 'file true,
+                        Err(Skip::Later) => {
+                            self.locked.lock().insert(c.key, Instant::now());
+                            break 'file true;
+                        }
                         Err(Skip::NoSandbox) => {
                             self.no_sandbox.lock().insert(c.key, (c.size, c.modified));
                             break 'file false;
@@ -1192,6 +1230,8 @@ impl Content {
                     let (what, text) = read;
                     index.put(c.key, what, &text).map_err(|e| e.to_string())?;
                     known.insert(c.key, what);
+                    forgotten.remove(&c.key);
+                    self.locked.lock().remove(&c.key);
                     since_commit += 1;
                     indexed += 1;
                     // read again: the text kept for the model is of an older version
@@ -1211,8 +1251,7 @@ impl Content {
                         self.vectors.lock().remove(c.key);
                     }
                 }
-                let ext = ext_of(&c.path);
-                if crate::props::has_props(&ext) {
+                if props_wanted {
                     mark(true);
                     let mut p = crate::props::read(Path::new(&c.path), &ext, tz);
                     mark(false);
@@ -1245,12 +1284,14 @@ impl Content {
                         p.ocr = ocr_on && is_picture(&c.path) && !is_raw(&c.path);
                     }
                     self.props.lock().set(c.key, p);
-                } else if !c.props_only && !c.meaning_only {
+                } else if !crate::props::has_props(&ext) && !c.props_only && !c.meaning_only {
                     // a record reused by another kind of file: no old properties on it
                     self.props.lock().remove(c.key);
                 }
                 true
             };
+            // the file's own work (not the commit below)
+            let took = started.elapsed();
             {
                 let mut s = self.status.lock();
                 s.done = n as u64 + 1;
@@ -1272,7 +1313,6 @@ impl Content {
             // Rest at least as long as the file took; a quarter of that
             // while nobody is at the PC (locked, screen saver), four times
             // that while the CPU stays busy. A stop or a new plan ends it.
-            let took = started.elapsed();
             let rest = if slow {
                 took * 4
             } else if self.recent_hint().1 {
@@ -1303,24 +1343,25 @@ impl Content {
             shared.log.log(format!(
                 "content: indexed {indexed} files in {} s; {} documents, {} MB on disk",
                 t.elapsed().as_secs(),
-                index.docs(),
+                self.status.lock().files,
                 index.disk_bytes() >> 20
             ));
         }
         let mut s = self.status.lock();
-        if s.queued == 0 {
+        // not ready yet while the models' round is to come
+        if s.queued == 0 && !(models_later && !self.stopping()) {
             s.state = "ready".into();
         }
         Ok(())
     }
 
     fn update_counts(&self, index: &ContentIndex, known: &HashMap<u64, Indexed>) {
-        let failed = known.values().filter(|i| matches!(i.status, Status::Failed | Status::Protected | Status::TooLarge)).count();
-        // music and videos are in the index (for their properties), not documents
-        let media = self.media_keys.lock().iter().filter(|k| known.contains_key(k)).count() as u64;
+        // photos, music and videos are in the index (for their places, tags and
+        // properties), not documents
+        let (files, failed) = document_counts(known, &self.not_documents.lock());
         let mut s = self.status.lock();
-        s.files = index.docs().saturating_sub(media);
-        s.failed = failed as u64;
+        s.files = files;
+        s.failed = failed;
         s.disk_bytes = index.disk_bytes();
     }
 
@@ -2203,6 +2244,37 @@ fn new_sandbox() -> Option<Sandbox> {
     })
 }
 
+/// Forgets the indexed files `again` says yes to, so the next round reads
+/// them again; they are kept in `forgotten` until then (still in the index).
+fn forget(known: &mut HashMap<u64, Indexed>, forgotten: &mut HashSet<u64>, again: impl Fn(u64, &Indexed) -> bool) {
+    known.retain(|&k, i| {
+        let keep = !again(k, i);
+        if !keep {
+            forgotten.insert(k);
+        }
+        keep
+    });
+}
+
+/// The keys to remove from the index: files indexed, or forgotten to be
+/// read again, that are no longer wanted.
+fn gone_keys(known: &HashMap<u64, Indexed>, forgotten: &HashSet<u64>, wanted: &impl Fn(u64) -> bool) -> Vec<u64> {
+    let gone: HashSet<u64> = known.keys().chain(forgotten).copied().filter(|&k| !wanted(k)).collect();
+    gone.into_iter().collect()
+}
+
+/// (documents, of them could not be read): the indexed files, without
+/// `not_documents`.
+fn document_counts(known: &HashMap<u64, Indexed>, not_documents: &HashSet<u64>) -> (u64, u64) {
+    let docs = known.iter().filter(|(k, _)| !not_documents.contains(k));
+    let (mut files, mut failed) = (0, 0);
+    for (_, i) in docs {
+        files += 1;
+        failed += matches!(i.status, Status::Failed | Status::Protected | Status::TooLarge) as u64;
+    }
+    (files, failed)
+}
+
 /// Size and date of each indexed file, by key.
 fn known_sizes(known: &HashMap<u64, Indexed>) -> HashMap<u64, (u64, u32)> {
     known.iter().map(|(k, i)| (*k, (i.size, i.modified))).collect()
@@ -2516,6 +2588,31 @@ mod tests {
         // it does not: the model's failure, nothing is kept
         assert_eq!(embed_pieces(&pieces, embed, &mut || Err("no answer in 20 s".into())), Err("no answer in 20 s".into()));
         assert_eq!(embed_pieces(&[], embed, &mut || Err("never asked".into())), Ok(vec![]));
+    }
+
+    #[test]
+    fn files_forgotten_to_be_read_again_leave_the_index_when_gone() {
+        let at = |status| Indexed { size: 1, modified: 1, status };
+        let mut known: HashMap<u64, Indexed> = [(1, at(Status::Ok)), (2, at(Status::Empty)), (3, at(Status::Ok))].into();
+        let mut forgotten = HashSet::new();
+        forget(&mut known, &mut forgotten, |_, i| i.status == Status::Empty);
+        forget(&mut known, &mut forgotten, |k, _| k == 3);
+        assert_eq!(known.keys().copied().collect::<Vec<_>>(), [1]);
+        assert_eq!(forgotten, [2, 3].into());
+        // 2 and 3 deleted before they were read again: still removed from the index
+        let mut gone = gone_keys(&known, &forgotten, &|k| k == 1);
+        gone.sort();
+        assert_eq!(gone, [2, 3]);
+        assert!(gone_keys(&known, &forgotten, &|_| true).is_empty());
+    }
+
+    #[test]
+    fn photos_and_media_are_not_counted_as_documents() {
+        let at = |status| Indexed { size: 1, modified: 1, status };
+        let known: HashMap<u64, Indexed> = [(1, at(Status::Ok)), (2, at(Status::Failed)), (3, at(Status::Ok)), (4, at(Status::Failed))].into();
+        // 3 is a photo, 4 a song
+        assert_eq!(document_counts(&known, &[3, 4].into()), (2, 1));
+        assert_eq!(document_counts(&known, &HashSet::new()), (4, 2));
     }
 
     #[test]
