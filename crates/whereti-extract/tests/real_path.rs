@@ -35,6 +35,16 @@ fn a_file_is_read_only_at_its_real_path() {
         let through = std::path::PathBuf::from(format!(r"{}\secret.txt", drive.0));
         assert!(open_real(&through).is_ok(), "{} refused", through.display());
     }
+    // and through a SUBST drive letter for a share (the drive's own admin
+    // share, where this user may use it)
+    let local = target.to_string_lossy().into_owned();
+    let share = std::path::PathBuf::from(format!(r"\\localhost\{}${}", &local[..1], &local[2..]));
+    if share.join("secret.txt").is_file() {
+        if let Some(drive) = Subst::new(&share) {
+            let through = std::path::PathBuf::from(format!(r"{}\secret.txt", drive.0));
+            assert!(open_real(&through).is_ok(), "{} refused", through.display());
+        }
+    }
     // through the junction: refused
     let through = link.join("secret.txt");
     assert!(std::fs::read(&through).is_ok(), "the junction itself works");

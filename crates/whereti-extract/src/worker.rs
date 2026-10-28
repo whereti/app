@@ -948,19 +948,26 @@ fn dos_target(path: &Path) -> PathBuf {
         return PathBuf::from(s);
     }
     let drive = s[..2].to_ascii_uppercase();
-    let Some(target) = dos_device(&drive) else { return PathBuf::from(s) };
-    let mapped = if let Some(dir) = target.strip_prefix(r"\??\") {
-        // SUBST: \??\C:\some\folder
-        Some(dir.trim_end_matches('\\').to_string())
-    } else {
-        // a network drive: \Device\LanmanRedirector\;Z:0000000000012345\server\share
-        let upper = target.to_ascii_uppercase();
-        upper.find(&format!(";{drive}")).and_then(|at| target[at + 1..].find('\\').map(|p| format!(r"\{}", &target[at + 1 + p..])))
-    };
-    match mapped {
+    match dos_device(&drive).and_then(|target| drive_target(&drive, &target)) {
         Some(m) => PathBuf::from(format!("{m}{}", &s[2..])),
         None => PathBuf::from(s),
     }
+}
+
+/// The folder or share the drive letter `drive` (`X:`) stands for, from
+/// what Windows says it is (`target`); `None` for a drive of its own.
+fn drive_target(drive: &str, target: &str) -> Option<String> {
+    if let Some(dir) = target.strip_prefix(r"\??\") {
+        // SUBST: \??\C:\some\folder, or onto a share: \??\UNC\server\share
+        let dir = dir.trim_end_matches('\\');
+        return Some(match dir.get(..4).filter(|p| p.eq_ignore_ascii_case(r"UNC\")) {
+            Some(_) => format!(r"\\{}", &dir[4..]),
+            None => dir.to_string(),
+        });
+    }
+    // a network drive: \Device\LanmanRedirector\;Z:0000000000012345\server\share
+    let upper = target.to_ascii_uppercase();
+    upper.find(&format!(";{drive}")).and_then(|at| target[at + 1..].find('\\').map(|p| format!(r"\{}", &target[at + 1 + p..])))
 }
 
 /// What a DOS device name (`X:`) stands for.
@@ -1064,6 +1071,15 @@ impl Drop for Job {
 mod tests {
     use super::*;
     use std::time::Instant;
+
+    #[test]
+    fn drive_letters_map_to_what_they_stand_for() {
+        assert_eq!(drive_target("X:", r"\??\C:\Users\ana\acte\").as_deref(), Some(r"C:\Users\ana\acte"));
+        // SUBST onto a share names it as an open file is named
+        assert_eq!(drive_target("X:", r"\??\UNC\server\share\acte").as_deref(), Some(r"\\server\share\acte"));
+        assert_eq!(drive_target("Z:", r"\Device\LanmanRedirector\;Z:0000000000012345\server\share").as_deref(), Some(r"\\server\share"));
+        assert_eq!(drive_target("C:", r"\Device\HarddiskVolume3"), None);
+    }
 
     #[test]
     fn a_pipe_held_elsewhere_is_not_waited_for() {
