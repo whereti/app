@@ -268,30 +268,41 @@ pub(crate) fn within<T>(until: std::time::Instant, f: impl FnOnce() -> T) -> T {
 struct Out {
     text: String,
     budget: usize,
+    /// Something was left out (time ran out, too many names...).
     truncated: bool,
+    /// Text was refused for want of budget.
+    cut: bool,
 }
 
 impl Out {
     fn new(max_chars: usize) -> Out {
-        Out { text: String::new(), budget: max_chars, truncated: false }
+        Out { text: String::new(), budget: max_chars, truncated: false, cut: false }
     }
 
-    /// The budget is spent. Callers ask this before adding more, so when it
-    /// is, something is left out and the text counts as truncated.
-    fn full(&mut self) -> bool {
-        if self.budget == 0 {
-            self.truncated = true;
-        }
+    /// Text was refused for want of budget: callers stop adding more. A
+    /// text that fits exactly is not cut, so the budget may be spent before
+    /// this says so (`spent`).
+    fn full(&self) -> bool {
+        self.cut
+    }
+
+    /// Nothing more fits: for callers whose next step is slow (a document
+    /// inside an archive), which skip it, and count it as left out.
+    fn spent(&self) -> bool {
         self.budget == 0
     }
 
     fn push(&mut self, s: &str) {
         for c in s.chars() {
-            if self.budget == 0 {
-                self.truncated = true;
-                return;
-            }
             let c = if c == '\r' || (c.is_control() && c != '\n' && c != '\t') { continue } else { c };
+            if self.budget == 0 {
+                // white space past the end is not text left out
+                if !c.is_whitespace() {
+                    self.cut = true;
+                    return;
+                }
+                continue;
+            }
             self.text.push(c);
             self.budget -= 1;
         }
@@ -321,7 +332,7 @@ impl Out {
             tidy.push('\n');
         }
         self.text = tidy.trim().to_string();
-        Extracted { text: self.text, truncated: self.truncated }
+        Extracted { text: self.text, truncated: self.truncated || self.cut }
     }
 }
 
@@ -1077,6 +1088,16 @@ mod tests {
         let slide = |t: &str| format!(r#"<p:sld xmlns:a="a" xmlns:p="p"><a:p><a:r><a:t>{t}</a:t></a:r></a:p></p:sld>"#);
         let e = extract("pptx", &make_zip(&[("ppt/slides/slide1.xml", &slide("unu")), ("ppt/slides/slide2.xml", &slide("doi"))]), 3).unwrap();
         assert!(e.truncated, "{e:?}");
+        // an exact fit leaves nothing out
+        let doc = r#"<w:document xmlns:w="w"><w:body><w:p><w:r><w:t>abcd</w:t></w:r></w:p><w:p></w:p></w:body></w:document>"#;
+        let e = extract("docx", &make_zip(&[("word/document.xml", doc)]), 4).unwrap();
+        assert_eq!((e.text.as_str(), e.truncated), ("abcd", false));
+        let e = extract("pptx", &make_zip(&[("ppt/slides/slide1.xml", &slide("unu")), ("ppt/slides/slide2.xml", &slide(""))]), 3).unwrap();
+        assert_eq!((e.text.as_str(), e.truncated), ("unu", false));
+        assert_eq!(extract("txt", b"abcd\r\n\n", 4).unwrap(), Extracted { text: "abcd".into(), truncated: false });
+        let z = make_zip(&[("a.jpg", "x")]);
+        assert_eq!(extract("zip", &z, 5).unwrap(), Extracted { text: "a.jpg".into(), truncated: false });
+        assert!(extract("zip", &make_zip(&[("a.jpg", "x"), ("b.jpg", "y")]), 5).unwrap().truncated);
     }
 
     #[test]

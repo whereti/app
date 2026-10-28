@@ -57,7 +57,8 @@ fn read_until() -> Instant {
 /// Adds a document's text, under its name again, read by `until`.
 fn content(out: &mut Out, name: &str, bytes: &[u8], until: Instant) {
     let Some(ext) = readable(name) else { return };
-    if out.full() {
+    if out.spent() {
+        out.truncated = true;
         return;
     }
     if let Ok(e) = crate::within(until, || extract(&ext, bytes, out.budget)) {
@@ -95,7 +96,7 @@ pub(crate) fn zip(bytes: &[u8], out: &mut Out) -> Result<(), ExtractError> {
     // 2. the documents' text, while there is time
     let until = read_until();
     for (i, name) in wanted {
-        if out.full() || Instant::now() >= until {
+        if out.spent() || Instant::now() >= until {
             out.truncated = true;
             break;
         }
@@ -147,7 +148,7 @@ pub(crate) fn sevenz(bytes: &[u8], out: &mut Out) -> Result<(), ExtractError> {
     blocks.sort_unstable();
     blocks.dedup();
     for block in blocks {
-        if out.full() || Instant::now() >= until {
+        if out.spent() || Instant::now() >= until {
             out.truncated = true;
             break;
         }
@@ -159,7 +160,7 @@ pub(crate) fn sevenz(bytes: &[u8], out: &mut Out) -> Result<(), ExtractError> {
         let _ = decoder.for_each_entries(&mut |entry, data| {
             let i = index;
             index += 1;
-            if out.full() || Instant::now() >= until {
+            if out.spent() || Instant::now() >= until {
                 out.truncated = true;
                 return Ok(false);
             }
