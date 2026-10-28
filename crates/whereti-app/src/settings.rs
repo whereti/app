@@ -31,6 +31,9 @@ pub struct SettingsState {
     pub hotkey: Option<String>,
     pub theme: ThemeChoice,
     pub autostart: bool,
+    /// "Start with Windows" was turned on once, at the first start: never
+    /// again after that (the user may have turned it off).
+    pub autostart_offered: bool,
     /// The welcome page was seen and closed.
     pub welcomed: bool,
     /// The preview panel is open.
@@ -70,6 +73,7 @@ impl SettingsState {
             hotkey: None,
             theme: ThemeChoice::System,
             autostart: shell::autostart_enabled(),
+            autostart_offered: false,
             welcomed: false,
             preview: true,
             lang: None,
@@ -96,6 +100,7 @@ impl SettingsState {
                     Some(("preview", "off")) => s.preview = false,
                     Some(("language", v)) => s.lang = Lang::from_code(v),
                     Some(("welcomed", "yes")) => s.welcomed = true,
+                    Some(("autostart_offered", "yes")) => s.autostart_offered = true,
                     Some(("updates", "off")) => s.updates = false,
                     Some(("learn", "off")) => s.learn = false,
                     Some(("searches", "off")) => s.remember_searches = false,
@@ -104,6 +109,8 @@ impl SettingsState {
                 }
             }
         }
+        // a version before this flag turned it on with the welcome page
+        s.autostart_offered |= s.welcomed;
         crate::usage::set_enabled(s.learn);
         crate::history::set_enabled(s.remember_searches);
         s
@@ -140,6 +147,9 @@ impl SettingsState {
         }
         if self.photo_tags_asked {
             text.push_str("photo_tags_asked=yes\n");
+        }
+        if self.autostart_offered {
+            text.push_str("autostart_offered=yes\n");
         }
         let path = settings_file();
         if let Some(dir) = path.parent() {

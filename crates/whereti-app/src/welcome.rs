@@ -101,12 +101,11 @@ pub fn show(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
                     _ => tr("looking for documents…").to_string(),
                 };
                 let ready_step = if content_ready { Step::Done } else if names_ready { Step::Working(None) } else { Step::Waiting };
-                let hotkey = app.hotkey_label().unwrap_or_else(|| crate::tray::PREFERRED_HOTKEY.to_string());
-                let ready_detail = if names_ready {
-                    trf!("Press {hotkey} in any app to open whereti. You can search already.", hotkey)
-                } else {
-                    tr("You can start typing now; results grow as the index is built.")
-                    .to_string()
+                // the shortcut only if one works (all may be taken by other apps)
+                let ready_detail = match (names_ready, app.hotkey_label()) {
+                    (true, Some(hotkey)) => trf!("Press {hotkey} in any app to open whereti. You can search already.", hotkey),
+                    (true, None) => tr("Open whereti from its icon next to the clock. You can search already.").to_string(),
+                    (false, _) => tr("You can start typing now; results grow as the index is built.").to_string(),
                 };
 
                 Frame::NONE
@@ -231,6 +230,12 @@ fn optional_row(ui: &mut egui::Ui, p: &Palette, title: &str, desc: &str, size: &
 pub fn finish(app: &mut WheretiApp) {
     app.page = Page::Search;
     app.focus_search = true;
+    seen(app);
+}
+
+/// The welcome page was seen and left (by any way: a button, a key, the
+/// settings, closing the window): it does not come back at the next start.
+pub fn seen(app: &mut WheretiApp) {
     if !app.settings.welcomed {
         app.settings.welcomed = true;
         app.settings.save();

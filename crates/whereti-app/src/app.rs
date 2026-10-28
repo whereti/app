@@ -285,13 +285,18 @@ impl WheretiApp {
             },
         };
         app.settings.apply_theme(ctx);
-        // First start (or right after the installer): the welcome page, and
-        // whereti starts with Windows unless the user turns it off later.
+        // First start (or right after the installer): the welcome page
         if !app.settings.welcomed || std::env::args().any(|a| a == "--welcome") {
             app.page = Page::Welcome;
-            if !app.settings.welcomed && !app.settings.autostart && shell::set_autostart(true).is_ok() {
+        }
+        // and whereti starts with Windows unless the user turns it off: turned
+        // on the very first time only, never again once the user chose
+        if !app.settings.autostart_offered {
+            app.settings.autostart_offered = true;
+            if !app.settings.autostart && shell::set_autostart(true).is_ok() {
                 app.settings.autostart = true;
             }
+            app.settings.save();
         }
         match app.tray.as_ref().map(|t| t.hotkey.clone()) {
             // Said once: the shortcut actually used is then remembered.
@@ -389,7 +394,10 @@ impl WheretiApp {
         ctx.send_viewport_cmd(ViewportCommand::Focus);
         self.visible = true;
         self.focus_search = true;
-        self.page = Page::Search;
+        // the welcome page of a start in the tray waits to be seen
+        if self.page != Page::Welcome {
+            self.page = Page::Search;
+        }
         // apps installed meanwhile
         if self.last_launch_refresh.elapsed() > Duration::from_secs(10 * 60) {
             self.last_launch_refresh = Instant::now();
@@ -471,6 +479,16 @@ impl WheretiApp {
         self.remember_search();
         self.file_dialog = None;
         self.pending_open = None;
+        // the window closed on the welcome page: it was seen
+        if self.page == Page::Welcome {
+            crate::welcome::seen(self);
+            self.page = Page::Search;
+        }
+        // a new shortcut being typed: the one in use works again (hidden,
+        // the window could not be brought back without it)
+        if self.settings.recording {
+            crate::settings::stop_recording(self);
+        }
         // thumbnails are memory: made again when the grid is shown again
         self.thumbs.clear();
         self.file_icons.trim();
@@ -2176,6 +2194,9 @@ impl eframe::App for WheretiApp {
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.keep_hidden_at_start(ctx, frame);
         if Requests::take(&self.requests.quit) {
+            if self.visible && self.page == Page::Welcome {
+                crate::welcome::seen(self);
+            }
             self.quitting = true;
             ctx.send_viewport_cmd(ViewportCommand::Close);
         }
@@ -2317,6 +2338,10 @@ impl eframe::App for WheretiApp {
             });
         // no grid this frame: no thumbnails fetched for it
         self.thumbs.after_frame();
+        // the welcome page left another way (the settings, the "?" panel)
+        if self.page != Page::Welcome {
+            crate::welcome::seen(self);
+        }
     }
 }
 

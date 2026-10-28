@@ -237,4 +237,15 @@ pub const ENTRIES: &[Entry] = &[
         pt_br: "A primeira leitura leva de minutos a algumas horas, conforme seus documentos, e acontece só uma vez.",
         ro: "Prima citire durează de la minute la câteva ore, după câte documente ai, și se face o singură dată.",
     },
+    Entry {
+        en: "Open whereti from its icon next to the clock. You can search already.",
+        note: "Detail line of the last step on the welcome page when no keyboard shortcut could be registered (all are taken by other apps).",
+        de: "Öffnen Sie whereti über sein Symbol neben der Uhr. Sie können schon suchen.",
+        es: "Abre whereti desde su icono junto al reloj. Ya puedes buscar.",
+        fr: "Ouvrez whereti depuis son icône près de l'horloge. Vous pouvez déjà rechercher.",
+        it: "Apri whereti dalla sua icona accanto all'orologio. Puoi già cercare.",
+        pl: "Otwórz whereti ikoną obok zegara. Możesz już szukać.",
+        pt_br: "Abra o whereti pelo ícone ao lado do relógio. Você já pode pesquisar.",
+        ro: "Deschide whereti din iconița de lângă ceas. Poți căuta deja.",
+    },
 ];
