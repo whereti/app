@@ -172,26 +172,46 @@ fn unpack(packed: &[u8]) -> std::io::Result<Vec<u8>> {
 fn write_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let tmp = path.with_extension("new");
     std::fs::write(&tmp, bytes).map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
-    for attempt in 0..8 {
+    let mut attempt = 0;
+    let err = loop {
         match std::fs::rename(&tmp, path) {
             Ok(()) => return Ok(()),
+            Err(e) if attempt == 7 => break e,
             // a process that was just stopped may hold the file a moment longer
-            Err(_) if attempt < 7 => std::thread::sleep(Duration::from_millis(250)),
-            Err(_) => {}
+            Err(_) => {
+                attempt += 1;
+                std::thread::sleep(Duration::from_millis(250));
+            }
         }
+    };
+    let fail = |what: &str, e: std::io::Error| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("cannot {what} {}: {e}", path.display())
+    };
+    // nothing there to move aside (a first install): the rename's own error says why
+    if std::fs::symlink_metadata(path).is_err() {
+        return Err(fail("write", err));
     }
-    let name = path.file_name().unwrap_or_default().to_string_lossy();
-    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
-    let aside = path.with_file_name(format!("{name}.{stamp}{OLD}"));
-    std::fs::rename(path, &aside)
-        .and_then(|()| std::fs::rename(&tmp, path))
-        .map_err(|e| format!("cannot replace {}: {e}", path.display()))?;
+    let aside = aside_name(path);
+    std::fs::rename(path, &aside).map_err(|e| fail("replace", e))?;
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        // the old program goes back in its place
+        let _ = std::fs::rename(&aside, path);
+        return Err(fail("replace", e));
+    }
     delete_at_restart(&aside);
     Ok(())
 }
 
 /// The ending of a program moved aside by `write_file`.
 const OLD: &str = ".old";
+
+/// A name of its own for a file moved aside (`whereti.exe.<time>.old`).
+fn aside_name(path: &Path) -> PathBuf {
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+    path.with_file_name(format!("{name}.{stamp}{OLD}"))
+}
 
 /// Deletes the programs moved aside by an earlier install, where possible.
 fn remove_leftovers(dir: &Path) {
