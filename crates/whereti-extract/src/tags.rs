@@ -87,6 +87,10 @@ pub fn best_labels(image: &[f32]) -> Vec<(usize, f32)> {
     ranked.into_iter().take(MAX_TAGS).filter(|t| t.1 >= MIN_SHARE).collect()
 }
 
+/// How an answer about one photo Windows cannot decode begins: that photo's
+/// trouble, not the model's (the service tells them apart by it).
+pub const UNDECODABLE: &str = "cannot decode the photo";
+
 /// The model, loaded once per worker.
 pub struct Tagger {
     session: ort::session::Session,
@@ -122,7 +126,7 @@ impl Tagger {
     /// The image vector of a photo (JPEG, PNG, HEIC, WebP, TIFF, BMP, GIF:
     /// whatever Windows can decode).
     pub fn embed(&mut self, bytes: &[u8]) -> Result<Vec<f32>, String> {
-        let pixels = pixels(bytes).map_err(|e| format!("cannot decode the photo: {}", e.message()))?;
+        let pixels = pixels(bytes).map_err(|e| format!("{UNDECODABLE}: {}", e.message()))?;
         let input = ort::value::Tensor::from_array(([1usize, 3, SIDE as usize, SIDE as usize], pixels)).map_err(|e| e.to_string())?;
         let outputs = self.session.run(ort::inputs!["pixel_values" => input]).map_err(|e| e.to_string())?;
         let (_, embeds) = outputs["image_embeds"].try_extract_tensor::<f32>().map_err(|e| e.to_string())?;

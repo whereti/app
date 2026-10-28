@@ -2078,7 +2078,7 @@ enum Looked {
 /// The worker's answer for a picture Windows cannot decode (the text of
 /// whereti_extract::tags::Tagger::embed), unlike a failure of the model.
 fn undecodable(e: &str) -> bool {
-    e.starts_with("cannot decode the photo")
+    e.starts_with(whereti_extract::tags::UNDECODABLE)
 }
 
 /// The words a photo's tags add to its text (labels as in props `tags`).
