@@ -130,8 +130,8 @@ fn silent_install() -> Result<(), String> {
 }
 
 fn silent_uninstall() -> Result<(), String> {
-    ops::set_autostart(false);
     elevated_or_not("--do-uninstall", ops::uninstall)?;
+    // with "start with Windows": only once whereti is really gone
     ops::remove_user_settings();
     Ok(())
 }
@@ -166,7 +166,7 @@ impl Setup {
         *state.lock().unwrap() = if uninstall { State::Removing } else { State::Working };
         std::thread::spawn(move || {
             let result = if uninstall {
-                ops::set_autostart(false);
+                // "start with Windows" goes with the settings, once whereti is really gone
                 elevated_or_not("--do-uninstall", ops::uninstall).map(|()| ops::remove_user_settings())
             } else {
                 // an update keeps the user's choice about starting with Windows
