@@ -147,6 +147,12 @@ pub(crate) fn spawn(
     if ok == 0 {
         return Err(os_error("handle list"));
     }
+    // The handle list needs them inheritable, and while they are, a process
+    // another thread starts with every inheritable handle (std's Command
+    // does) gets them too: our ends then see no end of the pipe while it
+    // runs. Copies made for the list would be no better, and std's lock for
+    // this is its own: the broker stops waiting for such a pipe instead
+    // (see worker::PipeThread).
     for &h in &child_ends {
         // SAFETY: our own pipe handles; inheritable only until the child has them
         unsafe { SetHandleInformation(h, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) };

@@ -503,17 +503,17 @@ impl Sandbox {
         }
 
         let mut stdin = child.stdin.take().expect("piped");
-        let writer = std::thread::spawn(move || {
+        let writer = PipeThread::start(move || {
             let _ = stdin.write_all(&bytes);
         });
         let mut stdout = child.stdout.take().expect("piped");
-        let reader = std::thread::spawn(move || {
+        let reader = PipeThread::start(move || {
             let mut out = Vec::new();
             let _ = stdout.read_to_end(&mut out);
             out
         });
         let mut stderr = child.stderr.take().expect("piped");
-        let err_reader = std::thread::spawn(move || {
+        let err_reader = PipeThread::start(move || {
             let mut out = String::new();
             let _ = stderr.read_to_string(&mut out);
             out
@@ -526,9 +526,9 @@ impl Sandbox {
         let code = child.exit_code();
         // its pipes close with it (the job ends anything it could have left)
         drop(job);
-        let _ = writer.join();
-        let out = reader.join().unwrap_or_default();
-        let err = err_reader.join().unwrap_or_default();
+        writer.finish();
+        let out = reader.finish();
+        let err = err_reader.finish();
         if !finished {
             return Err(SandboxError::Failed(format!("took longer than {:.1} s", self.timeout.as_secs_f32())));
         }
@@ -578,7 +578,7 @@ fn sandbox_check(exe: &Path) -> (bool, String) {
             crate::spawn::spawn(exe, &[std::ffi::OsStr::new("--probe-sandbox")], restricted, false, &job, &[]).map_err(|e| e.to_string())?;
         drop(child.stdin.take());
         let mut stdout = child.stdout.take().ok_or("no stdout")?;
-        let reader = std::thread::spawn(move || {
+        let reader = PipeThread::start(move || {
             let mut out = String::new();
             let _ = stdout.read_to_string(&mut out);
             out
@@ -589,7 +589,7 @@ fn sandbox_check(exe: &Path) -> (bool, String) {
         }
         let code = child.exit_code();
         drop(job);
-        let out = reader.join().unwrap_or_default();
+        let out = reader.finish();
         match (finished, code) {
             (true, Some(0)) => Ok(out),
             (false, _) => Err("no answer in 20 s".into()),
@@ -609,6 +609,44 @@ fn sandbox_check(exe: &Path) -> (bool, String) {
     };
     known.push((exe.to_path_buf(), ok, report.clone()));
     (ok, report)
+}
+
+/// A thread reading or writing one of a worker's pipes. Once the worker
+/// has ended, its pipe ends close with it, but a process another thread
+/// started meanwhile may hold copies for as long as it runs (see `spawn`):
+/// then the read or write is cancelled after a short wait, and what was
+/// read is kept.
+struct PipeThread<T> {
+    thread: std::thread::JoinHandle<()>,
+    result: std::sync::mpsc::Receiver<T>,
+}
+
+impl<T: Send + Default + 'static> PipeThread<T> {
+    fn start(f: impl FnOnce() -> T + Send + 'static) -> PipeThread<T> {
+        let (tx, result) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        PipeThread { thread, result }
+    }
+
+    /// Its result, once the worker has ended.
+    fn finish(self) -> T {
+        use std::os::windows::io::AsRawHandle;
+        use std::sync::mpsc::RecvTimeoutError;
+        let mut wait = Duration::from_secs(2);
+        loop {
+            match self.result.recv_timeout(wait) {
+                Ok(v) => return v,
+                Err(RecvTimeoutError::Disconnected) => return T::default(),
+                Err(RecvTimeoutError::Timeout) => {
+                    // SAFETY: the handle of a thread we started, still held.
+                    unsafe { windows_sys::Win32::System::IO::CancelSynchronousIo(self.thread.as_raw_handle() as _) };
+                    wait = Duration::from_millis(50);
+                }
+            }
+        }
+    }
 }
 
 // Broker side of the photo tags: one worker process that keeps the model
@@ -957,5 +995,32 @@ impl Job {
 impl Drop for Job {
     fn drop(&mut self) {
         unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    fn a_pipe_held_elsewhere_is_not_waited_for() {
+        use std::os::windows::io::FromRawHandle;
+        let (mut r, mut w) = (std::ptr::null_mut(), std::ptr::null_mut());
+        // SAFETY: two out-pointers, no attributes.
+        assert_ne!(unsafe { windows_sys::Win32::System::Pipes::CreatePipe(&mut r, &mut w, std::ptr::null(), 0) }, 0);
+        // SAFETY: fresh handles, owned from here.
+        let (mut read, mut write) = unsafe { (std::fs::File::from_raw_handle(r as _), std::fs::File::from_raw_handle(w as _)) };
+        write.write_all(b"partial").unwrap();
+        // the write end stays open, as in a process that inherited it
+        let t = Instant::now();
+        let reader = PipeThread::start(move || {
+            let mut out = Vec::new();
+            let _ = read.read_to_end(&mut out);
+            out
+        });
+        assert_eq!(reader.finish(), b"partial");
+        assert!(t.elapsed() < Duration::from_secs(10), "{:?}", t.elapsed());
+        drop(write);
     }
 }
