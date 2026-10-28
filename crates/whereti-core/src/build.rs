@@ -620,6 +620,22 @@ fn add_volume(
             rule[c as usize] = by;
         }
     }
+    // The outermost folders left out (inside a kept folder), where they
+    // are: live updates know them again by record, parent and name.
+    {
+        let mut folded = String::new();
+        let left = idx.left_out.entry(vs.letter.to_ascii_uppercase()).or_default();
+        for (i, e) in scan.entries.iter().enumerate() {
+            if state[i] != 1 || !e.is_dir || e.record < FIRST_USER_RECORD {
+                continue;
+            }
+            let p = parent_of(i);
+            if p == NO_PARENT || state[p as usize] == 1 {
+                continue;
+            }
+            left.insert(e.record, (e.parent, folded_owned(scan.name(e), &mut folded)));
+        }
+    }
     // Each left-out entry counts for the outermost left-out folder above it:
     // the one that actually keeps it out (a package's `dist` inside
     // `node_modules` is `node_modules`' doing, not the `dist` rule's).
@@ -788,6 +804,12 @@ fn resolve_paths(
 }
 
 /// Index flags for NTFS file attributes.
+fn folded_owned(name: &str, buf: &mut String) -> String {
+    buf.clear();
+    whereti_query::fold_into(name, buf);
+    buf.clone()
+}
+
 pub(crate) fn attr_flags(attributes: u32, is_dir: bool) -> u16 {
     let mut flags = 0u16;
     if is_dir {

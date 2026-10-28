@@ -51,7 +51,7 @@ impl RecordSource for VolumeSource<'_> {
         Ok(Some(RecordState {
             is_dir: info.is_dir(),
             attributes: std.attributes,
-            size: if info.is_dir() { 0 } else { info.data_size.unwrap_or(0) },
+            size: if info.is_dir() { 0 } else { info.data_size.unwrap_or(whereti_core::SIZE_UNKNOWN) },
             modified: std.modified,
             links,
             complete: !info.attr_list_nonresident,

@@ -698,6 +698,8 @@ impl Worker {
                     t.elapsed().as_millis()
                 ));
                 idx.set_skipped(load_skipped(&self.cfg.index_path));
+                // the folders it left out (none known: they are checked on disk)
+                idx.set_left_out_lines(&std::fs::read_to_string(self.cfg.index_path.with_extension("leftout")).unwrap_or_default());
                 idx
             }
             Err(e) => {
@@ -1015,6 +1017,7 @@ impl Worker {
             let idx = guard.as_ref().expect("index");
             save_skipped(&self.cfg.index_path, idx.skipped_by_drive());
             save_exclusions(&self.cfg.index_path, idx.exclusions());
+            save_whole(&self.cfg.index_path.with_extension("leftout"), &idx.left_out_lines());
             snapshot::save(idx, &self.cfg.index_path)
                 .map_err(|e| format!("cannot save {}: {e}", self.cfg.index_path.display()))?
         };
@@ -1624,6 +1627,14 @@ fn system_drive() -> char {
 /// What each exclusion left out, kept beside the index (`<index>.skipped`,
 /// one `drive<TAB>count<TAB>rule` per line): an index loaded from disk does
 /// not carry it.
+/// `text` to `path`, whole or not at all.
+fn save_whole(path: &std::path::Path, text: &str) {
+    let tmp = path.with_extension("tmp-side");
+    if std::fs::write(&tmp, text).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
+    }
+}
+
 /// The exclusions, beside the index: one per line (written whole).
 fn save_exclusions(index_path: &std::path::Path, paths: &[String]) {
     let text: String = paths.iter().map(|p| format!("{p}\n")).collect();

@@ -29,11 +29,16 @@ const FIRST_USER_RECORD: u64 = 16;
 const KEEP_FLAGS: u16 = FLAG_ROOT | FLAG_NON_ASCII | FLAG_TAIL | FLAG_DELETED | FLAG_DETACHED | FLAG_GONE;
 // FLAG_NOISE and FLAG_HOME are worked out again from the parent (place_flags)
 
+/// `RecordState::size` when it could not be read.
+pub const SIZE_UNKNOWN: u64 = u64::MAX;
+
 /// Current on-disk state of one MFT record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordState {
     pub is_dir: bool,
     pub attributes: u32,
+    /// `SIZE_UNKNOWN` when the data's size is in a record that was not read
+    /// (a very fragmented file): the size known so far is kept.
     pub size: u64,
     /// Last write, FILETIME.
     pub modified: u64,
@@ -168,6 +173,10 @@ impl NameIndex {
                 stats.removed += 1;
             }
             self.set_entries_of(vol, r, &[]);
+            let letter = self.volumes[vol].letter();
+            if let Some(left) = self.left_out.get_mut(&letter) {
+                left.remove(&r);
+            }
             return;
         };
 
@@ -193,7 +202,9 @@ impl NameIndex {
                     // stays where it is is left as it is until compaction)
                     .filter(|&pe| {
                         let stays = existing.iter().any(|&e| self.parent(e) == Some(pe) && self.name(e) == name);
-                        !(st.is_dir && !stays && self.smart_excludes(pe, name, smart, existing.is_empty() && !created))
+                        // left out by the build, and still where it was
+                        let left = existing.is_empty() && !created && self.was_left_out(vol, r, *p, name);
+                        !(st.is_dir && !stays && (left || self.smart_excludes(pe, name, smart)))
                     });
                 (pe, name.as_str())
             })
@@ -271,10 +282,17 @@ impl NameIndex {
     /// True when a folder `name` in `parent` is left out by one of the rules
     /// that look around a folder, as the build decides it. Project files
     /// beside it and markers inside it are looked up on disk.
-    /// `unseen`: the folder is not in the index at all. A `target` (or `bin`,
-    /// `obj`…) never seen was left out by the build beside its project file,
-    /// which may be gone by now (a project being deleted): no disk check then.
-    fn smart_excludes(&self, parent: u32, name: &str, smart: &[Smart], unseen: bool) -> bool {
+    /// Folder record `r` of volume `vol` was left out by the build, under
+    /// `parent` (a record) with this name: it has not moved since.
+    fn was_left_out(&self, vol: usize, r: u64, parent: u64, name: &str) -> bool {
+        let letter = self.volumes[vol].letter();
+        self.left_out
+            .get(&letter)
+            .and_then(|left| left.get(&r))
+            .is_some_and(|(p, n)| *p == parent && *n == fold(name))
+    }
+
+    fn smart_excludes(&self, parent: u32, name: &str, smart: &[Smart]) -> bool {
         if smart.is_empty() {
             return false;
         }
@@ -314,7 +332,7 @@ impl NameIndex {
             }
             Smart::Beside { name: want, manifests } => {
                 *want == name
-                    && (unseen || std::fs::read_dir(dir()).is_ok_and(|entries| {
+                    && std::fs::read_dir(dir()).is_ok_and(|entries| {
                         entries.take(100_000).flatten().any(|e| {
                             let f = fold(&e.file_name().to_string_lossy());
                             manifests.iter().any(|m| match m.strip_prefix('*') {
@@ -322,7 +340,7 @@ impl NameIndex {
                                 None => f == *m,
                             })
                         })
-                    }))
+                    })
             }
             Smart::Marker(m) => {
                 let mut p = dir();
@@ -403,7 +421,12 @@ impl NameIndex {
             // a reused record: a folder has no extension, a file its own
             self.ext[i] = if st.is_dir { 0 } else { ext_id(ext_ids, &mut self.exts, name) };
         }
-        self.size[i] = if st.is_dir { 0 } else { st.size };
+        self.size[i] = match (st.is_dir, st.size) {
+            (true, _) => 0,
+            (false, SIZE_UNKNOWN) if !was_dir => self.size[i],
+            (false, SIZE_UNKNOWN) => 0,
+            (false, size) => size,
+        };
         self.mtime[i] = filetime_to_minutes(st.modified);
         pass.touched.push(e);
     }
@@ -421,7 +444,7 @@ impl NameIndex {
         self.parent.push(parent);
         self.flags.push(attr_flags(st.attributes, st.is_dir) | self.noise_for(Some(parent), name, st.is_dir));
         self.ext.push(if st.is_dir { 0 } else { ext_id(ext_ids, &mut self.exts, name) });
-        self.size.push(if st.is_dir { 0 } else { st.size });
+        self.size.push(if st.is_dir || st.size == SIZE_UNKNOWN { 0 } else { st.size });
         self.mtime.push(filetime_to_minutes(st.modified));
         self.volume.push(vol as u8);
         self.name_rank.push(u32::MAX);
@@ -522,10 +545,12 @@ impl NameIndex {
         let exclusions = Exclusions { paths: self.exclusions.clone() };
         let scans = self.to_scans();
         let skipped = self.skipped.clone();
+        let left_out = std::mem::take(&mut self.left_out);
         *self = build(scans, &exclusions).0;
         // rebuilt from what the index holds: what was left out is not there
-        // to count again
+        // to count again, nor to be known again
         self.skipped = skipped;
+        self.left_out = left_out;
     }
 
     /// A clean index where the given volumes come from fresh scans and the
@@ -555,6 +580,12 @@ impl NameIndex {
             self.skipped.0.iter().filter(|(l, _, _)| !gone(*l)).cloned().collect();
         skipped.extend(idx.skipped.0.iter().filter(|(l, _, _)| fresh_letters.contains(l)).cloned());
         idx.skipped = crate::index::SkipCounts(skipped);
+        // the same for the folders left out: scanned drives anew, the others kept
+        for (l, folders) in self.left_out.iter() {
+            if !gone(*l) {
+                idx.left_out.insert(*l, folders.clone());
+            }
+        }
         idx
     }
 

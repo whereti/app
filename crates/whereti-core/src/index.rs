@@ -77,6 +77,31 @@ impl PartialEq for SkipCounts {
 }
 impl Eq for SkipCounts {}
 
+/// The folders left out per drive: record -> (parent record, folded name).
+/// Kept beside the index (like `SkipCounts`), not part of what it holds.
+#[derive(Debug, Default, Clone)]
+pub struct LeftOut(pub HashMap<char, HashMap<u64, (u64, String)>>);
+
+impl PartialEq for LeftOut {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+impl Eq for LeftOut {}
+
+impl std::ops::Deref for LeftOut {
+    type Target = HashMap<char, HashMap<u64, (u64, String)>>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for LeftOut {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
 /// All indexed names of all volumes.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct NameIndex {
@@ -114,6 +139,10 @@ pub struct NameIndex {
     pub(crate) exclusions: Vec<String>,
     /// What each of them left out at the last build.
     pub(crate) skipped: SkipCounts,
+    /// The folders the build left out, where it found them: per drive,
+    /// record -> (parent record, folded name). A change seen later in one
+    /// of them, still there, is not a folder come in from elsewhere.
+    pub(crate) left_out: LeftOut,
 
     // ---- live overlay (empty in a compact index) ----
     /// Names of renamed / added entries.
@@ -169,6 +198,33 @@ impl NameIndex {
     /// The counts saved beside an index loaded from disk.
     pub fn set_skipped(&mut self, counts: Vec<(char, String, u64)>) {
         self.skipped = SkipCounts(counts);
+    }
+
+    /// The folders left out, as lines `letter\trecord\tparent\tname`
+    /// (saved beside the index).
+    pub fn left_out_lines(&self) -> String {
+        let mut out = String::new();
+        for (l, folders) in self.left_out.iter() {
+            for (r, (p, name)) in folders {
+                out.push_str(&format!("{l}\t{r}\t{p}\t{name}\n"));
+            }
+        }
+        out
+    }
+
+    /// The folders left out, saved beside an index loaded from disk; only
+    /// for the drives this index has.
+    pub fn set_left_out_lines(&mut self, text: &str) {
+        let letters: Vec<char> = self.volumes.iter().map(|v| v.letter()).collect();
+        let mut map: HashMap<char, HashMap<u64, (u64, String)>> = HashMap::new();
+        for line in text.lines() {
+            let mut parts = line.splitn(4, '\t');
+            let (Some(l), Some(r), Some(p), Some(name)) = (parts.next(), parts.next(), parts.next(), parts.next()) else { continue };
+            let Some(l) = l.chars().next().filter(|l| letters.contains(l)) else { continue };
+            let (Ok(r), Ok(p)) = (r.parse::<u64>(), p.parse::<u64>()) else { continue };
+            map.entry(l).or_default().insert(r, (p, name.to_string()));
+        }
+        self.left_out = LeftOut(map);
     }
 
     /// True when there is no live-update overlay to fold in.

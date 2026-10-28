@@ -488,3 +488,62 @@ fn a_build_folder_left_out_stays_out_while_its_project_is_deleted() {
     idx.apply(0, &[424], &HashSet::from([424]), &mut m).unwrap();
     assert_eq!(hits(&idx, "target").len(), 1);
 }
+
+#[test]
+fn a_users_folder_named_like_a_build_folder_comes_back_from_the_recycle_bin() {
+    let mut m = Model::new(9);
+    let dir = |p: u64, n: &str| Rec { is_dir: true, size: 0, modified: 0, attrs: 0, links: vec![(p, n.into())] };
+    m.recs.insert(430, dir(PROIECTE, "tools"));
+    m.recs.insert(431, dir(430, "bin"));
+    m.recs.insert(432, Rec { is_dir: false, size: 1, modified: 0, attrs: 0, links: vec![(431, "tool.exe".into())] });
+    let mut e = exclusions();
+    e.paths.push(r"**\bin <*.csproj>".into());
+    let mut idx = build(vec![VolumeScan { letter: 'C', serial: 1, journal_id: 1, next_usn: 0, scan: m.scan() }], &e).0;
+    assert_eq!(hits(&idx, "tool.exe").len(), 1, "no project file beside it: the user's own");
+    // to the Recycle Bin, and the index compacted meanwhile (the subtree goes)
+    m.recs.get_mut(&431).unwrap().links[0] = (RECYCLE, "$R2".into());
+    idx.apply(0, &[431], &HashSet::new(), &mut m).unwrap();
+    idx.compact();
+    // restored: not a folder the build left out, so its contents are read again
+    m.recs.get_mut(&431).unwrap().links[0] = (430, "bin".into());
+    let s = idx.apply(0, &[431], &HashSet::new(), &mut m).unwrap();
+    assert!(s.needs_rescan, "a folder come in from elsewhere");
+    assert_eq!(hits(&idx, "bin").len(), 1);
+}
+
+#[test]
+fn a_python_env_being_deleted_needs_no_rescan() {
+    let mut m = Model::new(10);
+    let dir = |p: u64, n: &str| Rec { is_dir: true, size: 0, modified: 0, attrs: 0, links: vec![(p, n.into())] };
+    m.recs.insert(440, dir(PROIECTE, "env"));
+    m.recs.insert(441, Rec { is_dir: false, size: 1, modified: 0, attrs: 0, links: vec![(440, "pyvenv.cfg".into())] });
+    m.recs.insert(442, dir(440, "Lib"));
+    let mut e = exclusions();
+    e.paths.push(r"**\<pyvenv.cfg>".into());
+    let mut idx = build(vec![VolumeScan { letter: 'C', serial: 1, journal_id: 1, next_usn: 0, scan: m.scan() }], &e).0;
+    assert!(hits(&idx, "lib").is_empty());
+    // its marker goes first, then the folder changes as it is emptied
+    m.recs.remove(&441);
+    m.recs.get_mut(&440).unwrap().modified += MINUTE;
+    let s = idx.apply(0, &[441, 440], &HashSet::new(), &mut m).unwrap();
+    assert!(!s.needs_rescan);
+    assert!(hits(&idx, "env").is_empty());
+    // the folders left out survive a compaction
+    idx.compact();
+    m.recs.get_mut(&440).unwrap().modified += MINUTE;
+    let s = idx.apply(0, &[440], &HashSet::new(), &mut m).unwrap();
+    assert!(!s.needs_rescan);
+}
+
+#[test]
+fn a_size_that_could_not_be_read_keeps_the_one_known() {
+    let mut m = Model::new(11);
+    m.recs.insert(450, Rec { is_dir: false, size: 7_000_000_000, modified: 0, attrs: 0, links: vec![(DOCS, "disk.vhdx".into())] });
+    let mut idx = build(vec![VolumeScan { letter: 'C', serial: 1, journal_id: 1, next_usn: 0, scan: m.scan() }], &exclusions()).0;
+    // written to; its data size sits in an extension record not read
+    m.recs.get_mut(&450).unwrap().size = crate::SIZE_UNKNOWN;
+    m.recs.get_mut(&450).unwrap().modified += MINUTE;
+    idx.apply(0, &[450], &HashSet::new(), &mut m).unwrap();
+    let r = idx.search(&parse("disk.vhdx", &ctx()), &SearchOptions::default());
+    assert_eq!(idx.size(r.hits[0]), 7_000_000_000);
+}

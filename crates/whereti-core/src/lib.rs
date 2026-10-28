@@ -8,7 +8,7 @@ pub mod snapshot;
 
 pub use build::{build, filetime_to_minutes, BuildStats, Exclusions, VolumeScan, DEFAULT_GROUPS};
 pub use index::{NameIndex, VolumeInfo};
-pub use live::{ApplyStats, RecordSource, RecordState};
+pub use live::{ApplyStats, RecordSource, RecordState, SIZE_UNKNOWN};
 pub use search::{SearchOptions, SearchResults, SortBy};
 
 #[cfg(test)]
