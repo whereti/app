@@ -1130,7 +1130,11 @@ impl Worker {
         }
         self.follow_all();
         self.shared.set_state("ready");
-        self.log(format!("rescanned {list} in {} ms", t.elapsed().as_millis()));
+        // only what was scanned or dropped; a failed one said why already
+        let done: Vec<char> = scanned.iter().copied().chain(gone.iter().copied()).collect();
+        if !done.is_empty() {
+            self.log(format!("rescanned {} in {} ms", letters_text(&done), t.elapsed().as_millis()));
+        }
     }
 
     /// Rebuilds the whole index with new exclusion paths (from Settings).
