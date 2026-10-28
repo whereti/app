@@ -1016,19 +1016,34 @@ impl WheretiApp {
     /// Takes row `i` off the list (a file just deleted), keeping the
     /// sections and the count right.
     fn remove_row(&mut self, i: usize) {
-        if !self.dupe_sets.is_empty() {
-            self.remove_dupe_row(i);
+        if i >= self.rows.len() {
             return;
         }
-        let named_end = self.close_start.or(self.network_start).or(self.content_start).unwrap_or(self.rows.len());
-        if i >= self.launch_items.len() && i < named_end {
-            self.total = self.total.saturating_sub(1);
+        // in a `dupe:` list a set left with one file goes whole; rows outside
+        // the sets (found by "search them too") go alone
+        let (start, len) = match dupe_removal(&mut self.dupe_sets, i) {
+            Some(cut) => {
+                self.total = self.dupe_sets.len() as u64;
+                cut
+            }
+            None => {
+                let named_end = self.close_start.or(self.network_start).or(self.content_start).unwrap_or(self.rows.len());
+                // a `dupe:` list counts its sets, not its rows
+                if self.dupe_sets.is_empty() && i >= self.launch_items.len() && i < named_end {
+                    self.total = self.total.saturating_sub(1);
+                }
+                for s in self.dupe_sets.iter_mut().filter(|s| s.0 > i) {
+                    s.0 -= 1;
+                }
+                (i, 1)
+            }
+        };
+        for gone in self.rows.drain(start..start + len) {
+            self.thumbs.forget(&gone.path);
         }
-        let gone = self.rows.remove(i);
-        self.thumbs.forget(&gone.path);
         for s in [&mut self.close_start, &mut self.network_start, &mut self.content_start, &mut self.meaning_start].into_iter().flatten() {
-            if *s > i {
-                *s -= 1;
+            if *s > start {
+                *s = s.saturating_sub(len).max(start);
             }
         }
         if self.meaning_start == Some(self.rows.len()) {
@@ -1044,32 +1059,6 @@ impl WheretiApp {
         if self.close_start.is_some() && self.close_start == Some(self.network_start.or(self.content_start).unwrap_or(self.rows.len())) {
             self.close_start = None;
         }
-        self.selected = self.selected.min(self.rows.len().saturating_sub(1));
-    }
-
-    /// In a `dupe:` list: one copy fewer in its set; a set left with one
-    /// file is no longer a set of copies, and goes (with that file's row).
-    fn remove_dupe_row(&mut self, i: usize) {
-        let Some(k) = self.dupe_sets.iter().position(|&(s, n)| (s..s + n).contains(&i)) else { return };
-        let gone = self.rows.remove(i);
-        self.thumbs.forget(&gone.path);
-        self.dupe_sets[k].1 -= 1;
-        let mut removed = 1;
-        if self.dupe_sets[k].1 < 2 {
-            let (start, n) = self.dupe_sets.remove(k);
-            for _ in 0..n {
-                self.rows.remove(start);
-            }
-            removed += n;
-            for s in self.dupe_sets.iter_mut().skip(k) {
-                s.0 -= removed;
-            }
-        } else {
-            for s in self.dupe_sets.iter_mut().skip(k + 1) {
-                s.0 -= 1;
-            }
-        }
-        self.total = self.dupe_sets.len() as u64;
         self.selected = self.selected.min(self.rows.len().saturating_sub(1));
     }
 
@@ -2802,6 +2791,28 @@ fn animations_on() -> bool {
     on != 0
 }
 
+/// Row `i` of a `dupe:` list was deleted: one copy fewer in its set, and a
+/// set left with one file is no longer a set of copies, so it goes whole.
+/// Returns the rows to take off (start, length) and moves the sets after
+/// them up; `None` when `i` is in no set.
+fn dupe_removal(sets: &mut Vec<(usize, usize)>, i: usize) -> Option<(usize, usize)> {
+    let k = sets.iter().position(|&(s, n)| (s..s + n).contains(&i))?;
+    let cut = if sets[k].1 <= 2 {
+        let whole = sets.remove(k);
+        for s in sets.iter_mut().skip(k) {
+            s.0 -= whole.1;
+        }
+        whole
+    } else {
+        sets[k].1 -= 1;
+        for s in sets.iter_mut().skip(k + 1) {
+            s.0 -= 1;
+        }
+        (i, 1)
+    };
+    Some(cut)
+}
+
 /// "Search the documents not indexed yet" for one search.
 struct Scan {
     generation: u64,
@@ -3267,6 +3278,20 @@ mod tests {
         assert_eq!(relative_time(at(2026, 10, 22, 6), 180, now), "joi, 09:00");
         assert_eq!(relative_time(at(2026, 3, 12, 6), 180, now), "12 mar.");
         assert_eq!(relative_time(at(2024, 9, 3, 6), 180, now), "3 sept. 2024");
+    }
+
+    #[test]
+    fn deleting_from_sets_of_copies() {
+        // two sets of 3 and 2 copies, then a row found outside them
+        let mut sets = vec![(0, 3), (3, 2)];
+        assert_eq!(dupe_removal(&mut sets, 1), Some((1, 1)));
+        assert_eq!(sets, [(0, 2), (2, 2)]);
+        // a set left with one file goes whole, the next moves up
+        assert_eq!(dupe_removal(&mut sets, 0), Some((0, 2)));
+        assert_eq!(sets, [(0, 2)]);
+        // a row after the sets is in none of them
+        assert_eq!(dupe_removal(&mut sets, 2), None);
+        assert_eq!(sets, [(0, 2)]);
     }
 
     #[test]
