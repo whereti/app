@@ -8,10 +8,12 @@
 //! account) is a format this reader does not open.
 //!
 //! The text is the messages newest first: subject, sender, recipients and
-//! date on their own lines, then the start of the body, until the budget.
+//! date on their own lines, then the start of the body, until the budget
+//! or the caller's time runs out (then what was read, marked truncated).
 
 use std::io::{Read, Seek};
 use std::rc::Rc;
+use std::time::Instant;
 
 use outlook_pst::ltp::prop_context::PropertyValue;
 use outlook_pst::messaging::folder::Folder;
@@ -50,9 +52,15 @@ pub(crate) fn mailbox<R: Read + Seek + 'static>(open: impl Fn() -> std::io::Resu
     let mut folders: Vec<Rc<dyn Folder>> = vec![store.open_folder(&root).map_err(damaged)?];
     let mut messages: Vec<(i64, u32)> = Vec::new();
     let mut seen = 0;
+    // the caller's time (the worker's `--budget`): what was read by then
+    let late = || crate::deadline().is_some_and(|d| Instant::now() >= d);
     while let Some(folder) = folders.pop() {
         seen += 1;
         if seen > MAX_FOLDERS {
+            break;
+        }
+        if late() {
+            out.truncated = true;
             break;
         }
         if let Some(table) = folder.hierarchy_table() {
@@ -85,7 +93,7 @@ pub(crate) fn mailbox<R: Read + Seek + 'static>(open: impl Fn() -> std::io::Resu
     }
     messages.sort_by_key(|m| std::cmp::Reverse(m.0));
     for (time, node) in messages {
-        if out.full() {
+        if out.full() || late() {
             out.truncated = true;
             break;
         }
@@ -185,6 +193,10 @@ mod tests {
         let mut out = Out::new(10_000);
         mailbox(|| std::fs::File::open(&sample), &mut out).unwrap();
         assert!(!out.truncated);
+        // the caller's time up: no folder walked, what there is comes back cut
+        let mut out = Out::new(10_000);
+        crate::within(Instant::now(), || mailbox(|| std::fs::File::open(&sample), &mut out)).unwrap();
+        assert!(out.truncated);
         // junk is damaged, not a crash
         let mut out = Out::new(100);
         assert!(mailbox(|| Ok(std::io::Cursor::new(b"!BDN not really a mailbox".to_vec())), &mut out).is_err());
