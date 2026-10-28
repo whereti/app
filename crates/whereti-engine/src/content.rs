@@ -142,6 +142,11 @@ pub struct Content {
     /// Files whose reading once took the service down (a parser crash
     /// aborts the process): never read in-process again (crash.txt).
     crashed: Mutex<HashSet<u64>>,
+    /// The files being read in-process now (reading.txt).
+    reading_now: Mutex<Vec<u64>>,
+    /// Pictures wait for the round of the models after this one: a search
+    /// of the documents not indexed yet leaves them out.
+    pictures_wait: AtomicBool,
     /// Search by meaning: wanted by the user (meaning.txt), its state, the
     /// documents' vectors and the model's worker (meaning.rs).
     meaning_on: AtomicBool,
@@ -261,6 +266,8 @@ impl Content {
             dir: dir.to_path_buf(),
             props: Mutex::new(crate::props::PropStore::load(dir)),
             crashed: Mutex::new(load_crashed(dir, log)),
+            reading_now: Mutex::new(Vec::new()),
+            pictures_wait: AtomicBool::new(false),
             meaning_on: AtomicBool::new(std::fs::read_to_string(dir.join("meaning.txt")).is_ok_and(|s| s.trim() == "on")),
             meaning_state: Mutex::new("off".into()),
             vectors: Mutex::new(crate::meaning::Vectors::load(dir)),
@@ -580,13 +587,18 @@ impl Content {
         Some(v)
     }
 
-    /// Notes the file being read in-process (a crash then names it).
-    fn reading(&self, key: Option<u64>) {
-        let path = self.dir.join("reading.txt");
-        let _ = match key {
-            Some(k) => std::fs::write(path, k.to_string()),
-            None => std::fs::write(path, ""),
-        };
+    /// Notes a file being read in-process, `on` before and off after (a
+    /// crash then names it). The indexing and a search of the documents not
+    /// indexed yet may each be reading one: every one is listed.
+    fn reading(&self, key: u64, on: bool) {
+        let mut now = self.reading_now.lock();
+        if on {
+            now.push(key);
+        } else if let Some(i) = now.iter().position(|&k| k == key) {
+            now.swap_remove(i);
+        }
+        let text: String = now.iter().map(|k| format!("{k}\n")).collect();
+        let _ = std::fs::write(self.dir.join("reading.txt"), text);
     }
 
     /// Documents close in meaning to the query's plain words; the other
@@ -1083,6 +1095,7 @@ impl Content {
         };
         let models_turn = self.models_turn.swap(false, Ordering::Relaxed);
         let models_later = !models_turn && text_waiting && (meaning_now || todo.iter().any(is_later));
+        self.pictures_wait.store(models_later, Ordering::Relaxed);
         if models_later {
             todo.retain(|c| !is_later(c));
         }
@@ -1196,7 +1209,7 @@ impl Content {
                 }
                 // the crash marker is set only around what runs in this process
                 // (a sandboxed read cut short by a shutdown is no crash)
-                let mark = |on: bool| self.reading(on.then_some(c.key));
+                let mark = |on: bool| self.reading(c.key, on);
                 // read again for its meaning: its properties only when missing
                 let ext = ext_of(&c.path);
                 let props_wanted = crate::props::has_props(&ext) && !(c.meaning_only && self.props.lock().contains(c.key));
@@ -1621,9 +1634,16 @@ impl Content {
         if needles.is_empty() {
             return ScanPlan::default();
         }
+        // not files that crashed the service, nor pictures merely waiting for
+        // the round of the models (their text is read then)
+        let crashed = self.crashed.lock().clone();
+        let pictures_wait = self.pictures_wait.load(Ordering::Relaxed);
         let known = self.known_keys.read();
-        let mut candidates: Vec<Candidate> =
-            files_in(idx, &self.folders(), &[]).into_values().filter(|c| !known.contains_key(&c.key) && !c.photo_only && !c.media_only && !is_mailbox(&c.path)).collect();
+        let mut candidates: Vec<Candidate> = files_in(idx, &self.folders(), &[])
+            .into_values()
+            .filter(|c| !known.contains_key(&c.key) && !c.photo_only && !c.media_only && !is_mailbox(&c.path))
+            .filter(|c| !crashed.contains(&c.key) && !(pictures_wait && is_picture(&c.path)))
+            .collect();
         drop(known);
         if !filters.clauses.is_empty() {
             let entries: Vec<u32> = candidates
@@ -1661,7 +1681,8 @@ impl Content {
             for (c, ok) in chunk.iter().zip(allowed) {
                 i += 1;
                 if ok {
-                    if let Ok((_, text)) = extract(c, sandbox.as_ref(), None, None, &mut Looked::No, &|_| {}) {
+                    // parsed in this process (a photo's place): marked like the indexing does
+                    if let Ok((_, text)) = extract(c, sandbox.as_ref(), None, None, &mut Looked::No, &|on| self.reading(c.key, on)) {
                         let folded = fold(&text);
                         if plan.needles.iter().all(|w| folded.contains(w.as_str())) {
                             rows.push(Row { path: c.path.clone(), is_dir: false, size: c.size, modified: c.modified, flags: 0 });
@@ -1767,20 +1788,26 @@ const PHOTO_EXTS: &[&str] = whereti_query::kinds::PHOTOS;
 /// What cameras and phones write (PHOTOS without PNG and WebP).
 const CAMERA_EXTS: &[&str] = &["jpg", "jpeg", "jpe", "jfif", "heic", "heif", "hif", "avif", "jxl", "tif", "tiff"];
 
-/// Keys of files whose in-process reading crashed the service: the one
-/// named in reading.txt at start (it was being read when the service went
-/// down) is added to crash.txt for good.
+/// Keys of files whose in-process reading crashed the service: those
+/// named in reading.txt at start (they were being read when the service
+/// went down) are added to crash.txt for good.
 fn load_crashed(dir: &Path, log: &dyn Fn(String)) -> HashSet<u64> {
     let list = dir.join("crash.txt");
     let mut set: HashSet<u64> =
         std::fs::read_to_string(&list).map(|t| t.lines().filter_map(|l| l.trim().parse().ok()).collect()).unwrap_or_default();
     let reading = dir.join("reading.txt");
-    if let Some(k) = std::fs::read_to_string(&reading).ok().and_then(|t| t.trim().parse::<u64>().ok()) {
+    let named: Vec<u64> =
+        std::fs::read_to_string(&reading).map(|t| t.lines().filter_map(|l| l.trim().parse().ok()).collect()).unwrap_or_default();
+    let mut added = false;
+    for k in named {
         if set.insert(k) {
             log(format!("content: file {k} stopped the service while it was read; it is skipped from now on"));
-            let text: String = set.iter().map(|k| format!("{k}\n")).collect();
-            let _ = std::fs::write(&list, text);
+            added = true;
         }
+    }
+    if added {
+        let text: String = set.iter().map(|k| format!("{k}\n")).collect();
+        let _ = std::fs::write(&list, text);
     }
     let _ = std::fs::write(&reading, "");
     set
@@ -2654,6 +2681,26 @@ mod tests {
         // the next start remembers it, and nothing new is blamed
         let again = load_crashed(&dir, &|_| {});
         assert_eq!(again.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn files_read_at_once_by_the_indexing_and_a_search_are_all_named() {
+        let dir = std::env::temp_dir().join(format!("whereti-reading-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let content = Content::open(&dir, &|_| {});
+        let named = || std::fs::read_to_string(dir.join("reading.txt")).unwrap();
+        content.reading(7, true);
+        content.reading(9, true);
+        // one ends: the other is still named
+        content.reading(7, false);
+        assert_eq!(named(), "9\n");
+        content.reading(7, true);
+        drop(content);
+        // the service went down while both were read: both are skipped from now on
+        let set = load_crashed(&dir, &|_| {});
+        assert_eq!(set, [7, 9].into());
+        assert_eq!(named(), "");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
