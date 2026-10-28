@@ -34,6 +34,8 @@ pub fn run(args: ExtractArgs) -> Result<(), String> {
     sandbox.memory_limit = args.memory_mb << 20;
     let (mut ok, mut failed) = (0, 0);
     for f in &args.files {
+        // the worker checks the real path against this one: a whole path
+        let f = &std::path::absolute(f).unwrap_or_else(|_| f.clone());
         let size = std::fs::metadata(f).map(|m| m.len()).unwrap_or(0);
         let t = Instant::now();
         match sandbox.extract_file(f, args.max) {
@@ -62,6 +64,9 @@ pub fn run(args: ExtractArgs) -> Result<(), String> {
     }
     if args.files.len() > 1 {
         println!("\n{ok} extracted, {failed} failed");
+    }
+    if failed > 0 {
+        return Err(format!("{failed} of {} files could not be extracted", ok + failed));
     }
     Ok(())
 }

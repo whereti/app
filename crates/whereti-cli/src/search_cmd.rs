@@ -300,9 +300,15 @@ fn query_text(args: &[String]) -> String {
                 return a.clone();
             }
             // `name:value with spaces` quotes the value, so the function stays
-            match a.split_once(':') {
-                Some((name, value)) if name.len() > 1 && name.chars().all(|c| c.is_ascii_alphabetic()) => {
-                    format!("{name}:\"{value}\"")
+            // (also `!name:` and `c:`; but `C:\Program Files` is a path)
+            let (neg, rest) = a.strip_prefix('!').map_or(("", a.as_str()), |r| ("!", r));
+            match rest.split_once(':') {
+                Some((name, value))
+                    if !name.is_empty()
+                        && name.chars().all(|c| c.is_ascii_alphabetic())
+                        && (name.len() > 1 || !value.starts_with(['\\', '/'])) =>
+                {
+                    format!("{neg}{name}:\"{value}\"")
                 }
                 _ => format!("\"{a}\""),
             }
@@ -472,6 +478,8 @@ mod tests {
         assert_eq!(q(&["raport", "ext:pdf"]), "raport ext:pdf");
         assert_eq!(q(&["nume exact.txt"]), "\"nume exact.txt\"");
         assert_eq!(q(&[r"path:C:\Program Files", "x"]), r#"path:"C:\Program Files" x"#);
+        assert_eq!(q(&["c:annual report"]), r#"c:"annual report""#);
+        assert_eq!(q(&[r"!path:C:\Program Files"]), r#"!path:"C:\Program Files""#);
         assert_eq!(q(&[r"C:\Program Files"]), r#""C:\Program Files""#);
         assert_eq!(q(&[r#"say "hi" there"#]), r#"say "hi" there"#);
     }

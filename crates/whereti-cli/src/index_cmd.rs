@@ -31,6 +31,10 @@ pub fn run(args: IndexArgs) -> Result<(), String> {
     } else {
         args.volumes.iter().map(|v| crate::parse_letter(v)).collect::<Result<_, _>>()?
     };
+    // each drive once, in letter order (as the service keeps them)
+    let mut letters: Vec<char> = letters.into_iter().map(|l| l.to_ascii_uppercase()).collect();
+    letters.sort_unstable();
+    letters.dedup();
     if letters.is_empty() {
         return Err("no volumes to index".into());
     }
