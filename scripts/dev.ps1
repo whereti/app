@@ -4,11 +4,11 @@
 #   scripts\dev.ps1 -AppOnly   the same, never touching the service
 #
 # The app runs straight from target\release, against the installed service.
-# When the service, the extractor or wt changed (they differ from the copies
-# in Program Files), they are swapped in place with ONE administrator prompt
-# (scripts\dev-swap.ps1): the service is stopped, the files replaced, the
-# service started again. The app is copied there too, so a restart of
-# Windows starts the same build.
+# When a program changed (the service, the extractor, wt, onnxruntime.dll or
+# the app itself differ from the copies in Program Files), they are swapped
+# in place with ONE administrator prompt (scripts\dev-swap.ps1): the service
+# is stopped, the files replaced, the service started again. The app is
+# copied there too, so a restart of Windows starts the same build.
 #
 # The installer (scripts\package.ps1) stays for the end of a stage and for
 # testing the update itself.
@@ -20,7 +20,8 @@ $target = Join-Path $root "target\release"
 $installed = "C:\Program Files\whereti"
 
 # the app holds target\release\whereti.exe (and the installed one): close it first
-Get-Process whereti -ErrorAction SilentlyContinue | Stop-Process -Force
+# (one it cannot close, an elevated one or another user's, is left running)
+Get-Process whereti -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 Start-Sleep -Milliseconds 300
 
 Push-Location $root
@@ -31,9 +32,12 @@ try {
 
 function Same([string]$name) {
     $a = Join-Path $target $name; $b = Join-Path $installed $name
+    # onnxruntime.dll is in target\release only once package.ps1 put it there
+    if (-not (Test-Path $a)) { return $true }
     (Test-Path $b) -and ((Get-FileHash $a).Hash -eq (Get-FileHash $b).Hash)
 }
-$changed = @("whereti-service.exe", "whereti-extract.exe", "wt.exe") | Where-Object { -not (Same $_) }
+# the app too: the copy in Program Files is the one Windows starts
+$changed = @("whereti-service.exe", "whereti-extract.exe", "wt.exe", "whereti.exe", "onnxruntime.dll") | Where-Object { -not (Same $_) }
 
 if ($changed -and -not $AppOnly) {
     if (-not (Test-Path $installed)) { throw "whereti is not installed: run the installer once first" }
@@ -48,7 +52,7 @@ if ($changed -and -not $AppOnly) {
 } elseif ($changed) {
     "Not swapped (-AppOnly): $($changed -join ', ')"
 } else {
-    "Service unchanged: no administrator prompt"
+    "Nothing changed in Program Files: no administrator prompt"
 }
 
 Start-Process (Join-Path $target "whereti.exe")
