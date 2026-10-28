@@ -439,12 +439,76 @@ pub fn set_autostart(on: bool) {
 
 /// Starts the installed app as the current (not elevated) user.
 pub fn launch_app() {
-    let _ = Command::new(install_dir().join("whereti.exe")).arg("--welcome").spawn();
+    start_app("--welcome");
 }
 
 /// Opens whereti as usual, without the welcome page (after an update).
 pub fn open_app() {
-    let _ = Command::new(install_dir().join("whereti.exe")).spawn();
+    start_app("");
+}
+
+/// whereti never runs with administrator rights: an installer that was
+/// itself started elevated has the desktop's Explorer start it, as the
+/// signed-in user. If that fails it is not started (the Start menu has it).
+fn start_app(args: &str) {
+    let exe = install_dir().join("whereti.exe");
+    if is_elevated() {
+        let _ = shell_execute_as_desktop(&exe, args);
+    } else {
+        let _ = Command::new(&exe).args(args.split_whitespace()).spawn();
+    }
+}
+
+/// ShellExecute through the desktop's Explorer (IShellDispatch2), so the
+/// program runs with Explorer's rights, not this process's.
+fn shell_execute_as_desktop(exe: &Path, args: &str) -> windows::core::Result<()> {
+    use std::mem::ManuallyDrop;
+    use windows::core::{Interface, BSTR};
+    use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, IDispatch, IServiceProvider, CLSCTX_ALL, COINIT_APARTMENTTHREADED};
+    use windows::Win32::System::Variant::{VariantClear, VARIANT, VT_BSTR, VT_I4};
+    use windows::Win32::UI::Shell::{
+        IShellBrowser, IShellDispatch2, IShellFolderViewDual, IShellWindows, ShellWindows, CSIDL_DESKTOP,
+        SID_STopLevelBrowser, SVGIO_BACKGROUND, SWC_DESKTOP, SWFO_NEEDDISPATCH,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    fn text(s: &str) -> VARIANT {
+        let mut v = VARIANT::default();
+        // SAFETY: a VT_BSTR variant owning its string, freed by VariantClear.
+        unsafe {
+            let inner = &mut *v.Anonymous.Anonymous;
+            inner.vt = VT_BSTR;
+            inner.Anonymous.bstrVal = ManuallyDrop::new(BSTR::from(s));
+        }
+        v
+    }
+    fn number(n: i32) -> VARIANT {
+        let mut v = VARIANT::default();
+        // SAFETY: a VT_I4 variant, nothing to free.
+        unsafe {
+            let inner = &mut *v.Anonymous.Anonymous;
+            inner.vt = VT_I4;
+            inner.Anonymous.lVal = n;
+        }
+        v
+    }
+    let dir = exe.parent().unwrap_or(exe);
+    // SAFETY: COM calls on interfaces we hold; every variant is cleared.
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let shell_windows: IShellWindows = CoCreateInstance(&ShellWindows, None, CLSCTX_ALL)?;
+        let at = number(CSIDL_DESKTOP as i32);
+        let mut hwnd = 0;
+        let desktop: IDispatch = shell_windows.FindWindowSW(&at, &VARIANT::default(), SWC_DESKTOP, &mut hwnd, SWFO_NEEDDISPATCH)?;
+        let browser: IShellBrowser = desktop.cast::<IServiceProvider>()?.QueryService(&SID_STopLevelBrowser)?;
+        let view: IDispatch = browser.QueryActiveShellView()?.GetItemObject(SVGIO_BACKGROUND)?;
+        let shell: IShellDispatch2 = view.cast::<IShellFolderViewDual>()?.Application()?.cast()?;
+        let mut params = [text(args), text(&dir.to_string_lossy()), text("open"), number(SW_SHOWNORMAL.0)];
+        let result = shell.ShellExecute(&BSTR::from(exe.to_string_lossy().as_ref()), &params[0], &params[1], &params[2], &params[3]);
+        for v in &mut params {
+            let _ = VariantClear(v);
+        }
+        result
+    }
 }
 
 // ---------------------------------------------------------------- elevation
