@@ -683,6 +683,26 @@ impl WheretiApp {
         }
     }
 
+    /// Chinese, Japanese or Korean letters in what is shown (the search, the
+    /// results, the names of apps, the preview, the snippets): the fonts
+    /// for them, once.
+    fn load_cjk_fonts(&mut self, ctx: &egui::Context) {
+        if self.cjk_fonts {
+            return;
+        }
+        let wanted = has_cjk(&self.query)
+            || self.rows.iter().any(|r| has_cjk(&r.path))
+            || self.launch_items.iter().any(|it| has_cjk(&it.name))
+            || self.preview.saw_cjk
+            || self.snippets.saw_cjk;
+        if wanted {
+            self.cjk_fonts = true;
+            crate::setup_fonts(ctx, true);
+            // the new fonts are used from the next frame
+            ctx.request_repaint();
+        }
+    }
+
     /// Row `i` is an app, a Settings page or a Control Panel item.
     fn is_launch(&self, i: usize) -> bool {
         i < self.launch_items.len()
@@ -2243,10 +2263,7 @@ impl eframe::App for WheretiApp {
             }
         }
         self.updater.tick(self.settings.updates, ctx);
-        if !self.cjk_fonts && (has_cjk(&self.query) || self.rows.iter().any(|r| has_cjk(&r.path))) {
-            self.cjk_fonts = true;
-            crate::setup_fonts(ctx, true);
-        }
+        self.load_cjk_fonts(ctx);
         // Hidden: ask once at start (started with --hidden), then only while indexing.
         let indexing = self.status.as_ref().and_then(indexing_fraction).is_some();
         if !self.visible && (indexing || (self.status.is_none() && self.offline.is_none())) {
@@ -2355,6 +2372,8 @@ impl eframe::App for WheretiApp {
         if self.page != Page::Welcome {
             crate::welcome::seen(self);
         }
+        // the preview or a snippet may have just read such text
+        self.load_cjk_fonts(&ctx);
     }
 }
 
