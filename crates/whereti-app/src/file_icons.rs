@@ -125,8 +125,9 @@ impl FileIcons {
     fn fetch(&self, path: &str, is_dir: bool) -> Option<(Vec<u8>, usize)> {
         let list = self.list.as_ref()?;
         // a program's own icon is read from the file: not from a share, where
-        // a NAS asleep would hold the window for its timeout
-        let own_icon = !is_dir && has_own_icon(path) && !crate::win::is_network_path(path);
+        // a NAS asleep would hold the window for its timeout, nor for a
+        // shortcut to a share (Windows reads its icon from the target)
+        let own_icon = !is_dir && has_own_icon(path) && !crate::win::is_network_path(path) && !link_to_network(path);
         let (name, attrs, flags) = if is_dir {
             (HSTRING::from("folder"), FILE_ATTRIBUTE_DIRECTORY, SHGFI_SYSICONINDEX | SHGFI_USEFILEATTRIBUTES)
         } else if own_icon {
@@ -149,6 +150,32 @@ impl FileIcons {
             let _ = DestroyIcon(icon);
         }
         out
+    }
+}
+
+/// A shortcut (.lnk) whose target or icon is on the network, or that
+/// cannot be read: it gets the plain shortcut icon. Reads only the
+/// shortcut itself, never what it points to.
+fn link_to_network(path: &str) -> bool {
+    use windows::core::Interface;
+    use windows::Win32::System::Com::{CoCreateInstance, IPersistFile, CLSCTX_INPROC_SERVER, STGM_READ};
+    use windows::Win32::UI::Shell::{IShellLinkW, ShellLink};
+    if !path.to_ascii_lowercase().ends_with(".lnk") {
+        return false;
+    }
+    let text = |w: &[u16]| String::from_utf16_lossy(&w[..w.iter().position(|&c| c == 0).unwrap_or(w.len())]);
+    // SAFETY: COM calls on the UI thread (COM is initialised by winit) on
+    // objects owned here; the buffers are of their stated size.
+    unsafe {
+        let Ok(link) = CoCreateInstance::<_, IShellLinkW>(&ShellLink, None, CLSCTX_INPROC_SERVER) else { return true };
+        let Ok(file) = link.cast::<IPersistFile>() else { return true };
+        if file.Load(&HSTRING::from(path), STGM_READ).is_err() {
+            return true;
+        }
+        let (mut target, mut icon, mut index) = ([0u16; 1024], [0u16; 1024], 0);
+        let _ = link.GetPath(&mut target, std::ptr::null_mut(), 0);
+        let _ = link.GetIconLocation(&mut icon, &mut index);
+        [text(&target), text(&icon)].iter().any(|p| !p.is_empty() && crate::win::is_network_path(p))
     }
 }
 
@@ -185,7 +212,8 @@ fn icon_rgba(icon: HICON) -> Option<(Vec<u8>, usize)> {
             free(&ii);
             return None;
         }
-        let (w, h) = (bm.bmWidth as usize, bm.bmHeight as usize);
+        // a bottom-up or top-down bitmap: the height may be negative
+        let (w, h) = (bm.bmWidth.unsigned_abs() as usize, bm.bmHeight.unsigned_abs() as usize);
         let mut bmi = BITMAPINFO {
             bmiHeader: BITMAPINFOHEADER {
                 biSize: size_of::<BITMAPINFOHEADER>() as u32,
@@ -220,5 +248,37 @@ fn icon_rgba(icon: HICON) -> Option<(Vec<u8>, usize)> {
             p.swap(0, 2); // BGRA → RGBA
         }
         Some((px, w))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A shortcut to `target`, saved in the temporary folder.
+    fn shortcut(name: &str, target: &str) -> String {
+        use windows::core::Interface;
+        use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, IPersistFile, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED};
+        use windows::Win32::UI::Shell::{IShellLinkW, ShellLink};
+        let path = std::env::temp_dir().join(format!("whereti-{}-{name}.lnk", std::process::id()));
+        // SAFETY: COM set up on this test thread; objects owned here.
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+            let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).unwrap();
+            link.SetPath(&HSTRING::from(target)).unwrap();
+            link.cast::<IPersistFile>().unwrap().Save(&HSTRING::from(path.as_os_str()), true).unwrap();
+        }
+        path.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn shortcuts_to_a_share_get_the_plain_icon() {
+        let share = shortcut("share", r"\\nas\photos\holiday.jpg");
+        let local = shortcut("local", r"C:\Windows\notepad.exe");
+        assert!(link_to_network(&share));
+        assert!(!link_to_network(&local));
+        assert!(!link_to_network(r"C:\Windows\notepad.exe"));
+        let _ = std::fs::remove_file(share);
+        let _ = std::fs::remove_file(local);
     }
 }
