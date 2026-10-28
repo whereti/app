@@ -626,8 +626,9 @@ impl Content {
     }
 
     /// The photo model's worker for this round, when it may be used: after
-    /// a failure, only once `MODEL_RETRY` has passed and it tags one of
-    /// `photos` (a few are tried; one may be unreadable).
+    /// a failure, only once `MODEL_RETRY` has passed and it answers on one
+    /// of `photos` (a few are tried; one may be unreadable, or a picture
+    /// Windows cannot decode, which says nothing of the model).
     fn tagger_for_round<'a>(&self, photos: impl Iterator<Item = &'a Candidate>) -> Option<TagWorker> {
         if !self.tags_ready() {
             return None;
@@ -639,18 +640,25 @@ impl Content {
             Some(t) if t.elapsed() < MODEL_RETRY => return None,
             Some(_) => {}
         }
-        for c in photos.filter(|c| c.size <= MAX_TAGGED).take(3) {
+        // the model loaded and answered, though not with tags
+        let mut answered = false;
+        for c in photos.filter(|c| c.size <= MAX_TAGGED).take(10) {
             let Ok(bytes) = read_shared(Path::new(&c.path), MAX_TAGGED) else { continue };
-            return match tagger.tags(&bytes) {
+            match tagger.tags(&bytes) {
                 Ok(_) => {
                     self.tags_works();
-                    Some(tagger)
+                    return Some(tagger);
                 }
+                Err(e) if undecodable(&e) => answered = true,
                 Err(e) => {
                     self.tags_failure(&e);
-                    None
+                    return None;
                 }
-            };
+            }
+        }
+        if answered {
+            self.tags_works();
+            return Some(tagger);
         }
         // nothing to try it on: later
         *self.tags_failed.lock() = Some(Instant::now());
@@ -1037,9 +1045,7 @@ impl Content {
         let mut paused_for: Option<&'static str> = None;
         // the CPU busy since (for BUSY_MAX), and going on slowly despite it
         let (mut busy_since, mut slow): (Option<Instant>, bool) = (None, false);
-        // the photo model: worked in this round; failures in a row; photos it
-        // failed on before it worked (they are then taken as looked at)
-        let (mut tags_worked, mut tag_fails, mut unsure): (bool, u32, Vec<u64>) = (false, 0, Vec::new());
+        let mut tag_round = TagRound::default();
         'files: for (n, c) in todo.into_iter().enumerate() {
             if self.stopping() || *self.wake.lock() {
                 break; // stop, or folders changed: plan again
@@ -1106,6 +1112,7 @@ impl Content {
             }
             let started = Instant::now();
             let mut looked = Looked::No;
+            let mut kept: Option<Vec<u16>> = None;
             // the file's work; `false`: nothing was read (no rest after it)
             let worked = 'file: {
                 // a file that once crashed a parser is not read in-process again
@@ -1128,7 +1135,7 @@ impl Content {
                     let kept = self.meaning_text.lock().remove(&c.key);
                     let pieces = match kept {
                         Some(p) => Some(p),
-                        None => extract(&c, sandbox, None, &mut Looked::No, &mark)
+                        None => extract(&c, sandbox, None, None, &mut Looked::No, &mark)
                             .ok()
                             .map(|(_, text)| whereti_extract::meaning::pieces(&text, crate::meaning::PIECES)),
                     };
@@ -1139,7 +1146,12 @@ impl Content {
                     }
                     since_commit += 1;
                 } else if !c.props_only {
-                    let read = match extract(&c, sandbox, tagger.as_mut(), &mut looked, &mark) {
+                    // a photo unchanged since the model looked at it keeps those tags
+                    // while the model gives none now (off for a while, failing)
+                    if want_tags && is_picture(&c.path) && self.known_keys.read().get(&c.key) == Some(&(c.size, c.modified)) {
+                        kept = self.props.lock().get(c.key).filter(|p| p.tagged).map(|p| p.tags.clone());
+                    }
+                    let read = match extract(&c, sandbox, tagger.as_mut(), kept.as_deref(), &mut looked, &mark) {
                         Ok(r) => r,
                         // gone, locked, no access: in a later round (nothing is kept of it)
                         Err(Skip::Later) => break 'file true,
@@ -1193,38 +1205,23 @@ impl Content {
                         }
                         since_commit += 1;
                     } else {
-                        // tagged only when the model looked at it
-                        match std::mem::replace(&mut looked, Looked::No) {
-                            Looked::Tags(tags) => {
-                                p.tags = tags;
-                                p.tagged = true;
-                                if !tags_worked {
-                                    // the photos it failed on before: it works, so they could not be read
-                                    let mut store = self.props.lock();
-                                    for k in unsure.drain(..) {
-                                        if let Some(mut q) = store.get(k).cloned() {
-                                            q.tagged = true;
-                                            store.set(k, q);
-                                        }
-                                    }
-                                }
-                                (tags_worked, tag_fails) = (true, 0);
-                            }
-                            Looked::Failed(e) => {
-                                tag_fails += 1;
-                                if tag_fails >= 3 {
-                                    // failing in a row: the model, not the photos
-                                    shared.log.log(format!("content: the photo model fails ({e}); tried again later"));
-                                    self.tags_failure(&e);
-                                    tagger = None;
-                                } else if tags_worked {
-                                    p.tagged = true;
-                                } else {
-                                    unsure.push(c.key);
-                                }
-                            }
-                            Looked::No => {}
+                        // tagged only when the model looked at it (now, or before: `kept`)
+                        let look = tag_round.note(c.key, std::mem::replace(&mut looked, Looked::No), kept.take());
+                        if let Some(e) = &look.model_fails {
+                            shared.log.log(format!("content: the photo model fails ({e}); tried again later"));
+                            self.tags_failure(e);
+                            tagger = None;
                         }
+                        if !look.settled.is_empty() {
+                            let mut store = self.props.lock();
+                            for k in look.settled {
+                                if let Some(mut q) = store.get(k).cloned() {
+                                    q.tagged = true;
+                                    store.set(k, q);
+                                }
+                            }
+                        }
+                        (p.tags, p.tagged) = (look.tags, look.tagged);
                         p.ocr = ocr_on && is_picture(&c.path) && !is_raw(&c.path);
                     }
                     self.props.lock().set(c.key, p);
@@ -1569,7 +1566,7 @@ impl Content {
             for (c, ok) in chunk.iter().zip(allowed) {
                 i += 1;
                 if ok {
-                    if let Ok((_, text)) = extract(c, sandbox.as_ref(), None, &mut Looked::No, &|_| {}) {
+                    if let Ok((_, text)) = extract(c, sandbox.as_ref(), None, None, &mut Looked::No, &|_| {}) {
                         let folded = fold(&text);
                         if plan.needles.iter().all(|w| folded.contains(w.as_str())) {
                             rows.push(Row { path: c.path.clone(), is_dir: false, size: c.size, modified: c.modified, flags: 0 });
@@ -1940,13 +1937,29 @@ fn is_picture(path: &str) -> bool {
 }
 
 /// What the photo model made of a photo.
+#[derive(Debug)]
 enum Looked {
     /// It did not look (off, failing, the photo unreadable now).
     No,
     /// Its labels (none found: empty).
     Tags(Vec<u16>),
-    /// It failed on it (a photo it cannot read, or the model itself).
+    /// Windows cannot decode the picture (HEIC without its codec, CMYK):
+    /// the model answered, so it is looked at, with nothing found.
+    Unreadable,
+    /// Its worker failed on it (no answer, stopped, the model did not load).
     Failed(String),
+}
+
+/// The worker's answer for a picture Windows cannot decode (the text of
+/// whereti_extract::tags::Tagger::embed), unlike a failure of the model.
+fn undecodable(e: &str) -> bool {
+    e.starts_with("cannot decode the photo")
+}
+
+/// The words a photo's tags add to its text (labels as in props `tags`).
+fn tags_text(tags: &[u16]) -> String {
+    let tags: Vec<(usize, f32)> = tags.iter().map(|&t| (t as usize, 0.0)).collect();
+    whereti_extract::tags::index_text(&tags)
 }
 
 /// What is in a photo, as words for the index ("dog Hund perro chien
@@ -1966,10 +1979,67 @@ fn photo_tags(path: &Path, tagger: &mut TagWorker, looked: &mut Looked) -> Optio
             *looked = Looked::Tags(tags.iter().map(|(i, _)| *i as u16).collect());
             (!tags.is_empty()).then(|| whereti_extract::tags::index_text(&tags))
         }
+        Err(e) if undecodable(&e) => {
+            *looked = Looked::Unreadable;
+            None
+        }
         Err(e) => {
             *looked = Looked::Failed(e);
             None
         }
+    }
+}
+
+/// The photo model over one round: whether it worked, its failures in a
+/// row, and the photos its worker failed on before it worked.
+#[derive(Default)]
+struct TagRound {
+    worked: bool,
+    fails: u32,
+    unsure: Vec<u64>,
+}
+
+/// What a photo's properties keep of the model's look.
+#[derive(Debug, PartialEq)]
+struct Look {
+    tags: Vec<u16>,
+    tagged: bool,
+    /// The worker fails three times in a row: the model, not the photos;
+    /// it is not used for the rest of the round.
+    model_fails: Option<String>,
+    /// Photos it failed on before it worked: those photos were the trouble,
+    /// they count as looked at.
+    settled: Vec<u64>,
+}
+
+impl TagRound {
+    /// `kept`: the tags the model gave this photo, unchanged since, before
+    /// (`None`: it never looked at it). They stay while it gives none now.
+    fn note(&mut self, key: u64, looked: Looked, kept: Option<Vec<u16>>) -> Look {
+        let had = kept.is_some();
+        let mut look = Look { tags: kept.unwrap_or_default(), tagged: had, model_fails: None, settled: Vec::new() };
+        match looked {
+            Looked::Tags(tags) => {
+                if !self.worked {
+                    look.settled = std::mem::take(&mut self.unsure);
+                }
+                (self.worked, self.fails) = (true, 0);
+                (look.tags, look.tagged) = (tags, true);
+            }
+            Looked::Unreadable => look.tagged = true,
+            Looked::Failed(e) => {
+                self.fails += 1;
+                if self.fails >= 3 {
+                    look.model_fails = Some(e);
+                } else if self.worked {
+                    look.tagged = true;
+                } else if !had {
+                    self.unsure.push(key);
+                }
+            }
+            Looked::No => {}
+        }
+        look
     }
 }
 
@@ -1985,12 +2055,15 @@ enum Skip {
 }
 
 /// Reads one file. `tagger`: recognise what is in photos (when on).
-/// `looked`: what the photo model made of a photo. `mark`: called with
-/// `true` before and `false` after parsing in this process.
+/// `kept`: the tags the model gave the photo before, which stay when it
+/// gives none now. `looked`: what the photo model made of a photo.
+/// `mark`: called with `true` before and `false` after parsing in this
+/// process.
 fn extract(
     c: &Candidate,
     sandbox: Option<&Sandbox>,
     tagger: Option<&mut TagWorker>,
+    kept: Option<&[u16]>,
     looked: &mut Looked,
     mark: &dyn Fn(bool),
 ) -> Result<(Indexed, String), Skip> {
@@ -2004,6 +2077,10 @@ fn extract(
     // a photo: where it was taken and what is in it
     let place = if kind == Kind::Image {
         let tags = tagger.and_then(|t| photo_tags(path, t, looked));
+        let tags = match kept {
+            Some(k) if tags.is_none() && !matches!(looked, Looked::Tags(_)) && !k.is_empty() => Some(tags_text(k)),
+            _ => tags,
+        };
         mark(true);
         let place = place_text(path, &ext);
         mark(false);
@@ -2348,6 +2425,43 @@ mod tests {
         assert!(reply.total <= SEARCH_DEPTH as u64);
         drop(content);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_picture_windows_cannot_decode_is_not_a_model_failure() {
+        assert!(undecodable("cannot decode the photo: The component cannot be found."));
+        assert!(!undecodable("no answer in 20 s") && !undecodable("cannot load the model: bad file"));
+        let mut round = TagRound::default();
+        // undecodable pictures, however many: looked at, nothing found, the model stays on
+        for k in 0..5 {
+            let look = round.note(k, Looked::Unreadable, None);
+            assert_eq!((look.tags, look.tagged, look.model_fails), (vec![], true, None));
+        }
+        // the worker failing before it ever worked: the photo waits; three in a row: the model
+        assert!(!round.note(10, Looked::Failed("no answer in 20 s".into()), None).tagged);
+        assert!(round.note(11, Looked::Unreadable, None).model_fails.is_none());
+        assert!(round.note(12, Looked::Failed("no answer in 20 s".into()), None).model_fails.is_none());
+        let look = round.note(13, Looked::Failed("the tagger stopped".into()), Some(vec![4]));
+        assert_eq!(look.model_fails.as_deref(), Some("the tagger stopped"));
+        // tags it gave before stay while it gives none
+        assert_eq!((look.tags, look.tagged), (vec![4], true));
+        let look = round.note(14, Looked::No, Some(vec![2, 9]));
+        assert_eq!((look.tags, look.tagged), (vec![2, 9], true));
+        assert_eq!(round.note(15, Looked::No, None), Look { tags: vec![], tagged: false, model_fails: None, settled: vec![] });
+    }
+
+    #[test]
+    fn photos_the_worker_failed_on_count_as_looked_at_once_it_works() {
+        let mut round = TagRound::default();
+        assert!(!round.note(1, Looked::Failed("no answer in 20 s".into()), None).tagged);
+        // it works: the photo it failed on was the trouble
+        let look = round.note(2, Looked::Tags(vec![7]), None);
+        assert_eq!((look.tags, look.tagged, look.settled), (vec![7], true, vec![1]));
+        // once it worked, a failure is the photo's, and the count starts again
+        assert!(round.note(3, Looked::Failed("no answer in 20 s".into()), None).tagged);
+        assert!(round.note(4, Looked::Failed("no answer in 20 s".into()), None).model_fails.is_none());
+        // new tags replace the ones kept
+        assert_eq!(round.note(5, Looked::Tags(vec![]), Some(vec![3])).tags, Vec::<u16>::new());
     }
 
     #[test]
