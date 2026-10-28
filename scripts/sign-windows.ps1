@@ -40,8 +40,10 @@ if (-not $cert) {
 if (-not $cert.HasPrivateKey) {
     throw "Certificate $thumbprint has no usable key. Unplug and replug the token with proCertum CardManager closed."
 }
-$provider = (certutil -user -store My $thumbprint 2>&1 | Select-String -Pattern "Provider =").ToString()
-if ($provider -match "crypto3 CSP") {
+# The provider's name, not certutil's label for it: the label ("Provider")
+# is translated on a Windows in another language.
+$store = (certutil -user -store My $thumbprint 2>&1 | Out-String)
+if ($store -match "crypto3 CSP") {
     throw "Certificate $thumbprint is bound to the legacy crypto3 CSP, which cannot sign with SHA-256. Remove it with 'certutil -user -delstore My $thumbprint', then replug the token so the card registers it through the minidriver."
 }
 
