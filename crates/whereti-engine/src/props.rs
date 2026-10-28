@@ -461,10 +461,15 @@ fn utc_offset(s: &str) -> Option<i32> {
 }
 
 /// The offset from UTC (minutes east) of this PC's time zone at a local
-/// time (minutes since 1601): summer or winter time as on that date.
+/// time (minutes since 1601): summer or winter time as on that date, by
+/// the rules of that year (a country that moved its summer time, or gave it
+/// up); the current rules when Windows has none for that year.
 fn local_offset_at(local: u32) -> Option<i32> {
     use windows_sys::Win32::Foundation::{FILETIME, SYSTEMTIME};
-    use windows_sys::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToFileTime, TzSpecificLocalTimeToSystemTime};
+    use windows_sys::Win32::System::Time::{
+        FileTimeToSystemTime, GetDynamicTimeZoneInformation, GetTimeZoneInformationForYear, SystemTimeToFileTime,
+        TzSpecificLocalTimeToSystemTime, DYNAMIC_TIME_ZONE_INFORMATION, TIME_ZONE_ID_INVALID, TIME_ZONE_INFORMATION,
+    };
     let ticks = local as u64 * 600_000_000;
     let ft = FILETIME { dwLowDateTime: ticks as u32, dwHighDateTime: (ticks >> 32) as u32 };
     // SAFETY: zeroed POD out-parameters; null is the current time zone
@@ -472,10 +477,15 @@ fn local_offset_at(local: u32) -> Option<i32> {
         let mut st: SYSTEMTIME = std::mem::zeroed();
         let mut utc: SYSTEMTIME = std::mem::zeroed();
         let mut out: FILETIME = std::mem::zeroed();
-        if FileTimeToSystemTime(&ft, &mut st) == 0
-            || TzSpecificLocalTimeToSystemTime(std::ptr::null(), &st, &mut utc) == 0
-            || SystemTimeToFileTime(&utc, &mut out) == 0
-        {
+        if FileTimeToSystemTime(&ft, &mut st) == 0 {
+            return None;
+        }
+        let mut dynamic: DYNAMIC_TIME_ZONE_INFORMATION = std::mem::zeroed();
+        let mut year: TIME_ZONE_INFORMATION = std::mem::zeroed();
+        let of_year = GetDynamicTimeZoneInformation(&mut dynamic) != TIME_ZONE_ID_INVALID
+            && GetTimeZoneInformationForYear(st.wYear, &dynamic, &mut year) != 0;
+        let zone: *const TIME_ZONE_INFORMATION = if of_year { &year } else { std::ptr::null() };
+        if TzSpecificLocalTimeToSystemTime(zone, &st, &mut utc) == 0 || SystemTimeToFileTime(&utc, &mut out) == 0 {
             return None;
         }
         let utc_min = (((out.dwHighDateTime as u64) << 32 | out.dwLowDateTime as u64) / 600_000_000) as i64;
@@ -726,6 +736,10 @@ mod tests {
         // this PC's offset on a date: at most 14 hours
         let off = local_offset_at(exif_minutes("2025:01:15 12:00:00").unwrap()).unwrap();
         assert!(off.abs() <= 14 * 60);
+        // by the rules of each year, the oldest too
+        for date in ["1990:07:01 12:00:00", "2010:03:28 12:00:00", "2099:12:31 23:00:00"] {
+            assert!(local_offset_at(exif_minutes(date).unwrap()).is_some_and(|o| o.abs() <= 14 * 60), "{date}");
+        }
     }
 
     /// A little-endian TIFF whose directories lie after `gap` bytes of
