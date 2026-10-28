@@ -644,6 +644,12 @@ fn search(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
             // replace every exclusion there with this one change
             app.settings.exclusions.clear();
             app.searcher.ask_config();
+            // the click did nothing: say why
+            app.flash(if app.offline.is_some() {
+                tr("The whereti service is not running")
+            } else {
+                tr("whereti is still reading the settings from its service. Try again in a moment.")
+            });
         } else if changed {
             // applied at once: the service rebuilds its index in a few seconds
             app.searcher.set_exclusions(app.settings.exclusions.clone());

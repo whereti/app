@@ -1151,6 +1151,17 @@ pub const ENTRIES: &[Entry] = &[
         ro: "Folderul e pe acest PC, iar whereti îl caută deja. Adaugă foldere din rețea sau de pe un NAS.",
     },
     Entry {
+        en: "whereti is still reading the settings from its service. Try again in a moment.",
+        note: "Brief notice (toast) in Settings > Search when a folder to skip is added or a switch is clicked before the service has sent the current settings.",
+        de: "whereti liest die Einstellungen noch von seinem Dienst. Versuchen Sie es gleich noch einmal.",
+        es: "whereti aún está leyendo la configuración de su servicio. Inténtalo de nuevo en un momento.",
+        fr: "whereti lit encore les paramètres de son service. Réessayez dans un instant.",
+        it: "whereti sta ancora leggendo le impostazioni dal suo servizio. Riprova tra un attimo.",
+        pl: "whereti wciąż odczytuje ustawienia ze swojej usługi. Spróbuj ponownie za chwilę.",
+        pt_br: "O whereti ainda está lendo as configurações do serviço. Tente de novo em instantes.",
+        ro: "whereti încă citește setările de la serviciul său. Încearcă din nou peste o clipă.",
+    },
+    Entry {
         en: "{folder}: looking through it…",
         note: "Settings > Network folders: a folder being read right now; {folder} is its path.",
         de: "{folder}: wird durchsucht…",
