@@ -22,12 +22,28 @@ jobs:
       # the version in rust-toolchain.toml
       - name: Rust
         run: rustup toolchain install
-      # The installer (whereti-setup) packs the release programs and is built
-      # by scripts/package.ps1; it is not a default member, so these skip it.
+      # The installer (whereti-setup) is not a default member: it packs the
+      # programs it installs (build.rs), so these skip it and it comes last.
       - name: Tests
         run: cargo test --locked
       - name: Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
+      # A development payload for it: the debug programs, and one of them as a
+      # stand-in for onnxruntime.dll (package.ps1 fetches Microsoft's; here it
+      # only has to pack and unpack whole).
+      - name: Installer payload
+        run: |
+          cargo build --locked -p whereti-app -p whereti-service -p whereti-extract -p whereti-cli
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $payload = Join-Path $env:RUNNER_TEMP "whereti-payload"
+          New-Item -ItemType Directory -Force $payload | Out-Null
+          foreach ($p in "whereti.exe", "whereti-service.exe", "whereti-extract.exe", "wt.exe") { Copy-Item "target\debug\$p" $payload }
+          Copy-Item "target\debug\whereti-extract.exe" (Join-Path $payload "onnxruntime.dll")
+          "WHERETI_PAYLOAD=$payload" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Installer tests
+        run: cargo test --locked -p whereti-setup
+      - name: Installer clippy
+        run: cargo clippy --locked -p whereti-setup --all-targets -- -D warnings
 
   deny:
     runs-on: windows-latest
@@ -35,5 +51,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: cargo-deny
         run: |
-          cargo install cargo-deny --locked
+          # a fixed version: a newer one can change what the check reports
+          cargo install cargo-deny --locked --version 0.20.2
           cargo deny check
