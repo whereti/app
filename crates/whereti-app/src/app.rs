@@ -78,6 +78,18 @@ pub(crate) enum Page {
     Welcome,
 }
 
+/// What the service (or the thread talking to it) says in English and the
+/// user may read, in the app's language. Other texts stay as they come.
+fn service_text(msg: &str) -> String {
+    let known = [
+        whereti_i18n::tr_both("only an administrator of this PC can change this setting"),
+        whereti_i18n::tr_both("too many connections to the whereti service from this account"),
+        whereti_i18n::tr_both("service not running"),
+        whereti_i18n::tr_both("connection to the service was lost"),
+    ];
+    known.iter().fold(msg.to_string(), |text, (en, local)| text.replace(en, local))
+}
+
 /// Chinese, Japanese or Korean letters: the fonts for them are loaded then.
 pub(crate) fn has_cjk(s: &str) -> bool {
     s.chars().any(|c| matches!(c as u32, 0x1100..=0x11FF | 0x2E80..=0x9FFF | 0xAC00..=0xD7AF | 0xF900..=0xFAFF | 0xFF00..=0xFFEF | 0x20000..=0x3FFFF))
@@ -658,9 +670,9 @@ impl WheretiApp {
                     self.status = Some(s);
                 }
                 Update::Config(c) => self.settings.on_config(c),
-                Update::Done(msg) => self.flash(msg),
+                Update::Done(msg) => self.flash(service_text(&msg)),
                 Update::Offline(msg) => {
-                    self.offline = Some(msg);
+                    self.offline = Some(service_text(&msg));
                     // the preview's details were not answered: ask again later
                     self.file_info.0 = None;
                 }
@@ -3461,6 +3473,19 @@ mod tests {
         // a row after the sets is in none of them
         assert_eq!(dupe_removal(&mut sets, 2), None);
         assert_eq!(sets, [(0, 2)]);
+    }
+
+    #[test]
+    fn what_the_service_says_is_translated() {
+        let _guard = crate::i18n::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        crate::i18n::set(crate::i18n::Lang::Ro);
+        assert_eq!(service_text("service not running"), "serviciul nu rulează");
+        assert_eq!(
+            service_text("Nu s-au putut salva excluderile: only an administrator of this PC can change this setting"),
+            "Nu s-au putut salva excluderile: doar un administrator al acestui PC poate schimba această setare"
+        );
+        assert_eq!(service_text("something else"), "something else");
+        crate::i18n::set(crate::i18n::Lang::En);
     }
 
     #[test]

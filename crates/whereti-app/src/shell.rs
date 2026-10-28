@@ -21,7 +21,7 @@ pub fn open(path: &str) -> Result<(), String> {
     if r as isize > 32 {
         Ok(())
     } else {
-        Err(format!("Windows could not open {path}"))
+        Err(crate::trf!("Windows could not open {path}", path))
     }
 }
 
@@ -43,7 +43,7 @@ pub fn open_and_wait(path: &str) -> Result<(), String> {
     if unsafe { ShellExecuteExW(&mut info) } != 0 {
         Ok(())
     } else {
-        Err(format!("Windows could not open {path}"))
+        Err(crate::trf!("Windows could not open {path}", path))
     }
 }
 
