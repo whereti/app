@@ -1493,6 +1493,10 @@ const MAX_HASHED: u64 = 64 * 1024 * 1024;
 /// is locked meanwhile); the rest are read in the background, for the
 /// next search.
 const HASH_BUDGET: Duration = Duration::from_millis(150);
+/// Larger files are never read during a search (one file of 64 MB on a
+/// slow disk would hold the name index far past the budget): only in the
+/// background, for the next search.
+const MAX_HASHED_NOW: u64 = 4 << 20;
 
 /// Remembered content hashes: path -> (size, last write and change time,
 /// hash).
@@ -1517,7 +1521,7 @@ impl Content {
             let mut first_with: HashMap<u64, usize> = HashMap::new();
             for &k in same_size {
                 let (_, _, path) = &found[k];
-                let h = match content_hash(&self.hashes, path, size, Instant::now() < deadline) {
+                let h = match content_hash(&self.hashes, path, size, size <= MAX_HASHED_NOW && Instant::now() < deadline) {
                     Hashed::Yes(h) => h,
                     Hashed::NotNow => {
                         later.push((path.clone(), size));
