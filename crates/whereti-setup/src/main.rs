@@ -198,10 +198,49 @@ fn logo_128() -> Vec<u8> {
     include_bytes!("../../../media/icons/whereti-128.rgba").to_vec()
 }
 
-/// Compares "0.10.2" with "0.9.0" by numbers, not as text.
+/// Compares "0.10.2" with "0.9.0" by numbers, not as text, as semver does:
+/// "0.9" is "0.9.0", and a prerelease ("1.0.0-beta.2") comes before its
+/// release. Build details after '+' do not count.
 fn version_cmp(a: &str, b: &str) -> std::cmp::Ordering {
-    let parts = |v: &str| -> Vec<u64> { v.split(['.', '-']).map(|p| p.parse().unwrap_or(0)).collect() };
-    parts(a).cmp(&parts(b))
+    use std::cmp::Ordering;
+    let split = |v: &str| {
+        let v = v.trim().split('+').next().unwrap_or("");
+        let (core, pre) = v.split_once('-').map_or((v, None), |(c, p)| (c, Some(p.to_string())));
+        let nums: Vec<u64> = core.split('.').map(|p| p.parse().unwrap_or(0)).collect();
+        (nums, pre)
+    };
+    let ((mut x, xp), (mut y, yp)) = (split(a), split(b));
+    let len = x.len().max(y.len());
+    x.resize(len, 0);
+    y.resize(len, 0);
+    x.cmp(&y).then_with(|| match (xp, yp) {
+        (None, None) => Ordering::Equal,
+        (None, Some(_)) => Ordering::Greater,
+        (Some(_), None) => Ordering::Less,
+        (Some(p), Some(q)) => {
+            // dot by dot: numbers by value and before words, words as text,
+            // and fewer parts first when all before are equal
+            let (mut p, mut q) = (p.split('.'), q.split('.'));
+            loop {
+                match (p.next(), q.next()) {
+                    (None, None) => return Ordering::Equal,
+                    (None, Some(_)) => return Ordering::Less,
+                    (Some(_), None) => return Ordering::Greater,
+                    (Some(s), Some(t)) => {
+                        let o = match (s.parse::<u64>(), t.parse::<u64>()) {
+                            (Ok(m), Ok(n)) => m.cmp(&n),
+                            (Ok(_), Err(_)) => Ordering::Less,
+                            (Err(_), Ok(_)) => Ordering::Greater,
+                            (Err(_), Err(_)) => s.cmp(t),
+                        };
+                        if o != Ordering::Equal {
+                            return o;
+                        }
+                    }
+                }
+            }
+        }
+    })
 }
 
 // ---------------------------------------------------------------- look
@@ -582,5 +621,23 @@ mod tests {
         assert_eq!(version_cmp("0.10.0", "0.9.3"), Greater);
         assert_eq!(version_cmp("0.0.1", "0.0.1"), Equal);
         assert_eq!(version_cmp("1.0.0", "1.0.1"), Less);
+    }
+
+    #[test]
+    fn missing_parts_are_zero() {
+        assert_eq!(version_cmp("0.9", "0.9.0"), Equal);
+        assert_eq!(version_cmp("1", "0.9.9"), Greater);
+    }
+
+    #[test]
+    fn a_prerelease_comes_before_its_release() {
+        assert_eq!(version_cmp("1.0.0-beta.1", "1.0.0"), Less);
+        assert_eq!(version_cmp("1.0.0", "1.0.0-rc.1"), Greater);
+        assert_eq!(version_cmp("1.0.0-beta.2", "1.0.0-beta.10"), Less);
+        assert_eq!(version_cmp("1.0.0-alpha", "1.0.0-alpha.1"), Less);
+        assert_eq!(version_cmp("1.0.0-alpha.1", "1.0.0-beta"), Less);
+        assert_eq!(version_cmp("1.0.0-1", "1.0.0-alpha"), Less);
+        assert_eq!(version_cmp("1.0.0-rc.1", "0.9.9"), Greater);
+        assert_eq!(version_cmp("1.0.0+build.5", "1.0.0"), Equal);
     }
 }
