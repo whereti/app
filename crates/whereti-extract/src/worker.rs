@@ -415,15 +415,17 @@ impl Sandbox {
 
     /// The worker runs with the restricted token (see `spawn`). `false`
     /// only where Windows' OCR, picture or PDF code failed with it and
-    /// works without it: then the worker has its own lockdown alone.
+    /// works without it: then the worker has its own lockdown alone. Waits
+    /// for the check of the worker (extracting never does).
     pub fn restricted(&self) -> bool {
-        restricted_works(&self.exe)
+        sandbox_check(&self.exe, true).0
     }
 
     /// One line for the log: whether the worker has the restricted token,
-    /// and what Windows' OCR, picture and PDF code can do in it.
+    /// and what Windows' OCR, picture and PDF code can do in it. Waits for
+    /// the check of the worker.
     pub fn sandbox_report(&self) -> String {
-        sandbox_check(&self.exe).1
+        sandbox_check(&self.exe, true).1
     }
 
     /// Reads `path` (sharing it with writers, so open files work) and
@@ -472,7 +474,7 @@ impl Sandbox {
     pub fn probe_exit(&self, args: &[&str]) -> Option<i32> {
         let job = Job::new(self.memory_limit).ok()?;
         let args: Vec<&std::ffi::OsStr> = args.iter().map(std::ffi::OsStr::new).collect();
-        let (mut child, _) = crate::spawn::spawn(&self.exe, &args, self.restricted(), false, &job, &[]).ok()?;
+        let (mut child, _) = crate::spawn::spawn(&self.exe, &args, restricted_works(&self.exe), false, &job, &[]).ok()?;
         drop(child.stdin.take());
         if !child.wait_for(self.timeout) {
             child.kill();
@@ -492,7 +494,7 @@ impl Sandbox {
 
         let job = Job::new(self.memory_limit).map_err(|e| SandboxError::Failed(format!("job object: {e}")))?;
         let give: Vec<_> = give.into_iter().collect();
-        let (mut child, given) = crate::spawn::spawn(&self.exe, &args, self.restricted(), true, &job, &give)
+        let (mut child, given) = crate::spawn::spawn(&self.exe, &args, restricted_works(&self.exe), true, &job, &give)
             .map_err(|e| SandboxError::Failed(format!("cannot start the extractor: {e}")))?;
         // the handle's value in the worker comes first
         let mut bytes = bytes;
@@ -559,25 +561,84 @@ pub fn use_own_desktop() {
 /// Whether the worker `exe` does its work with the restricted token, found
 /// once per worker: it is started with it and without it, and asked what
 /// Windows' OCR, picture and PDF code can do (`--probe-sandbox`). Without
-/// the restricted token only if it can do less with it.
+/// the restricted token only if it can do less with it. Never waits for
+/// the check: until it is done, the restricted token (see `sandbox_check`).
 fn restricted_works(exe: &Path) -> bool {
-    sandbox_check(exe).0
+    sandbox_check(exe, false).0
 }
 
-/// `restricted_works`, and what was found, for the log.
-fn sandbox_check(exe: &Path) -> (bool, String) {
-    static KNOWN: std::sync::Mutex<Vec<(PathBuf, bool, String)>> = std::sync::Mutex::new(Vec::new());
-    let mut known = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((_, ok, report)) = known.iter().find(|(p, ..)| p == exe) {
-        return (*ok, report.clone());
+/// Where the check of one worker stands.
+enum Check {
+    /// Being probed; meanwhile the last verdict, or the restricted token.
+    Running { meanwhile: bool },
+    /// Found; `again`: when to probe again (the probe failed or got no
+    /// answer, which says nothing for good about the restricted token).
+    Done { ok: bool, report: String, again: Option<std::time::Instant> },
+}
+
+static CHECKS: std::sync::Mutex<Vec<(PathBuf, Check)>> = std::sync::Mutex::new(Vec::new());
+static CHECKED: std::sync::Condvar = std::sync::Condvar::new();
+
+/// How long a probe that failed stands before the worker is probed again.
+const PROBE_AGAIN: Duration = Duration::from_secs(600);
+
+/// `restricted_works`, and what was found, for the log. `wait`: for the
+/// check (else, while it runs, what is used meanwhile). Nobody waits for
+/// another caller's lock while a worker is probed: the probe runs unlocked,
+/// in this thread when it waits, else in a thread of its own.
+fn sandbox_check(exe: &Path, wait: bool) -> (bool, String) {
+    let being_checked = |meanwhile: bool| (meanwhile, format!("restricted token: {}, being checked", if meanwhile { "yes" } else { "no" }));
+    let mut checks = CHECKS.lock().unwrap_or_else(|e| e.into_inner());
+    let meanwhile = loop {
+        let Some(i) = checks.iter().position(|(p, _)| p == exe) else {
+            checks.push((exe.to_path_buf(), Check::Running { meanwhile: true }));
+            break true;
+        };
+        match &checks[i].1 {
+            Check::Done { ok, report, again } if again.is_none_or(|at| std::time::Instant::now() < at) => return (*ok, report.clone()),
+            Check::Done { ok, .. } => {
+                let meanwhile = *ok;
+                checks[i].1 = Check::Running { meanwhile };
+                break meanwhile;
+            }
+            Check::Running { meanwhile } if !wait => return being_checked(*meanwhile),
+            Check::Running { .. } => checks = CHECKED.wait(checks).unwrap_or_else(|e| e.into_inner()),
+        }
+    };
+    drop(checks);
+    if wait {
+        return probe_and_keep(exe, meanwhile);
     }
-    // what the worker answers, or why it did not
-    let probe = |restricted: bool| -> Result<String, String> {
-        let job = Job::new(512 << 20).map_err(|e| format!("job object: {e}"))?;
-        let (mut child, _) =
-            crate::spawn::spawn(exe, &[std::ffi::OsStr::new("--probe-sandbox")], restricted, false, &job, &[]).map_err(|e| e.to_string())?;
+    let owned = exe.to_path_buf();
+    match std::thread::Builder::new().name("whereti sandbox check".into()).spawn(move || drop(probe_and_keep(&owned, meanwhile))) {
+        Ok(_) => being_checked(meanwhile),
+        Err(_) => probe_and_keep(exe, meanwhile),
+    }
+}
+
+/// Probes the worker and keeps the verdict for `sandbox_check`, waking
+/// those who wait for it.
+fn probe_and_keep(exe: &Path, meanwhile: bool) -> (bool, String) {
+    let (ok, report, again) = std::panic::catch_unwind(|| probe_sandbox(exe))
+        .unwrap_or_else(|_| (meanwhile, "restricted token: the check failed".into(), Some(std::time::Instant::now() + PROBE_AGAIN)));
+    let mut checks = CHECKS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, check)) = checks.iter_mut().find(|(p, _)| p == exe) {
+        *check = Check::Done { ok, report: report.clone(), again };
+    }
+    CHECKED.notify_all();
+    (ok, report)
+}
+
+/// Probes the worker `exe` (see `restricted_works`): whether to use the
+/// restricted token, the line for the log, and when to probe again.
+fn probe_sandbox(exe: &Path) -> (bool, String, Option<std::time::Instant>) {
+    // what the worker answers, or why it did not (`true`: no answer in time)
+    let probe = |restricted: bool| -> Result<String, (String, bool)> {
+        let job = Job::new(512 << 20).map_err(|e| (format!("job object: {e}"), false))?;
+        let (mut child, _) = crate::spawn::spawn(exe, &[std::ffi::OsStr::new("--probe-sandbox")], restricted, false, &job, &[])
+            .map_err(|e| (e.to_string(), false))?;
         drop(child.stdin.take());
-        let mut stdout = child.stdout.take().ok_or("no stdout")?;
+        let mut stdout = child.stdout.take().ok_or(("no stdout".to_string(), false))?;
         let reader = PipeThread::start(move || {
             let mut out = String::new();
             let _ = stdout.read_to_string(&mut out);
@@ -592,23 +653,24 @@ fn sandbox_check(exe: &Path) -> (bool, String) {
         let out = reader.finish();
         match (finished, code) {
             (true, Some(0)) => Ok(out),
-            (false, _) => Err("no answer in 20 s".into()),
-            (_, code) => Err(format!("stopped with code {:#x}", code.unwrap_or(-1))),
+            (false, _) => Err(("no answer in 20 s".into(), true)),
+            (_, code) => Err((format!("stopped with code {:#x}", code.unwrap_or(-1)), false)),
         }
     };
     let can = |answer: &str| -> Vec<String> { answer.split_whitespace().filter(|w| w.ends_with("=1")).map(String::from).collect() };
-    let (ok, report) = match probe(true) {
-        Err(e) => (false, format!("restricted token: no ({e})")),
-        Ok(with) if can(&with).len() >= 3 => (true, format!("restricted token: yes ({with})")),
+    let again = Some(std::time::Instant::now() + PROBE_AGAIN);
+    match probe(true) {
+        // a busy machine (a boot): no verdict, the restricted token until the next probe
+        Err((e, true)) => (true, format!("restricted token: yes, not checked ({e}; checked again later)"), again),
+        Err((e, _)) => (false, format!("restricted token: no ({e}; checked again later)"), again),
+        Ok(with) if can(&with).len() >= 3 => (true, format!("restricted token: yes ({with})"), None),
         Ok(with) => match probe(false) {
             Ok(without) if !can(&without).iter().all(|w| can(&with).contains(w)) => {
-                (false, format!("restricted token: no ({with}; without it: {without})"))
+                (false, format!("restricted token: no ({with}; without it: {without})"), None)
             }
-            _ => (true, format!("restricted token: yes ({with})")),
+            _ => (true, format!("restricted token: yes ({with})"), None),
         },
-    };
-    known.push((exe.to_path_buf(), ok, report.clone()));
-    (ok, report)
+    }
 }
 
 /// A thread reading or writing one of a worker's pipes. Once the worker
@@ -1022,5 +1084,29 @@ mod tests {
         assert_eq!(reader.finish(), b"partial");
         assert!(t.elapsed() < Duration::from_secs(10), "{:?}", t.elapsed());
         drop(write);
+    }
+
+    #[test]
+    fn a_failed_check_does_not_hold_callers_and_is_tried_again() {
+        let missing = std::env::temp_dir().join(format!("whereti-no-worker-{}.exe", std::process::id()));
+        // the first caller does not wait for the probe: the restricted token meanwhile
+        let t = Instant::now();
+        let (ok, report) = sandbox_check(&missing, false);
+        assert!(ok && report.contains("being checked"), "{report}");
+        assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+        // the worker cannot start: not with the restricted token, for a while
+        let (ok, report) = sandbox_check(&missing, true);
+        assert!(!ok && report.contains("checked again later"), "{report}");
+        assert_eq!(sandbox_check(&missing, false), (ok, report));
+        // once that while is over, probed again, the last verdict meanwhile
+        {
+            let mut checks = CHECKS.lock().unwrap();
+            let (_, check) = checks.iter_mut().find(|(p, _)| *p == missing).unwrap();
+            let Check::Done { again, .. } = check else { panic!("not done") };
+            *again = Some(Instant::now());
+        }
+        let (ok, report) = sandbox_check(&missing, false);
+        assert!(!ok && report.contains("being checked"), "{report}");
+        assert!(!sandbox_check(&missing, true).0);
     }
 }

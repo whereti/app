@@ -41,6 +41,9 @@ fn ocr_stops_inside_the_callers_time() {
     let one = fixture("scanned.pdf");
     let mut s = sandbox();
     s.timeout = Duration::from_millis(2500);
+    // the check of the worker (which extracting never waits for) done
+    // first, so its probes do not compete with the timed part
+    let _ = s.sandbox_report();
     let t = Instant::now();
     let got = s.extract_bytes("pdf", one, 100_000);
     assert!(t.elapsed() < Duration::from_millis(2500), "{:?}", t.elapsed());
