@@ -2001,7 +2001,7 @@ impl WheretiApp {
     /// put off for a few days.
     fn update_banner(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, p: &Palette) {
         use crate::update::Phase;
-        if !self.updater.banner() {
+        if !self.updater.banner(self.settings.updates) {
             return;
         }
         let phase = self.updater.phase();
@@ -2138,7 +2138,8 @@ impl WheretiApp {
         let mut left: Option<(String, Color32)> = None;
         let mut update_link = false;
         if let crate::update::Phase::Offered(o) = self.updater.phase() {
-            if self.message.is_none() && self.page == Page::Search && !self.updater.banner() {
+            // the line instead of the banner, and like it only while checking is on
+            if self.settings.updates && self.message.is_none() && self.page == Page::Search && !self.updater.banner(true) {
                 left = Some((trf!("whereti {version} is available · Install", version = o.version), p.accent));
                 update_link = true;
             }

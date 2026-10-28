@@ -32,6 +32,9 @@ const MAX_INSTALLER: u64 = 200 << 20;
 /// "Later" on the update banner hides it this long (Settings, About still
 /// shows the update).
 const LATER_SECS: u64 = 3 * DAY_SECS;
+/// The installer finished well and closes whereti: still running this long
+/// after, the update did not happen.
+const INSTALL_WAIT: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Offer {
@@ -57,11 +60,42 @@ pub struct Updater {
     /// "Later" on the banner: for which version, and when (kept in memory,
     /// written to update.txt when chosen).
     later: Option<(String, u64)>,
+    /// When the last check went out, as Unix seconds, kept here so Settings
+    /// does not read the file every frame.
+    last_check: Option<u64>,
 }
 
 fn state_file() -> PathBuf {
     let base = std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
     base.join("whereti").join("update.txt")
+}
+
+/// update.txt is read, changed and written again by the window and by the
+/// check's thread: one at a time, so neither loses what the other wrote
+/// (and they never share the temporary file).
+static STATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn with_state<T>(f: impl FnOnce(&Path) -> T) -> T {
+    let _one_at_a_time = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    f(&state_file())
+}
+
+/// The only installer whereti downloads: whereti's own GitHub release of
+/// that version, named as the release script names it. The version is
+/// plain (digits, letters, dots, dashes), so the address cannot be bent
+/// elsewhere (no `..`, `%`, `?` or `#`).
+fn installer_url_ok(version: &str, url: &str) -> bool {
+    let plain = !version.is_empty()
+        && version.len() <= 32
+        && version.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+        && !version.contains("..")
+        && !version.starts_with(['.', '-']);
+    plain && url == format!("{DOWNLOADS}v{version}/whereti-setup-{version}.exe")
+}
+
+/// An offer from update.txt that can still be installed.
+fn still_offered(saved: &Saved) -> Option<Offer> {
+    saved.offer.clone().filter(|o| newer(&o.version, VERSION) && installer_url_ok(&o.version, &o.url))
 }
 
 fn now_secs() -> u64 {
@@ -140,13 +174,18 @@ fn due(last: Option<u64>, now: u64) -> Result<bool, u64> {
 
 impl Updater {
     pub fn new() -> Updater {
-        let saved = Saved::load(&state_file());
-        let phase = match &saved.offer {
-            Some(o) if newer(&o.version, VERSION) => Phase::Offered(o.clone()),
-            _ => Phase::Idle,
+        let saved = with_state(Saved::load);
+        let phase = match still_offered(&saved) {
+            Some(o) => Phase::Offered(o),
+            None => Phase::Idle,
         };
         // the first look waits a minute, so a check never slows the start
-        Updater { phase: Arc::new(Mutex::new(phase)), next_look: Instant::now() + Duration::from_secs(60), later: saved.later }
+        Updater {
+            phase: Arc::new(Mutex::new(phase)),
+            next_look: Instant::now() + Duration::from_secs(60),
+            later: saved.later,
+            last_check: saved.last_check,
+        }
     }
 
     pub fn phase(&self) -> Phase {
@@ -154,11 +193,13 @@ impl Updater {
     }
 
     /// Whether the big banner shows: always while downloading, installing or
-    /// after a failure; for an offer, unless "Later" was chosen for this
-    /// version less than three days ago.
-    pub fn banner(&self) -> bool {
+    /// after a failure; for an offer, only while checking for updates is on
+    /// (`enabled`), and unless "Later" was chosen for this version less than
+    /// three days ago.
+    pub fn banner(&self, enabled: bool) -> bool {
         match self.phase() {
             Phase::Idle => false,
+            Phase::Offered(_) if !enabled => false,
             Phase::Offered(o) => match &self.later {
                 Some((v, t)) if *v == o.version => now_secs().saturating_sub(*t) >= LATER_SECS || *t > now_secs(),
                 _ => true,
@@ -174,16 +215,18 @@ impl Updater {
         }
         if let Phase::Offered(o) = self.phase() {
             self.later = Some((o.version, now_secs()));
-            let path = state_file();
-            let mut saved = Saved::load(&path);
-            saved.later = self.later.clone();
-            saved.save(&path);
+            let later = self.later.clone();
+            with_state(|path| {
+                let mut saved = Saved::load(path);
+                saved.later = later;
+                saved.save(path);
+            });
         }
     }
 
     /// The last check, as Unix seconds.
     pub fn last_check(&self) -> Option<u64> {
-        Saved::load(&state_file()).last_check
+        self.last_check
     }
 
     /// Called often; does real work only when a check is due.
@@ -197,31 +240,40 @@ impl Updater {
         if !matches!(*self.phase.lock(), Phase::Idle | Phase::Failed(_) | Phase::Offered(_)) {
             return;
         }
-        let path = state_file();
-        let mut saved = Saved::load(&path);
         let now = now_secs();
-        match due(saved.last_check, now) {
-            Ok(false) => return,
-            Err(reset) => {
-                saved.last_check = Some(reset);
-                saved.save(&path);
-                return;
+        let claimed = with_state(|path| {
+            let mut saved = Saved::load(path);
+            match due(saved.last_check, now) {
+                Ok(false) => return false,
+                Err(reset) => {
+                    saved.last_check = Some(reset);
+                    saved.save(path);
+                    self.last_check = Some(reset);
+                    return false;
+                }
+                Ok(true) => {}
             }
-            Ok(true) => {}
-        }
-        // Claim the day first. If that cannot be written, no request goes
-        // out: one check a day must hold even when the disk is full.
-        saved.last_check = Some(now);
-        if !saved.save(&path) {
+            // Claim the day first. If that cannot be written, no request goes
+            // out: one check a day must hold even when the disk is full.
+            saved.last_check = Some(now);
+            let saved_ok = saved.save(path);
+            if saved_ok {
+                self.last_check = Some(now);
+            }
+            saved_ok
+        });
+        if !claimed {
             return;
         }
         let (phase, ctx) = (self.phase.clone(), ctx.clone());
         let _ = std::thread::Builder::new().name("update-check".into()).spawn(move || {
             // a failed check is silent and waits for tomorrow
             let Ok(answer) = check() else { return };
-            let mut saved = Saved::load(&path);
-            saved.offer = answer.clone();
-            saved.save(&path);
+            with_state(|path| {
+                let mut saved = Saved::load(path);
+                saved.offer = answer.clone();
+                saved.save(path);
+            });
             let mut phase = phase.lock();
             // never while one is being downloaded or installed
             if matches!(*phase, Phase::Idle | Phase::Failed(_) | Phase::Offered(_)) {
@@ -240,24 +292,43 @@ impl Updater {
         *self.phase.lock() = Phase::Downloading { version: offer.version.clone(), done: 0, total: 0 };
         let (phase, ctx) = (self.phase.clone(), ctx.clone());
         let _ = std::thread::Builder::new().name("update-install".into()).spawn(move || {
-            let result = download_and_run(&offer, &mut |done, total| {
-                *phase.lock() = Phase::Downloading { version: offer.version.clone(), done, total };
-                ctx.request_repaint();
-            });
-            *phase.lock() = match result {
-                Ok(()) => Phase::Installing,
-                Err(e) => Phase::Failed(e),
+            let mut started = {
+                let (phase, ctx) = (phase.clone(), ctx.clone());
+                move || {
+                    *phase.lock() = Phase::Installing;
+                    ctx.request_repaint();
+                }
             };
+            let result = download_and_run(
+                &offer,
+                &mut |done, total| {
+                    *phase.lock() = Phase::Downloading { version: offer.version.clone(), done, total };
+                    ctx.request_repaint();
+                },
+                &mut started,
+            );
+            match result {
+                Ok(()) => {
+                    // the installer finished and closes whereti: still here
+                    // a while later, it did not
+                    std::thread::sleep(INSTALL_WAIT);
+                    let mut phase = phase.lock();
+                    if *phase == Phase::Installing {
+                        *phase = Phase::Failed(crate::i18n::tr("The update was cancelled or did not finish.").into());
+                    }
+                }
+                Err(e) => *phase.lock() = Phase::Failed(e),
+            }
             ctx.request_repaint();
         });
     }
 
     /// Back to the offer after a failure, so the button shows again.
     pub fn retry(&self) {
-        let saved = Saved::load(&state_file());
-        *self.phase.lock() = match saved.offer {
-            Some(o) if newer(&o.version, VERSION) => Phase::Offered(o),
-            _ => Phase::Idle,
+        let saved = with_state(Saved::load);
+        *self.phase.lock() = match still_offered(&saved) {
+            Some(o) => Phase::Offered(o),
+            None => Phase::Idle,
         };
     }
 }
@@ -339,14 +410,19 @@ fn parse_offer(body: &[u8]) -> Result<Option<Offer>, String> {
     let entry = &v["platforms"][format!("windows-{}", arch())];
     let url = entry["url"].as_str().unwrap_or("").to_string();
     let sha256 = entry["sha256"].as_str().unwrap_or("").to_ascii_lowercase();
-    if !url.starts_with(DOWNLOADS) || sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+    if !installer_url_ok(&version, &url) || sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err("the update manifest is not valid".into());
     }
     Ok(Some(Offer { version, notes: v["notes"].as_str().unwrap_or("").to_string(), url, sha256 }))
 }
 
-fn download_and_run(offer: &Offer, progress: &mut dyn FnMut(u64, u64)) -> Result<(), String> {
+/// `started`: the installer is running (Windows asks for permission now).
+fn download_and_run(offer: &Offer, progress: &mut dyn FnMut(u64, u64), started: &mut dyn FnMut()) -> Result<(), String> {
     use crate::i18n::tr;
+    // checked again here: the offer may come from update.txt
+    if !installer_url_ok(&offer.version, &offer.url) {
+        return Err(tr("The download is damaged. Try again later.").into());
+    }
     let (status, bytes) = whereti_net::http_get(&offer.url, &agent(), MAX_INSTALLER, progress)?;
     if status != 200 {
         return Err(crate::trf!("The download failed (error {status}).", status));
@@ -359,30 +435,111 @@ fn download_and_run(offer: &Offer, progress: &mut dyn FnMut(u64, u64)) -> Result
     if installer_version(&bytes).as_deref() != Some(offer.version.as_str()) {
         return Err(tr("The download is damaged. Try again later.").into());
     }
-    let dir = std::env::temp_dir().join("whereti-update");
-    let _ = std::fs::create_dir_all(&dir);
-    let file = dir.join(format!("whereti-setup-{}.exe", offer.version.replace(['\\', '/', ':'], "")));
-    std::fs::write(&file, &bytes).map_err(|e| e.to_string())?;
-    // From here until the installer has started, nobody else may change the
-    // file; and what is on disk is checked again through that same handle.
-    let held = hold(&file, &offer.sha256)?;
-    if let Err(e) = verify_publisher(&file) {
+    // the downloads of earlier updates, if their installer left them
+    remove_old_downloads();
+    let dir = fresh_folder()?;
+    let file = dir.join(format!("whereti-setup-{}.exe", offer.version));
+    let result = (|| {
+        std::fs::write(&file, &bytes).map_err(|e| e.to_string())?;
+        // From here until the installer has started, nobody else may change the
+        // file; and what is on disk is checked again through that same handle.
+        let held = hold(&file, &offer.sha256)?;
+        if let Err(e) = verify_publisher(&file) {
+            drop(held);
+            return Err(crate::trf!("The update is not signed by {publisher}: {e}", publisher = PUBLISHER, e));
+        }
+        let result = run_installer(&file, started);
         drop(held);
-        let _ = std::fs::remove_file(&file);
-        return Err(crate::trf!("The update is not signed by {publisher}: {e}", publisher = PUBLISHER, e));
-    }
-    let result = run_installer(&file);
-    drop(held);
+        result
+    })();
+    // the installer has ended (when it worked, it closes whereti first)
+    let _ = std::fs::remove_dir_all(&dir);
     result
 }
 
-/// The version an installer carries (`WHERETI-SETUP-VERSION=x.y.z`).
+/// The start of the name of the folders downloads go to.
+const DOWNLOAD_FOLDER: &str = "whereti-update";
+
+/// A new folder for the download in the user's temporary folder, with a
+/// name nobody can guess: nothing can be put there before the installer
+/// is (a DLL it would load), and nothing left there is reused.
+fn fresh_folder() -> Result<PathBuf, String> {
+    use std::hash::{BuildHasher, Hasher};
+    let mut last = String::new();
+    for _ in 0..8 {
+        // keyed from the system's random numbers, new for every folder
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u128(SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos()));
+        h.write_u32(std::process::id());
+        let dir = std::env::temp_dir().join(format!("{DOWNLOAD_FOLDER}-{:016x}", h.finish()));
+        match std::fs::create_dir(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(e) => last = e.to_string(),
+        }
+    }
+    Err(last)
+}
+
+/// Download folders of earlier updates, left when the installer replaced
+/// whereti (and the fixed one older versions used). Best effort.
+fn remove_old_downloads() {
+    let Ok(list) = std::fs::read_dir(std::env::temp_dir()) else { return };
+    for item in list.flatten() {
+        // folders only, never a link to somewhere else
+        let is_dir = item.file_type().is_ok_and(|t| t.is_dir());
+        if is_dir && item.file_name().to_string_lossy().starts_with(DOWNLOAD_FOLDER) {
+            let _ = std::fs::remove_dir_all(item.path());
+        }
+    }
+}
+
+/// The version an installer carries (`WHERETI-SETUP-VERSION=x.y.z`): it
+/// must say it exactly once, and not inside its signature, the one part
+/// of a signed program its signature does not cover (anyone could add a
+/// second mark there without breaking the signature).
 fn installer_version(bytes: &[u8]) -> Option<String> {
     let mark = b"WHERETI-SETUP-VERSION=";
-    let at = bytes.windows(mark.len()).position(|w| w == mark)? + mark.len();
+    let mut found = bytes.windows(mark.len()).enumerate().filter(|(_, w)| *w == mark).map(|(i, _)| i);
+    let start = found.next()?;
+    if found.next().is_some() {
+        return None;
+    }
+    let at = start + mark.len();
     let end = bytes[at..].iter().take(32).position(|&b| b == 0)? + at;
+    let (table, len) = certificate_table(bytes)?;
+    if start < table.saturating_add(len) && end >= table {
+        return None;
+    }
     let v = std::str::from_utf8(&bytes[at..end]).ok()?;
-    v.bytes().all(|b| b.is_ascii_digit() || b == b'.' || b == b'-' || b.is_ascii_alphanumeric()).then(|| v.to_string())
+    (!v.is_empty() && v.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')).then(|| v.to_string())
+}
+
+/// Where a program's signature is (Authenticode's certificate table), as
+/// (file offset, length); (0, 0) when it has none. `None`: not a program.
+fn certificate_table(pe: &[u8]) -> Option<(usize, usize)> {
+    let u16_at = |o: usize| Some(u16::from_le_bytes(pe.get(o..o.checked_add(2)?)?.try_into().ok()?));
+    let u32_at = |o: usize| Some(u32::from_le_bytes(pe.get(o..o.checked_add(4)?)?.try_into().ok()?) as usize);
+    if pe.get(..2)? != b"MZ" {
+        return None;
+    }
+    let nt = u32_at(0x3C)?;
+    if pe.get(nt..nt.checked_add(4)?)? != b"PE\0\0" {
+        return None;
+    }
+    // after the 4-byte signature and the 20-byte file header: the optional
+    // header, 32 or 64 bit, and its data directories
+    let opt = nt + 24;
+    let (count, dirs) = match u16_at(opt)? {
+        0x10B => (opt + 92, opt + 96),
+        0x20B => (opt + 108, opt + 112),
+        _ => return None,
+    };
+    // the security directory is the fifth; its address is a file offset
+    const SECURITY: usize = 4;
+    if u32_at(count)? <= SECURITY {
+        return Some((0, 0));
+    }
+    Some((u32_at(dirs + SECURITY * 8)?, u32_at(dirs + SECURITY * 8 + 4)?))
 }
 
 /// Opens the saved installer so that no one can write or delete it while
@@ -402,7 +559,8 @@ fn hold(file: &Path, sha256: &str) -> Result<std::fs::File, String> {
 
 /// Starts `whereti-setup.exe /S /open`: it asks Windows for permission,
 /// replaces whereti (closing this window) and opens the new version.
-fn run_installer(file: &Path) -> Result<(), String> {
+/// `started`: called once it runs.
+fn run_installer(file: &Path, started: &mut dyn FnMut()) -> Result<(), String> {
     use windows_sys::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject, INFINITE};
     use windows_sys::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
     let file_w: Vec<u16> = file.as_os_str().encode_wide_nul();
@@ -419,6 +577,7 @@ fn run_installer(file: &Path) -> Result<(), String> {
     if unsafe { ShellExecuteExW(&mut info) } == 0 || info.hProcess.is_null() {
         return Err(crate::i18n::tr("The installer could not be started.").into());
     }
+    started();
     let mut code = 0u32;
     // SAFETY: process handle from ShellExecuteExW. On success the installer
     // closes this app before it exits, so this returns only on failure.
@@ -517,13 +676,13 @@ fn verify_signature(file: &Path, revocation: bool) -> Result<(), (i32, String)> 
         data.dwStateAction = WTD_STATEACTION_CLOSE;
         WinVerifyTrust(std::ptr::null_mut(), &mut action, &mut data as *mut _ as *mut _);
         if status != 0 {
-            return Err((status, format!("no valid signature ({:#x})", status as u32)));
+            return Err((status, crate::trf!("no valid signature ({code})", code = format!("{:#x}", status as u32))));
         }
         if !signer.trim().eq_ignore_ascii_case(PUBLISHER)
             || serial.trim() != PUBLISHER_SERIAL
             || !country.trim().eq_ignore_ascii_case(PUBLISHER_COUNTRY)
         {
-            return Err((0, format!("signed by {signer} ({serial}, {country})")));
+            return Err((0, crate::trf!("signed by {signer} ({serial}, {country})", signer, serial, country)));
         }
     }
     Ok(())
@@ -576,11 +735,14 @@ mod tests {
 
     #[test]
     fn only_github_installers_with_a_hash_are_accepted() {
-        let ok = format!(
-            r#"{{"version":"99.0.0","notes":"n","platforms":{{"windows-{}":{{"url":"{DOWNLOADS}v99.0.0/x.exe","sha256":"{}"}}}}}}"#,
-            arch(),
-            "AB".repeat(32)
-        );
+        let manifest = |url: &str| {
+            format!(
+                r#"{{"version":"99.0.0","notes":"n","platforms":{{"windows-{}":{{"url":"{url}","sha256":"{}"}}}}}}"#,
+                arch(),
+                "AB".repeat(32)
+            )
+        };
+        let ok = manifest(&format!("{DOWNLOADS}v99.0.0/whereti-setup-99.0.0.exe"));
         let o = parse_offer(ok.as_bytes()).unwrap().unwrap();
         assert_eq!(o.version, "99.0.0");
         assert_eq!(o.sha256, "ab".repeat(32));
@@ -588,6 +750,29 @@ mod tests {
         assert!(parse_offer(elsewhere.as_bytes()).is_err());
         let old = ok.replace("99.0.0", "0.0.0");
         assert_eq!(parse_offer(old.as_bytes()).unwrap(), None);
+        // under whereti's releases, but not the installer of that version
+        for bent in [
+            format!("{DOWNLOADS}v99.0.0/x.exe"),
+            format!("{DOWNLOADS}v1.0.0/whereti-setup-1.0.0.exe"),
+            format!("{DOWNLOADS}v99.0.0/../../../other/releases/download/v99.0.0/whereti-setup-99.0.0.exe"),
+            format!("{DOWNLOADS}v99.0.0/whereti-setup-99.0.0.exe?x=1"),
+            format!("{DOWNLOADS}v99.0.0/whereti-setup-99.0.0.exe#x"),
+            format!("{DOWNLOADS}v99.0.0/whereti%2Dsetup-99.0.0.exe"),
+        ] {
+            assert!(parse_offer(manifest(&bent).as_bytes()).is_err(), "{bent}");
+        }
+        assert!(!installer_url_ok("99.0.0/../x", &format!("{DOWNLOADS}v99.0.0/../x/whereti-setup-99.0.0/../x.exe")));
+        assert!(!installer_url_ok("", &format!("{DOWNLOADS}v/whereti-setup-.exe")));
+    }
+
+    #[test]
+    fn download_folders_are_new_each_time() {
+        let a = fresh_folder().unwrap();
+        let b = fresh_folder().unwrap();
+        assert_ne!(a, b);
+        assert!(a.file_name().unwrap().to_string_lossy().starts_with(DOWNLOAD_FOLDER));
+        let _ = std::fs::remove_dir(&a);
+        let _ = std::fs::remove_dir(&b);
     }
 
     #[test]
@@ -637,15 +822,54 @@ mod publisher_tests {
             .find(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("whereti-setup-")));
         let Some(signed) = signed else { return };
         assert_eq!(verify_publisher(&signed), Ok(()));
+        // its version mark: once, outside the signature
+        assert!(installer_version(&std::fs::read(&signed).unwrap()).is_some());
         let unsigned = std::env::current_exe().unwrap();
         assert!(verify_publisher(&unsigned).is_err());
     }
 
+    /// A 64-bit program's headers with its signature at `table` (offset,
+    /// length), `size` bytes in all.
+    fn program(table: (u32, u32), size: usize) -> Vec<u8> {
+        let mut pe = vec![0u8; size];
+        pe[..2].copy_from_slice(b"MZ");
+        pe[0x3C..0x40].copy_from_slice(&0x40u32.to_le_bytes());
+        pe[0x40..0x44].copy_from_slice(b"PE\0\0");
+        let opt = 0x40 + 24;
+        pe[opt..opt + 2].copy_from_slice(&0x20Bu16.to_le_bytes());
+        pe[opt + 108..opt + 112].copy_from_slice(&16u32.to_le_bytes());
+        let security = opt + 112 + 4 * 8;
+        pe[security..security + 4].copy_from_slice(&table.0.to_le_bytes());
+        pe[security + 4..security + 8].copy_from_slice(&table.1.to_le_bytes());
+        pe
+    }
+
+    fn put(bytes: &mut [u8], at: usize, text: &[u8]) {
+        bytes[at..at + text.len()].copy_from_slice(text);
+    }
+
     #[test]
     fn the_installer_says_its_version() {
-        let mut bytes = b"MZ....".to_vec();
-        bytes.extend_from_slice(b"WHERETI-SETUP-VERSION=1.0.0\0rest");
+        let mark = b"WHERETI-SETUP-VERSION=1.0.0\0";
+        let mut bytes = program((3000, 1000), 4000);
+        put(&mut bytes, 1000, mark);
         assert_eq!(installer_version(&bytes).as_deref(), Some("1.0.0"));
+        // a second mark, anywhere: refused
+        let mut twice = bytes.clone();
+        put(&mut twice, 2000, b"WHERETI-SETUP-VERSION=9.9.9\0");
+        assert_eq!(installer_version(&twice), None);
+        // the only mark inside the signature, which the signature does not cover
+        let mut signed = program((3000, 1000), 4000);
+        put(&mut signed, 3100, mark);
+        assert_eq!(installer_version(&signed), None);
+        // no signature table at all: the signature check refuses it later
+        let mut unsigned = program((0, 0), 4000);
+        put(&mut unsigned, 1000, mark);
+        assert_eq!(installer_version(&unsigned).as_deref(), Some("1.0.0"));
+        // not a program
+        let mut text = b"MZ....".to_vec();
+        text.extend_from_slice(mark);
+        assert_eq!(installer_version(&text), None);
         assert_eq!(installer_version(b"MZ no mark"), None);
     }
 }
