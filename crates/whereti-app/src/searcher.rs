@@ -16,7 +16,7 @@ const CONTENT_DEBOUNCE: Duration = Duration::from_millis(150);
 /// the service cannot be reached.
 const SETTINGS_RETRIES: u32 = 60;
 /// The service closes a connection idle for 60 s: reconnect a bit before.
-const RECONNECT_AFTER: Duration = Duration::from_secs(45);
+const RECONNECT_AFTER: Duration = Duration::from_secs(30);
 
 pub struct Job {
     pub generation: u64,
@@ -147,6 +147,22 @@ struct Pending {
     file_info: Option<String>,
 }
 
+const BIT_EXCLUSIONS: u8 = 1;
+const BIT_TAGS: u8 = 2;
+const BIT_WORK: u8 = 4;
+const BIT_MEANING: u8 = 8;
+
+/// Which change of settings a message is (for "answered already").
+fn setting_bit(m: &Msg) -> u8 {
+    match m {
+        Msg::SetExclusions(_) => BIT_EXCLUSIONS,
+        Msg::SetPhotoTags(_) => BIT_TAGS,
+        Msg::SetWorkFolders(_) => BIT_WORK,
+        Msg::SetMeaning(_) => BIT_MEANING,
+        _ => 0,
+    }
+}
+
 /// Waits `CONTENT_DEBOUNCE` for typing to pause: false when a newer search
 /// came (or the app is closing). Anything else that comes meanwhile (a
 /// status poll, file details for the preview) is kept in `carried`, to be
@@ -226,13 +242,17 @@ fn worker(jobs: Receiver<Msg>, out: Sender<Update>, wake: impl Fn()) {
         .into_iter()
         .flatten()
         .collect();
-        let mut keep_settings = |carried: &mut std::collections::VecDeque<Msg>| {
-            if settings.is_empty() {
+        // settings the service answered in this batch: never sent twice
+        // (a second SetExclusions would rebuild the index again)
+        let answered_settings = std::cell::Cell::new(0u8);
+        let keep_settings = |carried: &mut std::collections::VecDeque<Msg>, answered: u8, retries: &mut u32| {
+            let left: Vec<&Msg> = settings.iter().filter(|m| setting_bit(m) & answered == 0).collect();
+            if left.is_empty() {
                 return;
             }
-            retries += 1;
-            if retries <= SETTINGS_RETRIES {
-                for m in settings.iter().rev() {
+            *retries += 1;
+            if *retries <= SETTINGS_RETRIES {
+                for m in left.into_iter().rev() {
                     let again = match m {
                         Msg::SetExclusions(v) => Msg::SetExclusions(v.clone()),
                         Msg::SetPhotoTags(on) => Msg::SetPhotoTags(*on),
@@ -252,7 +272,11 @@ fn worker(jobs: Receiver<Msg>, out: Sender<Update>, wake: impl Fn()) {
         }
         if client.is_none() {
             match Client::connect(Duration::from_millis(300)) {
-                Ok(c) => client = Some(c),
+                Ok(c) => {
+                    client = Some(c);
+                    // reachable again: changes made from now on get their tries
+                    retries = 0;
+                }
                 Err(e) => {
                     let msg = if e.kind() == std::io::ErrorKind::NotFound {
                         "service not running".to_string()
@@ -261,30 +285,48 @@ fn worker(jobs: Receiver<Msg>, out: Sender<Update>, wake: impl Fn()) {
                     };
                     let _ = out.send(Update::Offline(msg));
                     wake();
-                    keep_settings(&mut carried);
+                    keep_settings(&mut carried, 0, &mut retries);
                     continue;
                 }
             }
         }
         let c = client.as_mut().expect("connected");
+        // when the service last answered: its idle clock starts there
+        let answered_at = std::cell::Cell::new(None::<Instant>);
+        let call = |c: &mut Client, req: &Request| {
+            let r = c.call(req);
+            if r.is_ok() {
+                answered_at.set(Some(Instant::now()));
+            }
+            r
+        };
+        let done = |bit: u8| answered_settings.set(answered_settings.get() | bit);
         let result = (|| -> std::io::Result<()> {
             if let Some(on) = p.work_folders {
-                if let Response::Error(e) = c.call(&Request::SetWorkFolders { on })? {
+                let r = call(c, &Request::SetWorkFolders { on })?;
+                done(BIT_WORK);
+                if let Response::Error(e) = r {
                     let _ = out.send(Update::Done(e));
                 }
             }
             if let Some(on) = p.meaning {
-                if let Response::Error(e) = c.call(&Request::SetMeaning { on })? {
+                let r = call(c, &Request::SetMeaning { on })?;
+                done(BIT_MEANING);
+                if let Response::Error(e) = r {
                     let _ = out.send(Update::Done(e));
                 }
             }
             if let Some(on) = p.photo_tags {
-                if let Response::Error(e) = c.call(&Request::SetPhotoTags { on })? {
+                let r = call(c, &Request::SetPhotoTags { on })?;
+                done(BIT_TAGS);
+                if let Response::Error(e) = r {
                     let _ = out.send(Update::Done(e));
                 }
             }
             if let Some(paths) = p.exclusions {
-                let msg = match c.call(&Request::SetExclusions { paths })? {
+                let r = call(c, &Request::SetExclusions { paths })?;
+                done(BIT_EXCLUSIONS);
+                let msg = match r {
                     Response::Ok => crate::i18n::tr("Exclusions saved. The index is being rebuilt.").to_string(),
                     Response::Error(e) => crate::trf!("Could not save the exclusions: {e}", e),
                     _ => crate::i18n::tr("Unexpected reply from the service").to_string(),
@@ -301,7 +343,7 @@ fn worker(jobs: Receiver<Msg>, out: Sender<Update>, wake: impl Fn()) {
                 let usage = crate::usage::for_query(&job.query);
                 let req = Request::Search(SearchRequest { query: job.query.clone(), limit: job.limit, sort: job.sort, usage });
                 let t = Instant::now();
-                match c.call(&req)? {
+                match call(c, &req)? {
                     Response::Search(mut reply) => {
                         let round_trip = t.elapsed();
                         refresh_rows(&mut reply);
@@ -336,7 +378,7 @@ fn worker(jobs: Receiver<Msg>, out: Sender<Update>, wake: impl Fn()) {
                                 sort: job.sort,
                                 usage,
                             });
-                            if let Response::Content(reply) = c.call(&req)? {
+                            if let Response::Content(reply) = call(c, &req)? {
                                 let _ = out.send(Update::Content { generation: job.generation, reply });
                                 wake();
                             }
@@ -351,7 +393,7 @@ fn worker(jobs: Receiver<Msg>, out: Sender<Update>, wake: impl Fn()) {
                                             sort: job.sort,
                                             usage: Vec::new(),
                                         });
-                                        if let Response::Content(reply) = c.call(&req)? {
+                                        if let Response::Content(reply) = call(c, &req)? {
                                             let _ = out.send(Update::Meaning { generation: job.generation, reply });
                                         }
                                     }
@@ -362,25 +404,25 @@ fn worker(jobs: Receiver<Msg>, out: Sender<Update>, wake: impl Fn()) {
                 }
             }
             if let Some(path) = p.file_info {
-                if let Response::FileInfo(info) = c.call(&Request::FileInfo { path: path.clone() })? {
+                if let Response::FileInfo(info) = call(c, &Request::FileInfo { path: path.clone() })? {
                     let _ = out.send(Update::FileInfo { path, info });
                 }
             }
             if let Some(job) = p.scan {
                 let req = Request::ScanUnindexed(ScanRequest { query: job.query, skip: job.skip, budget_ms: 1500, limit: 100 });
-                if let Response::Scan(reply) = c.call(&req)? {
+                if let Response::Scan(reply) = call(c, &req)? {
                     let _ = out.send(Update::Scan { generation: job.generation, reply });
                 }
             }
             if p.config {
-                if let Response::Config(cfg) = c.call(&Request::GetConfig)? {
+                if let Response::Config(cfg) = call(c, &Request::GetConfig)? {
                     let _ = out.send(Update::Config(cfg));
                 }
             }
             if p.status {
                 let (busy, away) = crate::shell::user_state();
-                c.call(&Request::Hint { busy, away })?;
-                if let Response::Status(s) = c.call(&Request::Status)? {
+                call(c, &Request::Hint { busy, away })?;
+                if let Response::Status(s) = call(c, &Request::Status)? {
                     let _ = out.send(Update::Status(s));
                 }
             }
@@ -390,10 +432,12 @@ fn worker(jobs: Receiver<Msg>, out: Sender<Update>, wake: impl Fn()) {
             // The service restarted or stopped: reconnect on the next job.
             client = None;
             let _ = out.send(Update::Offline("connection to the service was lost".into()));
-            keep_settings(&mut carried);
+            keep_settings(&mut carried, answered_settings.get(), &mut retries);
         } else {
             retries = 0;
-            last_answer = Instant::now();
+        }
+        if let Some(t) = answered_at.get() {
+            last_answer = t;
         }
         wake();
     }

@@ -652,12 +652,23 @@ impl Server {
     }
 
     pub fn stop(mut self) {
+        use std::os::windows::io::AsRawHandle;
         self.stop.store(true, Ordering::SeqCst);
-        // Wake the accept loop blocked in ConnectNamedPipe.
-        let _ = OpenOptions::new().access_mode(CLIENT_ACCESS).open(&self.name);
-        if let Some(t) = self.thread.take() {
-            let _ = t.join();
+        let Some(t) = self.thread.take() else { return };
+        // Wake the accept loop blocked in ConnectNamedPipe. Between two
+        // clients no instance listens and the open fails at once: tried
+        // again until the loop has seen the stop, then its wait is cancelled.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !t.is_finished() && Instant::now() < deadline {
+            let _ = OpenOptions::new().access_mode(CLIENT_ACCESS).open(&self.name);
+            std::thread::sleep(Duration::from_millis(50));
         }
+        while !t.is_finished() {
+            // SAFETY: the accept thread's own handle, alive while `t` is.
+            unsafe { windows_sys::Win32::System::IO::CancelSynchronousIo(t.as_raw_handle() as _) };
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let _ = t.join();
     }
 }
 

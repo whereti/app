@@ -939,6 +939,9 @@ impl Worker {
         }
         if self.last_refresh.elapsed() >= OPEN_REFRESH {
             self.last_refresh = Instant::now();
+            // reading open files again is no change made on the PC: the
+            // daily check waits for a quiet minute, which this must not hide
+            let (quiet_since, shown) = (self.last_change, *self.shared.last_change.lock());
             for v in 0..self.vols.len() {
                 if self.open[v].is_empty() || self.vols[v].is_none() {
                     continue;
@@ -950,6 +953,8 @@ impl Worker {
                     self.log(format!("{}: re-reading open files: {e}", info.letter()));
                 }
             }
+            self.last_change = quiet_since;
+            *self.shared.last_change.lock() = shown;
         }
         let may_save = self.save_after.is_none_or(|t| Instant::now() >= t);
         if self.dirty && may_save && (self.last_save.elapsed() >= self.cfg.save_every || self.journal_moved_far()) {
@@ -959,7 +964,9 @@ impl Worker {
             }
         }
         if let Some(every) = self.cfg.reconcile_every {
-            if self.last_reconcile.elapsed() >= every && self.last_change.elapsed() >= IDLE_FOR_RECONCILE {
+            // after a quiet minute; on a PC never quiet, a quarter of a period late anyway
+            let overdue = self.last_reconcile.elapsed() >= every + every / 4;
+            if self.last_reconcile.elapsed() >= every && (self.last_change.elapsed() >= IDLE_FOR_RECONCILE || overdue) {
                 self.reconcile();
             }
         }
