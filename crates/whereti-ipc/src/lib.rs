@@ -739,7 +739,28 @@ fn accept_loop(name: &str, mut instance: OwnedHandle, handler: Handler, stop: Ar
             while live(&slots) >= MAX_CLIENTS && !stop.load(Ordering::SeqCst) {
                 std::thread::sleep(Duration::from_millis(20));
             }
-            let state = Arc::new(ClientState::default());
+            // one account cannot take every connection: counted as it
+            // connects (by the client process's account), before it sends
+            // anything, so silent connections count too
+            let raw = std::os::windows::io::AsRawHandle::as_raw_handle(&instance);
+            let me = client_process_user(raw);
+            let theirs = me.as_ref().map_or(0, |me| {
+                lock(&slots).iter().filter(|s| !s.thread.is_finished() && lock(&s.state.user).as_ref() == Some(me)).count()
+            });
+            if theirs >= MAX_PER_USER {
+                // SAFETY: the connected instance; the handle is dropped below.
+                unsafe { windows_sys::Win32::System::Pipes::DisconnectNamedPipe(raw as _) };
+                drop(instance);
+                instance = loop {
+                    match create_instance(name, false) {
+                        Ok(h) => break h,
+                        Err(_) if stop.load(Ordering::SeqCst) => return,
+                        Err(_) => std::thread::sleep(Duration::from_millis(100)),
+                    }
+                };
+                continue;
+            }
+            let state = Arc::new(ClientState { user: Mutex::new(me), ..ClientState::default() });
             let spawned = std::thread::Builder::new().name("pipe-client".into()).spawn({
                 let (handler, state, slots) = (handler.clone(), state.clone(), slots.clone());
                 move || serve_client(instance, handler, &state, &slots)
@@ -954,6 +975,31 @@ ot\here.txt".to_string()];
     }
 
     #[test]
+    fn one_account_cannot_hold_every_connection() {
+        let name = format!(r"\\.\pipe\whereti-test-cap-{}", std::process::id());
+        let handler: Handler = Arc::new(|req, _| match req {
+            Request::Hello { .. } => Response::Hello { version: PROTOCOL_VERSION, server: "test".into() },
+            _ => Response::Ok,
+        });
+        let server = Server::start_with_idle(&name, handler, IDLE).unwrap();
+        let held: Vec<Client> = (0..MAX_PER_USER).map(|_| Client::connect_to(&name, Duration::from_secs(5)).unwrap()).collect();
+        assert!(Client::connect_to(&name, Duration::from_secs(2)).is_err(), "one more from the same account");
+        drop(held);
+        // let go: room again
+        let mut ok = None;
+        for _ in 0..50 {
+            if let Ok(c) = Client::connect_to(&name, Duration::from_secs(2)) {
+                ok = Some(c);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(ok.is_some());
+        drop(ok);
+        server.stop();
+    }
+
+    #[test]
     fn a_long_path_is_seen_through_the_pipe_and_an_idle_client_is_let_go() {
         let name = format!(r"\\.\pipe\whereti-test-long-{}", std::process::id());
         let handler: Handler = Arc::new(|req, caller| match req {
@@ -1019,4 +1065,42 @@ mod limits_tests {
         assert!(!Plain.is_admin());
         assert!(Trusted.is_admin());
     }
+}
+
+/// The account (user SID) of the process on the other end of a pipe,
+/// known as soon as it connects. `None` when it cannot be read.
+fn client_process_user(pipe: std::os::windows::io::RawHandle) -> Option<Vec<u8>> {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::Security::{GetLengthSid, GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
+    use windows_sys::Win32::System::Pipes::GetNamedPipeClientProcessId;
+    use windows_sys::Win32::System::Threading::{OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION};
+    let mut pid = 0u32;
+    // SAFETY: a connected pipe instance; an out-parameter.
+    if unsafe { GetNamedPipeClientProcessId(pipe as _, &mut pid) } == 0 || pid == 0 {
+        return None;
+    }
+    // SAFETY: handles opened here are closed below.
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if process.is_null() {
+        return None;
+    }
+    let mut token: HANDLE = std::ptr::null_mut();
+    let opened = unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) } != 0;
+    unsafe { CloseHandle(process) };
+    if !opened {
+        return None;
+    }
+    let mut needed = 0u32;
+    // SAFETY: size query, then a buffer of that size (8-aligned).
+    unsafe { GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut needed) };
+    let mut buf = vec![0u64; (needed as usize).div_ceil(8) + 1];
+    let ok = unsafe { GetTokenInformation(token, TokenUser, buf.as_mut_ptr().cast(), needed, &mut needed) } != 0;
+    let sid = ok.then(|| {
+        // SAFETY: TOKEN_USER as Windows wrote it; its SID points into `buf`.
+        let user = unsafe { &*(buf.as_ptr() as *const TOKEN_USER) };
+        let len = unsafe { GetLengthSid(user.User.Sid) } as usize;
+        unsafe { std::slice::from_raw_parts(user.User.Sid as *const u8, len) }.to_vec()
+    });
+    unsafe { CloseHandle(token) };
+    sid
 }
