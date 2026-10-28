@@ -983,12 +983,14 @@ fn shortcut(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
     let mut chosen: Option<String> = None;
     if app.settings.recording {
         // Keys pressed now are the new shortcut; Esc gives up.
-        let mut cancel = false;
+        let (mut cancel, mut refused) = (false, false);
         ui.input_mut(|i| {
             i.events.retain(|e| match e {
                 egui::Event::Key { key, pressed: true, modifiers, .. } => {
                     if *key == egui::Key::Escape && modifiers.is_none() {
                         cancel = true;
+                    } else if (modifiers.ctrl || modifiers.alt) && crate::tray::reserved(*key, *modifiers) {
+                        refused = true;
                     } else if let Some(label) = crate::tray::label_for(*key, *modifiers) {
                         chosen = Some(label);
                     }
@@ -1000,6 +1002,9 @@ fn shortcut(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
         });
         if cancel {
             stop_recording(app);
+        } else if refused && chosen.is_none() {
+            // still listening: the user tries other keys
+            app.flash(tr("These keys are needed for typing or by Windows. Try other ones."));
         }
     }
     let recording = app.settings.recording;

@@ -32,8 +32,10 @@ impl Requests {
 
 /// Shortcuts suggested in Settings. The first free one is used by default.
 /// Not Ctrl+Alt+Space first: Claude desktop uses it, and whichever app
-/// starts first would take it from the other.
-pub const HOTKEYS: [&str; 4] = ["Ctrl+Shift+Space", "Ctrl+Alt+Space", "Alt+Shift+Space", "Ctrl+Alt+W"];
+/// starts first would take it from the other. Not Ctrl+Alt with a letter:
+/// that is AltGr, which types letters on many keyboards (a shortcut saved
+/// by an older version, such as Ctrl+Alt+W, still works).
+pub const HOTKEYS: [&str; 4] = ["Ctrl+Shift+Space", "Ctrl+Alt+Space", "Alt+Shift+Space", "Alt+Shift+W"];
 pub const PREFERRED_HOTKEY: &str = HOTKEYS[0];
 
 /// The keys a shortcut can end with: egui's key, the name shown, the key
@@ -90,18 +92,45 @@ pub fn parse(label: &str) -> Option<HotKey> {
     Some(HotKey::new(Some(mods), code))
 }
 
+/// Keys a shortcut must not take: it would take them from every app.
+/// Ctrl+Alt is AltGr on many keyboards, with Shift too (Ctrl+Alt+E would
+/// take ę or € from everyone typing them, Ctrl+Alt+Shift+A the Polish Ą);
+/// and Windows and most apps need copy, paste, undo, save, find, new and
+/// close, Alt+Tab, Alt+F4, the window menu (Alt+Space), switching the
+/// keyboard's language (Ctrl+Space), moving and selecting by words, tabs,
+/// back and forward.
+pub fn reserved(key: egui::Key, m: egui::Modifiers) -> bool {
+    use egui::Key as K;
+    let typed = KEYS.iter().find(|k| k.0 == key).is_some_and(|k| k.1.chars().count() == 1);
+    if m.ctrl && m.alt && typed {
+        return true;
+    }
+    let moves = matches!(
+        key,
+        K::ArrowLeft | K::ArrowRight | K::ArrowUp | K::ArrowDown | K::Home | K::End | K::PageUp | K::PageDown | K::Insert | K::Enter
+    );
+    match (m.ctrl, m.alt, m.shift) {
+        _ if key == K::Tab => true,
+        (true, true, _) => false,
+        (true, false, false) => {
+            moves
+                || matches!(key, K::F4 | K::Space | K::C | K::V | K::X | K::Z | K::Y | K::A | K::S | K::F | K::P | K::N | K::O | K::W | K::T)
+        }
+        (true, false, true) => moves,
+        (false, true, false) => moves || matches!(key, K::F4 | K::Space),
+        (false, true, true) => moves,
+        _ => false,
+    }
+}
+
 /// The label for keys pressed in the window, e.g. "Ctrl+Shift+K"; `None`
-/// while only modifiers are held, or without Ctrl or Alt.
+/// while only modifiers are held, without Ctrl or Alt, or for keys a
+/// shortcut must not take (`reserved`).
 pub fn label_for(key: egui::Key, m: egui::Modifiers) -> Option<String> {
-    if !(m.ctrl || m.alt) {
+    if !(m.ctrl || m.alt) || reserved(key, m) {
         return None;
     }
     let &(_, name, _) = KEYS.iter().find(|k| k.0 == key)?;
-    // Ctrl+Alt is AltGr on many keyboards: Ctrl+Alt+E would take ę or €
-    // from everyone typing them
-    if m.ctrl && m.alt && !m.shift && name.chars().count() == 1 && name.chars().all(|c| c.is_ascii_alphanumeric()) {
-        return None;
-    }
     let mut label = String::new();
     for (on, text) in [(m.ctrl, "Ctrl+"), (m.alt, "Alt+"), (m.shift, "Shift+")] {
         if on {
@@ -355,6 +384,44 @@ mod tests {
         assert!(parse("A").is_none());
         assert!(parse("Ctrl+Nope").is_none());
         assert_eq!(parse("Ctrl+Shift+K"), Some(HotKey::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyK)));
+    }
+
+    /// The keys of a label like "Ctrl+Shift+K", as egui reports them.
+    fn keys_of(label: &str) -> (egui::Key, egui::Modifiers) {
+        let mut parts: Vec<&str> = label.split('+').collect();
+        let name = parts.pop().unwrap();
+        let key = KEYS.iter().find(|k| k.1 == name).unwrap().0;
+        let m = egui::Modifiers { ctrl: parts.contains(&"Ctrl"), alt: parts.contains(&"Alt"), shift: parts.contains(&"Shift"), ..Default::default() };
+        (key, m)
+    }
+
+    #[test]
+    fn suggestions_can_be_typed_too() {
+        for h in HOTKEYS {
+            let (key, m) = keys_of(h);
+            assert_eq!(label_for(key, m).as_deref(), Some(h));
+        }
+    }
+
+    #[test]
+    fn keys_everyone_needs_are_refused() {
+        for taken in [
+            "Ctrl+C", "Ctrl+V", "Ctrl+X", "Ctrl+Z", "Ctrl+Y", "Ctrl+A", "Ctrl+S", "Ctrl+F", "Ctrl+P", "Ctrl+N", "Ctrl+O",
+            "Ctrl+W", "Ctrl+T", "Ctrl+Enter", "Ctrl+Space", "Ctrl+F4", "Alt+F4", "Alt+Tab", "Alt+Shift+Tab", "Ctrl+Tab",
+            "Ctrl+Shift+Tab", "Ctrl+Alt+Tab", "Alt+Space", "Ctrl+Left", "Ctrl+Shift+Right", "Alt+Left", "Ctrl+Insert",
+            // AltGr types letters and signs, with Shift too
+            "Ctrl+Alt+E", "Ctrl+Alt+Shift+A", "Ctrl+Alt+-", "Ctrl+Alt+[", "Ctrl+Alt+2",
+        ] {
+            let (key, m) = keys_of(taken);
+            assert!(reserved(key, m), "{taken}");
+            assert_eq!(label_for(key, m), None, "{taken}");
+        }
+        for free in ["Ctrl+Shift+C", "Alt+Shift+W", "Ctrl+Alt+Space", "Ctrl+Alt+Left", "Ctrl+Shift+F5", "Alt+Q"] {
+            let (key, m) = keys_of(free);
+            assert_eq!(label_for(key, m).as_deref(), Some(free));
+        }
+        // saved by an older version: still a valid shortcut
+        assert!(parse("Ctrl+Alt+W").is_some());
     }
 
     #[test]

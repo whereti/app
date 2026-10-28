@@ -843,6 +843,17 @@ pub const ENTRIES: &[Entry] = &[
         ro: "Apasă tastele împreună, cu Ctrl sau Alt. Esc ca să renunți.",
     },
     Entry {
+        en: "These keys are needed for typing or by Windows. Try other ones.",
+        note: "Brief notice (toast) while recording a new shortcut in Settings > General, when the keys pressed are copy, paste, Alt+Tab, AltGr letters and the like, which every app needs.",
+        de: "Diese Tasten werden zum Schreiben oder von Windows gebraucht. Versuchen Sie andere.",
+        es: "Estas teclas se necesitan para escribir o las usa Windows. Prueba otras.",
+        fr: "Ces touches servent à la saisie ou à Windows. Essayez-en d'autres.",
+        it: "Questi tasti servono per scrivere o a Windows. Prova con altri.",
+        pl: "Tych klawiszy używa Windows lub są potrzebne do pisania. Wybierz inne.",
+        pt_br: "Essas teclas são usadas para digitar ou pelo Windows. Tente outras.",
+        ro: "Aceste taste sunt folosite la scris sau de Windows. Încearcă altele.",
+    },
+    Entry {
         en: "Opens whereti from any app.",
         note: "Settings row description under Shortcut in Settings > General.",
         de: "Öffnet whereti aus jeder App.",
