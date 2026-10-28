@@ -89,6 +89,12 @@ pub struct WheretiApp {
     pub(crate) searcher: Searcher,
     generation: u64,
     rows: Vec<Row>,
+    /// The search `rows` came from: while it is older than `generation`,
+    /// the rows on screen are not what the box says any more.
+    rows_generation: u64,
+    /// Enter (or Ctrl+Enter: `true`) pressed before the results of the
+    /// search typed came, and that search's generation: done when they come.
+    pending_open: Option<(bool, u64)>,
     total: u64,
     /// `rows[content_start..]` were found in file contents (not by name).
     content_start: Option<usize>,
@@ -209,6 +215,8 @@ impl WheretiApp {
             searcher,
             generation: 0,
             rows: Vec::new(),
+            rows_generation: 0,
+            pending_open: None,
             total: 0,
             content_start: None,
             close_start: None,
@@ -459,6 +467,7 @@ impl WheretiApp {
     fn hide(&mut self, ctx: &egui::Context) {
         self.remember_search();
         self.file_dialog = None;
+        self.pending_open = None;
         // thumbnails are memory: made again when the grid is shown again
         self.thumbs.clear();
         self.file_icons.trim();
@@ -501,6 +510,7 @@ impl WheretiApp {
                     self.list_moved = false;
                     self.launch_items = launch;
                     self.rows = rows;
+                    self.rows_generation = generation;
                     self.total = reply.total;
                     self.content_start = None;
                     self.meaning_start = None;
@@ -748,7 +758,21 @@ impl WheretiApp {
         if tab {
             self.toggle_preview();
         }
-        self.file_keys(ctx);
+        // Until the newest search answers, the rows on screen are an older
+        // search's (and a letter typed this frame changes the search after
+        // these keys): Enter waits for the new rows, the other file keys do
+        // nothing.
+        let typing = ctx.input(|i| {
+            i.events.iter().any(|e| match e {
+                egui::Event::Text(_) | egui::Event::Paste(_) | egui::Event::Cut => true,
+                egui::Event::Key { key, pressed: true, .. } => *key == Key::Backspace,
+                _ => false,
+            })
+        });
+        let current = self.rows_generation == self.generation && !typing;
+        if current {
+            self.file_keys(ctx);
+        }
         let last = self.rows.len().saturating_sub(1);
         let before = self.selected;
         // the grid: a line is `step` tiles; Left/Right move one tile, but
@@ -820,26 +844,32 @@ impl WheretiApp {
         }
         if down || up || pg_down || pg_up || self.selected != before {
             self.list_moved = true;
+            // moving in the list: the user picks the row, not Enter pressed before
+            self.pending_open = None;
         }
-        if menu && !self.is_launch(self.selected) {
+        if menu && current && !self.is_launch(self.selected) {
             if let (Some(hwnd), Some(row)) = (self.hwnd, self.rows.get(self.selected)) {
                 if let Err(e) = crate::win::context_menu(hwnd, &row.path.clone()) {
                     self.flash(e);
                 }
             }
         }
-        if ctrl_enter {
+        if (ctrl_enter || enter) && !current {
+            // a letter typed this frame starts the next search after these keys
+            self.pending_open = Some((ctrl_enter, self.generation + typing as u64));
+        } else if ctrl_enter {
             self.open_selected(ctx, true);
         } else if enter {
             self.open_selected(ctx, false);
         }
-        if copy && !self.is_launch(self.selected) {
+        if copy && current && !self.is_launch(self.selected) {
             if let Some(row) = self.rows.get(self.selected) {
                 ctx.copy_text(row.path.clone());
                 self.flash(tr("Path copied"));
             }
         }
         if esc {
+            self.pending_open = None;
             if self.query.is_empty() {
                 self.hide(ctx);
             } else {
@@ -1578,8 +1608,9 @@ impl WheretiApp {
 
     /// A click, double click, drag or right click on result `i`.
     fn after_list(&mut self, ctx: &egui::Context, clicked: Option<(usize, bool)>, dragged: Option<usize>, menu_for: Option<usize>) {
-        if clicked.is_some() || menu_for.is_some() {
+        if clicked.is_some() || menu_for.is_some() || dragged.is_some() {
             self.list_moved = true;
+            self.pending_open = None;
         }
         if let Some((i, open)) = clicked {
             self.selected = i;
@@ -2078,6 +2109,18 @@ impl eframe::App for WheretiApp {
             }
         }
         self.apply_updates();
+        // Enter pressed while the search was on its way: done once its rows
+        // are here; dropped if the user typed on (or the typing changed nothing)
+        if let Some((reveal, target)) = self.pending_open {
+            if self.generation != target {
+                self.pending_open = None;
+            } else if self.rows_generation == target {
+                self.pending_open = None;
+                if self.visible && self.page == Page::Search && self.renaming.is_none() && self.confirm_delete.is_none() {
+                    self.open_selected(ctx, reveal);
+                }
+            }
+        }
         self.updater.tick(self.settings.updates, ctx);
         if !self.cjk_fonts && (has_cjk(&self.query) || self.rows.iter().any(|r| has_cjk(&r.path))) {
             self.cjk_fonts = true;
