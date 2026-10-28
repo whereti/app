@@ -13,7 +13,7 @@
 
 use std::io::{Read, Seek};
 use std::rc::Rc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use outlook_pst::ltp::prop_context::PropertyValue;
 use outlook_pst::messaging::folder::Folder;
@@ -92,10 +92,17 @@ pub(crate) fn mailbox<R: Read + Seek + 'static>(open: impl Fn() -> std::io::Resu
         }
     }
     messages.sort_by_key(|m| std::cmp::Reverse(m.0));
+    // what was read so far, now and then, for the worker to hand back
+    // should one message take too long (see `crate::save_partial`)
+    let mut saved = Instant::now();
     for (time, node) in messages {
         if out.full() || late() {
             out.truncated = true;
             break;
+        }
+        if saved.elapsed() >= Duration::from_secs(1) {
+            crate::save_partial(out);
+            saved = Instant::now();
         }
         let Ok(id) = store.properties().make_entry_id(NodeId::from(node)) else { continue };
         let Ok(message) = store.open_message(&id, None) else { continue };

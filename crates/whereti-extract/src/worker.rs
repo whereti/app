@@ -150,8 +150,9 @@ pub fn serve_stdio() -> i32 {
         return 0;
     }
     // the caller's time: slow work stops in time to hand back what it has
-    if let Some(ms) = arg("--budget").and_then(|m| m.parse::<u64>().ok()) {
-        crate::set_deadline(Some(std::time::Instant::now() + Duration::from_millis(ms)));
+    let budget = arg("--budget").and_then(|m| m.parse::<u64>().ok()).map(Duration::from_millis);
+    if let Some(budget) = budget {
+        crate::set_deadline(Some(std::time::Instant::now() + budget));
     }
     if let Some(langs) = arg("--ocr-lang") {
         crate::set_ocr_languages(&langs.split(',').map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>());
@@ -165,6 +166,13 @@ pub fn serve_stdio() -> i32 {
         let tokenizer = Model::new(&tokenizer, given);
         return serve_embed(model, tokenizer);
     }
+    // one extraction from here: what a slow reader has so far goes back
+    // should it still be busy a little after its budget
+    let partial = crate::Partial::default();
+    if let Some(budget) = budget {
+        answer_late(budget, partial.clone());
+    }
+    crate::keep_partial(Some(partial));
     if args.iter().any(|a| a == "--mailbox") {
         let max = arg("--max").and_then(|m| m.parse().ok()).unwrap_or(1_000_000);
         // the file's handle comes first on stdin (put into this process by
@@ -184,12 +192,22 @@ pub fn serve_stdio() -> i32 {
     }
     let result = std::panic::catch_unwind(|| extract(&ext, &bytes, max))
         .unwrap_or_else(|_| Err(ExtractError::Damaged("the parser failed".into())));
+    answer(result)
+}
+
+/// Taken by whoever answers for the worker: its main thread, or the late
+/// answer (`answer_late`), which ends the process holding it. `true` once
+/// the main thread has its answer.
+static ANSWERING: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
+
+/// Writes an extraction's answer (see the module comment); the exit code.
+fn answer(result: Result<Extracted, ExtractError>) -> i32 {
+    // the late answer may be on its way out: then this waits for the end
+    let mut answering = ANSWERING.lock().unwrap_or_else(|e| e.into_inner());
+    *answering = true;
     match result {
         Ok(e) => {
-            let mut out = std::io::stdout().lock();
-            let _ = out.write_all(if e.truncated { b"T" } else { b"F" });
-            let _ = out.write_all(e.text.as_bytes());
-            let _ = out.flush();
+            write_text(&e);
             0
         }
         Err(ExtractError::Unsupported) => EXIT_UNSUPPORTED,
@@ -199,6 +217,35 @@ pub fn serve_stdio() -> i32 {
             EXIT_DAMAGED
         }
     }
+}
+
+/// `T` or `F` (truncated), then the text, on stdout.
+fn write_text(e: &Extracted) {
+    let mut out = std::io::stdout().lock();
+    let _ = out.write_all(if e.truncated { b"T" } else { b"F" });
+    let _ = out.write_all(e.text.as_bytes());
+    let _ = out.flush();
+}
+
+/// Slow work looks at the clock between documents, messages or pages, but
+/// one parser may not (a complex PDF inside an archive): if the main thread
+/// has not answered a little after the budget, what the slow reader left
+/// (see `crate::save_partial`: an archive's names, say) is the answer, and
+/// the process ends before the caller's timeout would kill it with nothing.
+/// Without such text, the main thread answers or the caller gives up.
+fn answer_late(budget: Duration, partial: crate::Partial) {
+    let _ = std::thread::Builder::new().name("late answer".into()).spawn(move || {
+        // the budget is 3/4 of the caller's timeout: half of the rest
+        std::thread::sleep(budget + budget / 6);
+        let answering = ANSWERING.lock().unwrap_or_else(|e| e.into_inner());
+        if *answering {
+            return;
+        }
+        let Some(e) = partial.lock().unwrap_or_else(|e| e.into_inner()).take() else { return };
+        write_text(&e);
+        // with the lock still held: the main thread writes nothing after this
+        std::process::exit(0);
+    });
 }
 
 /// A model file for the worker: by its path, or (`--given`) as a handle
@@ -299,21 +346,7 @@ fn serve_mailbox(handle: usize, max: usize) -> i32 {
         crate::mailbox::mailbox(|| file.try_clone(), &mut out).map(|_| out.finish())
     }))
     .unwrap_or_else(|_| Err(ExtractError::Damaged("the mailbox reader failed".into())));
-    match result {
-        Ok(e) => {
-            let mut out = std::io::stdout().lock();
-            let _ = out.write_all(if e.truncated { b"T" } else { b"F" });
-            let _ = out.write_all(e.text.as_bytes());
-            let _ = out.flush();
-            0
-        }
-        Err(ExtractError::Unsupported) => EXIT_UNSUPPORTED,
-        Err(ExtractError::Protected) => EXIT_PROTECTED,
-        Err(ExtractError::Damaged(msg)) => {
-            eprint!("{msg}");
-            EXIT_DAMAGED
-        }
-    }
+    answer(result)
 }
 
 /// Worker side of `EmbedWorker`: texts in, vectors out, until a zero

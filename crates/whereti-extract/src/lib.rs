@@ -264,6 +264,41 @@ pub(crate) fn within<T>(until: std::time::Instant, f: impl FnOnce() -> T) -> T {
     result
 }
 
+/// What a slow reader has so far (see `keep_partial`).
+pub(crate) type Partial = std::sync::Arc<std::sync::Mutex<Option<Extracted>>>;
+
+thread_local! {
+    /// Where this thread's slow readers (archives, mailboxes) leave what they
+    /// have so far: the worker hands it back if one parser that never looks
+    /// at the clock is still busy at its deadline.
+    static PARTIAL: std::cell::RefCell<Option<Partial>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Sets (or, `None`, clears) where this thread's slow readers leave what
+/// they have so far.
+pub(crate) fn keep_partial(to: Option<Partial>) {
+    PARTIAL.with(|p| *p.borrow_mut() = to);
+}
+
+/// Leaves `out` as it is now, cut, where `keep_partial` said.
+pub(crate) fn save_partial(out: &Out) {
+    PARTIAL.with(|p| {
+        if let Some(to) = p.borrow().as_ref() {
+            let text = Out { text: out.text.clone(), budget: 0, truncated: true, cut: true }.finish();
+            *to.lock().unwrap_or_else(|e| e.into_inner()) = Some(text);
+        }
+    });
+}
+
+/// Runs `f` (one document inside another) without its own partial text
+/// replacing the outer reader's.
+pub(crate) fn inner<T>(f: impl FnOnce() -> T) -> T {
+    let outer = PARTIAL.with(|p| p.borrow_mut().take());
+    let result = f();
+    keep_partial(outer);
+    result
+}
+
 /// Collects text up to a character budget, tidying whitespace.
 struct Out {
     text: String,

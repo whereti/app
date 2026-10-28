@@ -6,7 +6,10 @@
 //!
 //! Every name comes first, then the text of the documents, read while there
 //! is time (`READ_TIME`, or less when the caller waits less), so an archive
-//! of slow documents still gives all its names.
+//! of slow documents still gives all its names. Time is looked at between
+//! documents; one document whose parser takes too long cannot hold the rest
+//! back either: what was read before it is left for the worker, which hands
+//! it back near its deadline (see `crate::save_partial`).
 //!
 //! Bounded like everything here: members inflated at most `MAX_ENTRY`, at
 //! most `MAX_READ` documents read, pictures not read (OCR is slow), no
@@ -54,18 +57,20 @@ fn read_until() -> Instant {
     crate::deadline().map_or(own, |d| d.min(own))
 }
 
-/// Adds a document's text, under its name again, read by `until`.
+/// Adds a document's text, under its name again, read by `until`; then
+/// leaves what there is so far for the worker (see `crate::save_partial`).
 fn content(out: &mut Out, name: &str, bytes: &[u8], until: Instant) {
     let Some(ext) = readable(name) else { return };
     if out.spent() {
         out.truncated = true;
         return;
     }
-    if let Ok(e) = crate::within(until, || extract(&ext, bytes, out.budget)) {
+    if let Ok(e) = crate::inner(|| crate::within(until, || extract(&ext, bytes, out.budget))) {
         if !e.text.is_empty() {
             name_line(out, name);
             out.push(&e.text);
             out.newline();
+            crate::save_partial(out);
         }
         out.truncated |= e.truncated;
     }
@@ -93,7 +98,9 @@ pub(crate) fn zip(bytes: &[u8], out: &mut Out) -> Result<(), ExtractError> {
             wanted.push((i, name));
         }
     }
-    // 2. the documents' text, while there is time
+    // 2. the documents' text, while there is time (the names are kept
+    // first, for the worker to hand back should one document take too long)
+    crate::save_partial(out);
     let until = read_until();
     for (i, name) in wanted {
         if out.spent() || Instant::now() >= until {
@@ -141,7 +148,9 @@ pub(crate) fn sevenz(bytes: &[u8], out: &mut Out) -> Result<(), ExtractError> {
         }
     }
     // 2. the documents' text, block by block, while there is time; a block
-    // that cannot be decoded (unknown method, damaged) is skipped
+    // that cannot be decoded (unknown method, damaged) is skipped. The names
+    // are kept first, as for a ZIP.
+    crate::save_partial(out);
     let until = read_until();
     let file_block = &archive.stream_map.file_block_index;
     let mut blocks: Vec<usize> = wanted.iter().filter_map(|&i| file_block.get(i).copied().flatten()).collect();
@@ -558,6 +567,27 @@ mod tests {
         let e = crate::within(Instant::now(), || extract("zip", &z, 10_000)).unwrap();
         assert_eq!(e.text, "a.txt\nb.txt\npoza.jpg");
         assert!(e.truncated);
+    }
+
+    #[test]
+    fn the_names_are_left_for_the_worker_before_any_document_is_read() {
+        let z = zip_with(&[("a.txt", b"textul lui a"), ("poza.jpg", b"x"), ("b.txt", b"textul lui b")]);
+        let partial = crate::Partial::default();
+        crate::keep_partial(Some(partial.clone()));
+        // no time for documents: the names alone, cut
+        crate::within(Instant::now(), || extract("zip", &z, 10_000)).unwrap();
+        assert_eq!(partial.lock().unwrap().take(), Some(crate::Extracted { text: "a.txt\npoza.jpg\nb.txt".into(), truncated: true }));
+        // with time: what was read so far, document by document
+        let e = extract("zip", &z, 10_000).unwrap();
+        let got = partial.lock().unwrap().take().unwrap();
+        assert_eq!(got, crate::Extracted { text: e.text, truncated: true });
+        // what a document inside leaves does not replace the archive's
+        let mut out = Out::new(100);
+        out.push("numele");
+        crate::save_partial(&out);
+        crate::inner(|| crate::save_partial(&Out::new(100)));
+        crate::keep_partial(None);
+        assert_eq!(partial.lock().unwrap().take().map(|e| e.text).as_deref(), Some("numele"));
     }
 
     /// Sets a flag or a method in a ZIP's local and central headers alike.

@@ -76,6 +76,33 @@ fn the_sandboxed_worker_still_reads_what_it_is_handed() {
     }
 }
 
+/// An archive whose one document takes longer than the caller waits: its
+/// names still come back, in time.
+#[test]
+fn a_slow_document_inside_an_archive_still_gives_the_names() {
+    use std::io::Write;
+    // 48 MB of text in a code page (no UTF-8): slow to guess and decode
+    let big: Vec<u8> = b"caf\xE9 cu lapte ".iter().copied().cycle().take(48 << 20).collect();
+    let mut zip = std::io::Cursor::new(Vec::new());
+    {
+        let mut w = zip::ZipWriter::new(&mut zip);
+        for (name, data) in [("acte/factura.pdf", &b"x"[..]), ("mare.txt", &big), ("poze/vara.jpg", b"y")] {
+            w.start_file(name, zip::write::SimpleFileOptions::default()).unwrap();
+            w.write_all(data).unwrap();
+        }
+        w.finish().unwrap();
+    }
+    let mut sandbox = Sandbox::new(exe());
+    sandbox.timeout = std::time::Duration::from_millis(3000);
+    let _ = sandbox.sandbox_report();
+    let t = std::time::Instant::now();
+    let got = sandbox.extract_bytes("zip", zip.into_inner(), 100_000);
+    let took = t.elapsed();
+    let got = got.unwrap();
+    assert!(got.text.starts_with("acte\\factura.pdf\nmare.txt\npoze\\vara.jpg"), "{got:?}");
+    assert!(took < sandbox.timeout, "{took:?}");
+}
+
 /// The photo model's worker gets its model as a handle: with the
 /// restricted token it could not open it (here a private temp file, like
 /// ProgramData\whereti for the service). Needs onnxruntime.dll beside the
