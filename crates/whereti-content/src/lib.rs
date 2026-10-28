@@ -12,7 +12,7 @@
 
 pub mod tokenizer;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use parking_lot::Mutex;
@@ -282,6 +282,39 @@ impl ContentIndex {
         Some(Box::new(BooleanQuery::new(must)))
     }
 
+    /// Keys of the documents indexed before 0.9.4, whose letters of scripts
+    /// without spaces (Chinese, Japanese, Thai…) were kept in whole runs, so
+    /// a search finds them only once they are read again: those with such a
+    /// word of more than one letter (today each letter is a word). A run
+    /// longer than `tokenizer::MAX_WORD` was dropped then: a document with
+    /// only such runs cannot be told apart.
+    pub fn keys_with_old_unspaced_words(&self) -> tantivy::Result<HashSet<u64>> {
+        use tantivy::{DocSet, TERMINATED};
+        let searcher = self.reader.searcher();
+        let mut out = HashSet::new();
+        for seg in searcher.segment_readers() {
+            let words = seg.inverted_index(self.f.body)?;
+            let keys = seg.fast_fields().u64("key")?;
+            let alive = seg.alive_bitset();
+            let mut terms = words.terms().stream()?;
+            while terms.advance() {
+                // such letters take three or four bytes in UTF-8
+                if !terms.key().iter().any(|&b| b >= 0xE0) || !std::str::from_utf8(terms.key()).is_ok_and(old_unspaced) {
+                    continue;
+                }
+                let mut docs = words.read_postings_from_terminfo(terms.value(), IndexRecordOption::Basic)?;
+                let mut d = docs.doc();
+                while d != TERMINATED {
+                    if alive.is_none_or(|a| a.is_alive(d)) {
+                        out.extend(keys.first(d));
+                    }
+                    d = docs.advance();
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Bytes on disk (all segment files).
     pub fn disk_bytes(&self) -> u64 {
         let searcher = self.reader.searcher();
@@ -315,6 +348,14 @@ fn is_index_file(name: &str) -> bool {
     matches!(name, "meta.json" | ".managed.json" | "whereti-format.txt")
         || (name.starts_with(".tantivy-") && name.ends_with(".lock"))
         || (stem.len() == 32 && stem.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// A word only the tokenizer before 0.9.4 made: more than one letter, one
+/// of them of a script without spaces. A letter folded into two (が into か
+/// and its voicing mark) is still one.
+fn old_unspaced(word: &str) -> bool {
+    let letters = word.chars().filter(|c| !matches!(c, '\u{3099}' | '\u{309A}')).count();
+    letters > 1 && word.chars().any(tokenizer::unspaced)
 }
 
 fn regex_escape(word: &str) -> String {
@@ -410,6 +451,28 @@ mod tests {
         assert_eq!(keys("天気予報"), [key('C', 1)]);
         assert!(keys("京東").is_empty(), "the letters in the query's order");
         assert_eq!(keys("東京 天気"), [key('C', 1)]);
+    }
+
+    #[test]
+    fn documents_indexed_with_whole_runs_of_letters_are_found_once() {
+        // written as before 0.9.4: words are runs of letters, CJK ones too
+        let (schema, f) = schema();
+        let index = Index::create_in_ram(schema);
+        index.tokenizers().register(TOKENIZER, tantivy::tokenizer::SimpleTokenizer::default());
+        {
+            let mut w: IndexWriter = index.writer_with_num_threads(1, WRITER_HEAP).unwrap();
+            for (k, text) in [(1, "東京都の天気予報"), (2, "raport anual 2024"), (3, "ราคา 100 บาท"), (4, "大阪の天気")] {
+                w.add_document(doc!(f.key => key('C', k), f.size => 1u64, f.modified => 1u64, f.status => 0u64, f.body => text)).unwrap();
+            }
+            w.commit().unwrap();
+        }
+        let idx = ContentIndex::with_index(index, f).unwrap();
+        // 4 read again now: letter by letter, no longer to read again
+        idx.put(key('C', 4), ok(1), "大阪の天気").unwrap();
+        idx.put(key('C', 5), ok(1), "が東京").unwrap();
+        idx.commit().unwrap();
+        assert_eq!(idx.keys_with_old_unspaced_words().unwrap(), [key('C', 1), key('C', 3)].into());
+        assert!(old_unspaced("東京") && old_unspaced("2024年") && !old_unspaced("東") && !old_unspaced("か\u{3099}") && !old_unspaced("raport"));
     }
 
     #[test]

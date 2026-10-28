@@ -831,10 +831,12 @@ impl Content {
         // PDFs) are read again. Forgetting them makes the next round redo them.
         let ocr_marker = self.dir.join("ocr-1");
         let places_marker = self.dir.join("places-2"); // 2: again, with the tolerant EXIF reader (0.0.12)
+        let unspaced_marker = self.dir.join("unspaced-1");
         if known.is_empty() {
             // a new index: nothing indexed before to read again
             let _ = std::fs::write(&ocr_marker, "new index\n");
             let _ = std::fs::write(&places_marker, "new index\n");
+            let _ = std::fs::write(&unspaced_marker, "new index\n");
         }
         // Files forgotten to be read again, still in the index: removed from
         // it if they are gone before that.
@@ -865,6 +867,26 @@ impl Content {
             forget(&mut known, &mut forgotten, |k, _| photos.contains(&k));
             if known.len() < before {
                 shared.log.log(format!("content: {} photos are read again for where they were taken", before - known.len()));
+            }
+        }
+        // Once, since text without spaces is indexed letter by letter (0.9.4):
+        // the documents indexed before with such text, and only those, are
+        // read again (the index format stays, so nothing else is).
+        let mut unspaced_pass = !unspaced_marker.exists();
+        if unspaced_pass {
+            match index.keys_with_old_unspaced_words() {
+                Ok(keys) => {
+                    let before = known.len();
+                    forget(&mut known, &mut forgotten, |k, _| keys.contains(&k));
+                    if known.len() < before {
+                        shared.log.log(format!("content: {} documents with Chinese, Japanese or Thai text are read again", before - known.len()));
+                    }
+                }
+                Err(e) => {
+                    // tried again at the next start
+                    shared.log.log(format!("content: cannot look for text without spaces ({e})"));
+                    unspaced_pass = false;
+                }
             }
         }
         self.update_counts(index, &known);
@@ -901,6 +923,9 @@ impl Content {
                         }
                         if places_pass && all_done && !places_marker.exists() {
                             let _ = std::fs::write(&places_marker, "photos were read again for where they were taken\n");
+                        }
+                        if unspaced_pass && all_done && !unspaced_marker.exists() {
+                            let _ = std::fs::write(&unspaced_marker, "documents with text without spaces were read again\n");
                         }
                     }
                     Err(e) => {
