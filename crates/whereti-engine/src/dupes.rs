@@ -149,9 +149,16 @@ fn open(path: &str) -> Option<std::fs::File> {
     whereti_extract::worker::open_real(std::path::Path::new(path)).ok()
 }
 
+/// The file open, when its length is still the one its group was made for
+/// (the name index may be behind: a file that grew is not proven a copy by
+/// its first bytes).
+fn open_as(row: &Row) -> Option<std::fs::File> {
+    open(&row.path).filter(|f| f.metadata().is_ok_and(|m| m.len() == row.size))
+}
+
 /// The first and last `EDGE` bytes, remembered.
 fn edges(row: &Row) -> Option<u64> {
-    let mut f = open(&row.path)?;
+    let mut f = open_as(row)?;
     let mut h = cached(row, stamp(&f)?);
     if h.edges.is_none() {
         h.edges = edges_hash(&mut f, row.size);
@@ -186,7 +193,7 @@ enum Whole {
 /// `deadline`.
 fn whole_hash(row: &Row, deadline: Instant) -> Whole {
     // opened first: the hashes remembered count only for the file as it is now
-    let Some(mut f) = open(&row.path) else { return Whole::Unreadable };
+    let Some(mut f) = open_as(row) else { return Whole::Unreadable };
     let Some(now) = stamp(&f) else { return Whole::Unreadable };
     let mut h = cached(row, now);
     if let Some(w) = h.whole {
@@ -203,7 +210,9 @@ fn whole_hash(row: &Row, deadline: Instant) -> Whole {
             remember(&row.path, h);
             return Whole::NotYet;
         }
-        let n = match f.read(&mut buf) {
+        // never past the length compared (a file growing meanwhile)
+        let want = ((row.size - done) as usize).min(buf.len());
+        let n = match f.read(&mut buf[..want]) {
             Ok(0) | Err(_) => return Whole::Unreadable, // shorter than the index says: changed meanwhile
             Ok(n) => n,
         };
@@ -316,6 +325,26 @@ mod tests {
         let mut paths: Vec<&str> = found.groups[0].iter().map(|r| r.path.as_str()).collect();
         paths.sort();
         assert_eq!(paths, vec![a.path.as_str(), b.path.as_str()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_longer_than_the_index_says_is_no_copy() {
+        let dir = std::env::temp_dir().join(format!("whereti-dupes-len-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let data: Vec<u8> = (0..300_000u32).map(|i| (i * 11 % 239) as u8).collect();
+        let a = write(&dir, "a.bin", &data);
+        let b = write(&dir, "b.bin", &data);
+        // b grew after the name index saw it: the same first bytes prove nothing
+        let mut longer = data.clone();
+        longer.extend_from_slice(b"more");
+        std::fs::write(&b.path, &longer).unwrap();
+        assert!(verify(vec![vec![a, b]], Duration::from_secs(10), 100, &Trusted).groups.is_empty());
+        // small files too (read whole with their edges)
+        let c = write(&dir, "c.txt", b"same");
+        let d = write(&dir, "d.txt", b"same");
+        std::fs::write(&d.path, b"same and more").unwrap();
+        assert!(verify(vec![vec![c, d]], Duration::from_secs(10), 100, &Trusted).groups.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
