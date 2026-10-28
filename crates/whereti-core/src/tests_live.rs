@@ -547,3 +547,21 @@ fn a_size_that_could_not_be_read_keeps_the_one_known() {
     let r = idx.search(&parse("disk.vhdx", &ctx()), &SearchOptions::default());
     assert_eq!(idx.size(r.hits[0]), 7_000_000_000);
 }
+
+#[test]
+fn a_build_folder_made_live_stays_out_when_its_project_is_deleted() {
+    let mut m = Model::new(12);
+    let mut e = exclusions();
+    e.paths.push(r"**\*.lrdata".into());
+    let mut idx = build(vec![VolumeScan { letter: 'C', serial: 1, journal_id: 1, next_usn: 0, scan: m.scan() }], &e).0;
+    // made after the build, in a place the rules leave out (a name rule here:
+    // the model has no disk for project files)
+    m.recs.insert(460, Rec { is_dir: true, size: 0, modified: 0, attrs: 0, links: vec![(DOCS, "Fotos.lrdata".into())] });
+    idx.apply(0, &[460], &HashSet::from([460]), &mut m).unwrap();
+    assert!(hits(&idx, "fotos").is_empty());
+    // later it changes, still where it is: known as left out, no rescan
+    m.recs.get_mut(&460).unwrap().modified += MINUTE;
+    let s = idx.apply(0, &[460], &HashSet::new(), &mut m).unwrap();
+    assert!(!s.needs_rescan);
+    assert!(hits(&idx, "fotos").is_empty());
+}

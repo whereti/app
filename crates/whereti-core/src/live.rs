@@ -209,6 +209,16 @@ impl NameIndex {
                 (pe, name.as_str())
             })
             .collect();
+        // A folder kept out here (made in a left-out place, or moved there)
+        // is known from now on as the build knows its own: a later change
+        // in it, still where it is, is no folder come in from elsewhere.
+        if st.is_dir && st.links.len() == 1 && desired[0].0.is_none() {
+            let (p, name) = &st.links[0];
+            if self.live_dir(vol, *p).is_some() {
+                let letter = self.volumes[vol].letter();
+                self.left_out.entry(letter).or_default().insert(r, (*p, fold(name)));
+            }
+        }
 
         // Keep entries that are already right, reuse the others for renames/moves.
         let mut used = vec![false; existing.len()];
