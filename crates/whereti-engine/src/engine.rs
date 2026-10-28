@@ -40,6 +40,8 @@ const BATCH_WINDOW: Duration = Duration::from_millis(250);
 const IDLE_FOR_RECONCILE: Duration = Duration::from_secs(60);
 /// Compact when renamed/added/removed entries exceed this share of the index.
 const COMPACT_AT: f64 = 0.01;
+/// The least time between two compactions while the overlay grows slowly.
+const COMPACT_GAP: Duration = Duration::from_secs(30);
 /// How often the list of drives is checked (a USB stick plugged in or out).
 const DRIVE_CHECK: Duration = Duration::from_secs(3);
 /// Drives without a journal are walked again at most this often...
@@ -549,6 +551,8 @@ struct Worker {
     save_after: Option<Instant>,
     last_refresh: Instant,
     last_reconcile: Instant,
+    /// When the index was last compacted (no more than about twice a minute).
+    last_compact: Instant,
     last_change: Instant,
     last_timers: Instant,
 }
@@ -586,6 +590,7 @@ impl Worker {
             save_after: None,
             last_refresh: now,
             last_reconcile: now,
+            last_compact: now,
             last_change: now,
             last_timers: now,
         }
@@ -926,7 +931,10 @@ impl Worker {
             self.rescan(&rescan);
         }
         let ratio = self.shared.index.read().as_ref().map_or(0.0, NameIndex::overlay_ratio);
-        if ratio > COMPACT_AT {
+        // a burst of new files (a copy, an unpacked archive) compacts once in
+        // a while, not after every batch; a much grown overlay at once
+        let due = self.last_compact.elapsed() >= COMPACT_GAP || ratio > COMPACT_AT * 5.0;
+        if ratio > COMPACT_AT && due {
             self.compact();
         }
     }
@@ -1000,6 +1008,7 @@ impl Worker {
         };
         self.set_index(fresh);
         self.dirty = true;
+        self.last_compact = Instant::now();
         self.log(format!("compacted the index in {} ms", t.elapsed().as_millis()));
     }
 
@@ -1568,7 +1577,24 @@ impl Worker {
 fn caller_sees(caller: &dyn Caller, paths: &[String]) -> Vec<bool> {
     let on_drive: Vec<String> = paths.iter().filter(|p| p.as_bytes().get(1) == Some(&b':')).cloned().collect();
     let mut ok = caller.can_list(&on_drive).into_iter();
-    paths.iter().map(|p| if p.as_bytes().get(1) == Some(&b':') { ok.next().unwrap_or(false) } else { true }).collect()
+    paths
+        .iter()
+        .map(|p| {
+            if p.as_bytes().get(1) == Some(&b':') {
+                ok.next().unwrap_or(false)
+            } else {
+                // a rule for any drive names no one's folder, unless it goes
+                // into one: `\Users\ana\Private` (not `**\Users\*\.cache`)
+                !names_an_account(p)
+            }
+        })
+        .collect()
+}
+
+/// A rule with `\Users\<a name>\` in it (not a wildcard, not Public).
+fn names_an_account(rule: &str) -> bool {
+    let parts: Vec<&str> = rule.split('\\').filter(|s| !s.is_empty()).collect();
+    parts.windows(2).any(|w| w[0].eq_ignore_ascii_case("users") && w[1] != "*" && !w[1].eq_ignore_ascii_case("public"))
 }
 
 /// A log line without the paths in it: "content folders changed: C:\Users\ana"

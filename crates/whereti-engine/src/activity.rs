@@ -272,6 +272,9 @@ impl Activity {
         if !self.is_on() {
             return;
         }
+        // one writer at a time (the worker, and the service as it stops)
+        static WRITING: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+        let _one = WRITING.lock();
         let text: String = self.folders.lock().values().map(|h| format!("{:.3}\t{}\t{}\n", h.points, h.at, h.path)).collect();
         let tmp = self.file.with_extension("tmp");
         if std::fs::write(&tmp, text).is_ok() {
