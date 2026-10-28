@@ -101,10 +101,22 @@ fn main() {
             Ok(Box::new(Setup { state: Arc::new(Mutex::new(state)), autostart: true, logo: None, content_h: 0.0 }))
         }),
     );
-    // No window could be opened (graphics driver…): say why somewhere findable.
+    // No window could be opened (graphics driver…): say why, and keep it
+    // somewhere findable.
     if let Err(e) = result {
         let _ = std::fs::write(std::env::temp_dir().join("whereti-setup-error.txt"), e.to_string());
+        show_error(&format!("{}\n\n{e}", tr("Something went wrong")));
         std::process::exit(3);
+    }
+}
+
+/// A plain Windows message box, for when there is no window to say it in.
+fn show_error(text: &str) {
+    use windows::core::{w, HSTRING};
+    use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK, MB_SETFOREGROUND, MB_TOPMOST};
+    // SAFETY: valid strings; no owner window.
+    unsafe {
+        MessageBoxW(None, &HSTRING::from(text), w!("whereti setup"), MB_OK | MB_ICONERROR | MB_SETFOREGROUND | MB_TOPMOST);
     }
 }
 
