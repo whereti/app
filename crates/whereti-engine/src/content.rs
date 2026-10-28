@@ -58,6 +58,9 @@ const ZIP_TAIL: u64 = 16 << 20;
 /// Characters indexed per file.
 const MAX_CHARS: usize = 1_000_000;
 const COMMIT_EVERY_DOCS: usize = 200;
+/// Documents whose text is kept for the meaning model between the two
+/// rounds (a few KB each); beyond this, read again.
+const MEANING_KEPT: usize = 50_000;
 const COMMIT_EVERY: Duration = Duration::from_secs(20);
 /// How often the indexer looks whether a round is due.
 const CHECK_EVERY: Duration = Duration::from_secs(10);
@@ -151,6 +154,13 @@ pub struct Content {
     tags_downloading: AtomicBool,
     /// Music and videos (no text: not counted as documents).
     media_keys: Mutex<HashSet<u64>>,
+    /// Text read for meaning while the documents' text came first: kept
+    /// until the model reads it in the next round, so no document is read
+    /// twice. Lost on a restart (then read again).
+    meaning_text: Mutex<HashMap<u64, Vec<String>>>,
+    /// The last round read only text: this one is the models' turn, whatever
+    /// waits (a file locked for good must not hold the photos back).
+    models_turn: AtomicBool,
     /// Files whose reading failed once in a way that may pass (a timeout
     /// on a busy PC): read once more in a later round before it counts.
     failed_once: Mutex<HashMap<u64, (u64, u32)>>,
@@ -252,6 +262,8 @@ impl Content {
             meaning_downloading: AtomicBool::new(false),
             tags_downloading: AtomicBool::new(false),
             media_keys: Mutex::new(HashSet::new()),
+            meaning_text: Mutex::new(HashMap::new()),
+            models_turn: AtomicBool::new(false),
             failed_once: Mutex::new(HashMap::new()),
             no_sandbox: Mutex::new(HashMap::new()),
             hashing: Arc::new(AtomicBool::new(false)),
@@ -503,9 +515,9 @@ impl Content {
 
     /// The vectors of one document's text (its first pieces).
     /// `false` when the model failed (the document is tried again later).
-    fn read_meaning(&self, key: u64, text: &str) -> bool {
+    fn read_meaning(&self, key: u64, pieces: &[String]) -> bool {
         let mut vectors = Vec::new();
-        for piece in whereti_extract::meaning::pieces(text, crate::meaning::PIECES) {
+        for piece in pieces {
             let answer = self.model.lock().embed(&format!("passage: {piece}"));
             match answer {
                 Ok(v) => vectors.push(v),
@@ -843,10 +855,11 @@ impl Content {
                 }
                 match self.round(index, &shared, &mut known, sandbox.as_ref()) {
                     Ok(()) => {
-                        if ocr_pass && self.status.lock().queued == 0 && !ocr_marker.exists() {
+                        let all_done = self.status.lock().queued == 0 && !self.models_turn.load(Ordering::Relaxed);
+                        if ocr_pass && all_done && !ocr_marker.exists() {
                             let _ = std::fs::write(&ocr_marker, "documents without text were read again with OCR\n");
                         }
-                        if places_pass && self.status.lock().queued == 0 && !places_marker.exists() {
+                        if places_pass && all_done && !places_marker.exists() {
                             let _ = std::fs::write(&places_marker, "photos were read again for where they were taken\n");
                         }
                     }
@@ -986,6 +999,20 @@ impl Content {
             .chain(meaning_missing)
             .collect();
         let tz = system::date_ctx().tz_offset;
+        // Text first: while documents wait to be read, this round reads only
+        // their text, quickly; photos and meaning (the slow models) come in
+        // the next round, right after. Whatever the user writes becomes
+        // searchable in minutes, not after hours of model work.
+        let is_later = |c: &Candidate| c.meaning_only || c.photo_only || is_picture(&c.path);
+        let text_waiting = todo.iter().any(|c| !is_later(c) && !c.props_only && !c.media_only);
+        let models_turn = self.models_turn.swap(false, Ordering::Relaxed);
+        let models_later = !models_turn && text_waiting && (meaning_now || todo.iter().any(is_later));
+        if models_later {
+            todo.retain(|c| !is_later(c));
+        }
+        if !meaning_now {
+            self.meaning_text.lock().clear();
+        }
         // The newest files first: what the user works on becomes searchable first.
         todo.sort_unstable_by_key(|c| std::cmp::Reverse(c.modified));
         if !removed.is_empty() || !todo.is_empty() {
@@ -1098,8 +1125,15 @@ impl Content {
                     if !meaning_now {
                         break 'file false;
                     }
-                    if let Ok((_, text)) = extract(&c, sandbox, None, &mut Looked::No, &mark) {
-                        if !self.read_meaning(c.key, &text) {
+                    let kept = self.meaning_text.lock().remove(&c.key);
+                    let pieces = match kept {
+                        Some(p) => Some(p),
+                        None => extract(&c, sandbox, None, &mut Looked::No, &mark)
+                            .ok()
+                            .map(|(_, text)| whereti_extract::meaning::pieces(&text, crate::meaning::PIECES)),
+                    };
+                    if let Some(pieces) = pieces {
+                        if !self.read_meaning(c.key, &pieces) {
                             meaning_now = false;
                         }
                     }
@@ -1129,7 +1163,15 @@ impl Content {
                     since_commit += 1;
                     indexed += 1;
                     if meaning_now && what.status == Status::Ok && !c.photo_only && !c.media_only && !is_picture(&c.path) {
-                        if !self.read_meaning(c.key, &text) {
+                        let pieces = whereti_extract::meaning::pieces(&text, crate::meaning::PIECES);
+                        if models_later {
+                            // for the model, in the next round
+                            self.vectors.lock().remove(c.key);
+                            let mut kept = self.meaning_text.lock();
+                            if kept.len() < MEANING_KEPT {
+                                kept.insert(c.key, pieces);
+                            }
+                        } else if !self.read_meaning(c.key, &pieces) {
                             meaning_now = false; // the model failed: not for the rest of this round
                         }
                     } else {
@@ -1229,6 +1271,12 @@ impl Content {
         index.commit().map_err(|e| e.to_string())?;
         self.save_side();
         self.update_counts(index, known);
+        // the text is in: photos and meaning now, without waiting for a change
+        if models_later && !self.stopping() {
+            shared.log.log("content: the documents' text is in; now photos and meaning");
+            self.models_turn.store(true, Ordering::Relaxed);
+            *self.wake.lock() = true;
+        }
         if indexed > 0 || !removed.is_empty() {
             shared.log.log(format!(
                 "content: indexed {indexed} files in {} s; {} documents, {} MB on disk",

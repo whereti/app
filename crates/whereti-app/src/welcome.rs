@@ -65,7 +65,7 @@ pub fn show(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
                         );
                     });
                 });
-                ui.add_space(12.0);
+                ui.add_space(8.0);
 
                 // ---- the three steps
                 let names_step = match (&offline, &status) {
@@ -125,14 +125,14 @@ pub fn show(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
                     ui.add_space(6.0);
                     ui.add(
                         egui::Label::new(
-                            egui::RichText::new(tr("The first reading takes a while: from minutes to a few hours, depending on how many documents you have. It happens only once; after that only new or changed ones are read."))
+                            egui::RichText::new(tr("The first reading takes minutes to a few hours, depending on your documents, and happens only once."))
                                 .size(12.5)
                                 .color(p.text3),
                         )
                         .wrap(),
                     );
                 }
-                ui.add_space(10.0);
+                ui.add_space(8.0);
 
                 // ---- the two optional downloads: offered once, never started unasked
                 optional_downloads(app, ui, p);
@@ -154,7 +154,7 @@ fn optional_downloads(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
         for line in [crate::settings::photo_tags_line(&tags), crate::settings::meaning_line(&meaning)].into_iter().flatten() {
             ui.label(egui::RichText::new(line).size(12.5).color(p.text2));
         }
-        ui.add_space(12.0);
+        ui.add_space(10.0);
         return;
     }
     Frame::NONE
@@ -182,7 +182,7 @@ fn optional_downloads(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
                     app.settings.photo_tags_asked = true;
                     app.settings.save();
                 }
-                ui.add_space(10.0);
+                ui.add_space(6.0);
                 ui.add(
                     egui::Label::new(
                         egui::RichText::new(tr("Each is downloaded once, from Hugging Face, and works only on your PC. Both stay in Settings, Search."))
