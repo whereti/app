@@ -343,7 +343,7 @@ pub fn decode_text(bytes: &[u8]) -> Result<String, ExtractError> {
     if let Some((enc, bom)) = encoding_rs::Encoding::for_bom(bytes) {
         let mut body = &bytes[bom..];
         if enc == encoding_rs::UTF_8 {
-            body = whole_utf8(body);
+            body = whole_utf8(body, true);
         } else {
             // UTF-16: whole code units, and no high surrogate without its pair
             body = &body[..body.len() & !1];
@@ -360,7 +360,7 @@ pub fn decode_text(bytes: &[u8]) -> Result<String, ExtractError> {
     if head.contains(&0) {
         return Err(ExtractError::Unsupported); // binary
     }
-    let bytes = whole_utf8(bytes);
+    let bytes = whole_utf8(bytes, false);
     if let Ok(s) = std::str::from_utf8(bytes) {
         return Ok(s.to_string());
     }
@@ -371,10 +371,20 @@ pub fn decode_text(bytes: &[u8]) -> Result<String, ExtractError> {
 }
 
 /// `bytes` without an unfinished UTF-8 character at its very end (a head
-/// cut mid character), when everything before it is valid UTF-8.
-fn whole_utf8(bytes: &[u8]) -> &[u8] {
+/// cut mid character), when everything before it is valid UTF-8 and, unless
+/// the text is `sure` to be UTF-8 (a BOM), has a character of more than one
+/// byte: else the last byte may be a legacy code page's letter ("café" in
+/// Windows-1252 ends in 0xE9, which also starts a UTF-8 character).
+fn whole_utf8(bytes: &[u8], sure: bool) -> &[u8] {
     match std::str::from_utf8(bytes) {
-        Err(e) if e.error_len().is_none() && bytes.len() - e.valid_up_to() <= 3 => &bytes[..e.valid_up_to()],
+        Err(e) if e.error_len().is_none() && bytes.len() - e.valid_up_to() <= 3 => {
+            let valid = &bytes[..e.valid_up_to()];
+            if sure || !valid.is_ascii() {
+                valid
+            } else {
+                bytes
+            }
+        }
         _ => bytes,
     }
 }
@@ -1052,10 +1062,23 @@ mod tests {
             let bytes = text.as_bytes();
             for cut in 1..bytes.len() {
                 let got = decode_text(&bytes[..cut]).unwrap();
+                let whole = text.char_indices().map(|(i, _)| i).take_while(|&i| i <= cut).last().unwrap();
+                if bytes[..whole].is_ascii() {
+                    // nothing yet says UTF-8: the cut byte reads as a legacy letter
+                    assert!(got.starts_with(&text[..whole]) && got.chars().count() <= whole + 1, "{cut}: {got:?}");
+                    continue;
+                }
                 assert!(text.starts_with(&got), "{cut}: {got:?}");
                 assert!(got.len() + 3 >= cut, "{cut}: {got:?}");
             }
         }
+        // a legacy file, plain ASCII but for its last letter, keeps it
+        assert_eq!(decode_text(b"caf\xE9").unwrap(), "café");
+        assert_eq!(decode_text(b"Un\xEE").unwrap(), "Unî");
+        // the same letter after UTF-8 text: a cut character, dropped
+        assert_eq!(decode_text("ți caf\u{e9}".as_bytes().split_last().unwrap().1).unwrap(), "ți caf");
+        // with a BOM it is UTF-8 whatever comes before
+        assert_eq!(decode_text(b"\xEF\xBB\xBFcaf\xC3").unwrap(), "caf");
         // UTF-16 with a BOM, cut after an odd number of bytes or inside a pair
         let utf16: Vec<u8> = [0xFF, 0xFE].into_iter().chain("Șură 😀".encode_utf16().flat_map(|u| u.to_le_bytes())).collect();
         assert_eq!(decode_text(&utf16[..utf16.len() - 1]).unwrap(), "Șură ");
