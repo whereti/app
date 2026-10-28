@@ -10,6 +10,8 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Condvar, Mutex};
 
+use whereti_ipc::Row;
+
 use crate::app::match_mask;
 use crate::preview::{self, Content};
 
@@ -18,6 +20,8 @@ use crate::preview::{self, Content};
 const SEARCH_CHARS: usize = 2_000_000;
 /// Texts the worker keeps, to re-cut snippets when the query changes.
 const TEXTS: usize = 24;
+/// And at most about this much text in all.
+const TEXT_BYTES: usize = 16 << 20;
 /// Snippets kept per query.
 const SNIPPETS: usize = 400;
 /// Characters around the first match.
@@ -41,9 +45,13 @@ pub enum Line {
     NoExcerpt,
 }
 
+/// A file as it is now: its path, size and date. A file changed since its
+/// text was read has another key, so it is read again.
+type Key = (String, u64, u32);
+
 struct Shared {
-    /// Paths on screen without a snippet, in order; and the words.
-    wanted: Vec<String>,
+    /// Files on screen without a snippet, in order; and the words.
+    wanted: Vec<Key>,
     needles: Vec<String>,
 }
 
@@ -51,10 +59,13 @@ type Wanted = Arc<(Mutex<Shared>, Condvar)>;
 
 pub struct Snippets {
     wanted: Wanted,
-    rx: Receiver<(Vec<String>, String, Option<Snippet>)>,
-    made: HashMap<String, Option<Snippet>>,
+    rx: Receiver<(Vec<String>, Key, Option<Snippet>)>,
+    made: HashMap<Key, Option<Snippet>>,
     made_for: Vec<String>,
-    asked: Vec<String>,
+    asked: Vec<Key>,
+    /// A snippet with Chinese, Japanese or Korean text came (the fonts for
+    /// it are loaded then).
+    pub saw_cjk: bool,
 }
 
 impl Snippets {
@@ -66,9 +77,9 @@ impl Snippets {
             .name("snippets".into())
             .spawn(move || {
                 let sandbox = whereti_extract::worker::Sandbox::beside_current_exe();
-                let mut texts: VecDeque<(String, Option<Arc<str>>)> = VecDeque::new();
+                let mut texts: VecDeque<(Key, Option<Arc<str>>)> = VecDeque::new();
                 loop {
-                    let (path, needles) = {
+                    let (key, needles) = {
                         let (lock, cv) = &*w;
                         let mut sh = lock.lock().unwrap_or_else(|e| e.into_inner());
                         while sh.wanted.is_empty() {
@@ -76,29 +87,29 @@ impl Snippets {
                         }
                         (sh.wanted.remove(0), sh.needles.clone())
                     };
-                    let text = match texts.iter().find(|t| t.0 == path) {
+                    let text = match texts.iter().find(|t| t.0 == key) {
                         Some(t) => t.1.clone(),
                         None => {
-                            let t = match preview::load_with(&path, sandbox.as_ref(), SEARCH_CHARS) {
+                            let t = match preview::load_with(&key.0, sandbox.as_ref(), SEARCH_CHARS) {
                                 Content::Text { text, .. } => Some(Arc::<str>::from(text)),
                                 _ => None,
                             };
-                            if texts.len() >= TEXTS {
-                                texts.pop_front();
-                            }
-                            texts.push_back((path.clone(), t.clone()));
+                            // the same file as it was before goes
+                            texts.retain(|x| x.0 .0 != key.0);
+                            texts.push_back((key.clone(), t.clone()));
+                            keep_within(&mut texts);
                             t
                         }
                     };
-                    let snippet = text.and_then(|t| make(&t, &needles)).or_else(|| photo_line(&path, &needles));
-                    if tx.send((needles, path, snippet)).is_err() {
+                    let snippet = text.and_then(|t| make(&t, &needles)).or_else(|| photo_line(&key.0, &needles));
+                    if tx.send((needles, key, snippet)).is_err() {
                         return;
                     }
                     wake();
                 }
             })
             .expect("snippets thread");
-        Snippets { wanted, rx, made: HashMap::new(), made_for: Vec::new(), asked: Vec::new() }
+        Snippets { wanted, rx, made: HashMap::new(), made_for: Vec::new(), asked: Vec::new(), saw_cjk: false }
     }
 
     /// Call before painting the rows.
@@ -107,24 +118,27 @@ impl Snippets {
             self.made.clear();
             self.made_for = needles.to_vec();
         }
-        for (for_needles, path, snippet) in self.rx.try_iter() {
+        for (for_needles, key, snippet) in self.rx.try_iter() {
             if for_needles == self.made_for {
                 if self.made.len() >= SNIPPETS {
                     self.made.clear();
                 }
-                self.made.insert(path, snippet);
+                self.saw_cjk |= snippet.as_ref().is_some_and(|s| crate::app::has_cjk(&s.text));
+                self.made.insert(key, snippet);
             }
         }
         self.asked.clear();
     }
 
-    /// The line for a visible content row; asks for it the first time.
-    pub fn get(&mut self, path: &str) -> Line {
-        match self.made.get(path) {
+    /// The line for a visible content row; asks for it the first time (and
+    /// again once the file changed).
+    pub fn get(&mut self, row: &Row) -> Line {
+        let key = (row.path.clone(), row.size, row.modified);
+        match self.made.get(&key) {
             Some(Some(s)) => Line::Excerpt(s.clone()),
             Some(None) => Line::NoExcerpt,
             None => {
-                self.asked.push(path.to_string());
+                self.asked.push(key);
                 Line::Loading
             }
         }
@@ -142,8 +156,18 @@ impl Snippets {
     }
 }
 
-/// The excerpt around the first match: the whole phrase if the text has it,
-/// else the first (long enough) word. Whitespace is collapsed.
+/// The oldest texts go, beyond `TEXTS` of them or `TEXT_BYTES` in all
+/// (the newest always stays).
+fn keep_within<K>(texts: &mut VecDeque<(K, Option<Arc<str>>)>) {
+    let size = |t: &(K, Option<Arc<str>>)| t.1.as_ref().map_or(0, |s| s.len());
+    let mut bytes: usize = texts.iter().map(size).sum();
+    while texts.len() > 1 && (texts.len() > TEXTS || bytes > TEXT_BYTES) {
+        if let Some(old) = texts.pop_front() {
+            bytes -= size(&old);
+        }
+    }
+}
+
 /// A photo found by where it was taken or by what it shows: "câine ·
 /// Rome, Lazio, Italy". The tags live only in the service's index, so the
 /// app names the label the typed word matched (its photo's own text did not
@@ -199,6 +223,8 @@ fn matched_label(needles: &[String]) -> Option<&'static str> {
     None
 }
 
+/// The excerpt around the first match: the whole phrase if the text has it,
+/// else the first (long enough) word. Whitespace is collapsed.
 pub fn make(text: &str, needles: &[String]) -> Option<Snippet> {
     let long: Vec<String> = needles.iter().filter(|n| n.chars().count() >= 3).cloned().collect();
     let words: &[String] = if long.is_empty() { needles } else { &long };
@@ -284,6 +310,25 @@ mod tests {
         // diacritics fold: "masina" marks "mașină"
         let s = make("O mașină nouă", &["masina".into()]).unwrap();
         assert_eq!(marked(&s), "mașină");
+    }
+
+    #[test]
+    fn texts_kept_stay_small() {
+        let text = |n: usize| Some(Arc::<str>::from("x".repeat(n)));
+        let mut texts: VecDeque<(u32, Option<Arc<str>>)> = (0..TEXTS as u32 + 5).map(|k| (k, text(10))).collect();
+        keep_within(&mut texts);
+        assert_eq!(texts.len(), TEXTS);
+        assert_eq!(texts.front().map(|t| t.0), Some(5), "the oldest went");
+        // a few big texts: only as many as fit
+        texts.push_back((100, text(TEXT_BYTES / 2)));
+        texts.push_back((101, text(TEXT_BYTES / 2)));
+        keep_within(&mut texts);
+        assert_eq!(texts.back().map(|t| t.0), Some(101));
+        assert!(texts.iter().map(|t| t.1.as_ref().map_or(0, |s| s.len())).sum::<usize>() <= TEXT_BYTES);
+        // one larger than the whole budget is still kept, alone
+        texts.push_back((102, text(TEXT_BYTES + 1)));
+        keep_within(&mut texts);
+        assert_eq!(texts.len(), 1);
     }
 
     #[test]

@@ -25,6 +25,8 @@ use crate::theme::{self, Palette};
 /// Characters shown (and searched for highlights) in the panel.
 const SHOW_CHARS: usize = 60_000;
 const CACHE: usize = 16;
+/// The cache holds at most about this much (photos are ~3 MB each).
+const CACHE_BYTES: usize = 24 << 20;
 /// Wait this long after a selection change before extracting, so holding
 /// the arrow key does not start a worker per row.
 const DEBOUNCE: Duration = Duration::from_millis(90);
@@ -41,15 +43,36 @@ pub enum Content {
     Failed(String),
 }
 
+/// A file as it is now: its path, size and date. A file changed since it
+/// was read has another key, so it is read again.
+type Key = (String, u64, u32);
+
+fn key_of(row: &Row) -> Key {
+    (row.path.clone(), row.size, row.modified)
+}
+
 struct Loaded {
-    path: String,
+    key: Key,
     content: Content,
     took: Duration,
 }
 
+impl Content {
+    /// About how much memory it holds.
+    fn bytes(&self) -> usize {
+        match self {
+            Content::Folder { entries, .. } => entries.iter().map(|e| e.0.len() + 32).sum(),
+            Content::Text { text, .. } => text.len(),
+            Content::Picture { rgba, place, text, .. } => rgba.len() + text.len() + place.as_ref().map_or(0, |p| p.len()),
+            Content::NoPreview => 0,
+            Content::Failed(e) => e.len(),
+        }
+    }
+}
+
 /// A document's text laid out with its matches marked, for one query.
 struct Highlighted {
-    path: String,
+    key: Key,
     needles: Vec<String>,
     job: LayoutJob,
     hits: usize,
@@ -59,55 +82,66 @@ struct Highlighted {
 
 pub struct Preview {
     pub open: bool,
-    tx: Sender<String>,
+    tx: Sender<Key>,
     rx: Receiver<Loaded>,
-    /// The path shown (or being loaded).
-    current: Option<String>,
+    /// The file shown (or being loaded).
+    current: Option<Key>,
     cache: VecDeque<Loaded>,
     /// Highlighted text, rebuilt when the document or the query changes.
     job: Option<Highlighted>,
     scroll_to_match: bool,
     /// The shown photo, as a texture (made on the UI thread).
-    picture: Option<(String, egui::TextureHandle)>,
+    picture: Option<(Key, egui::TextureHandle)>,
+    /// Chinese, Japanese or Korean text was read (the fonts for it are loaded then).
+    pub saw_cjk: bool,
 }
 
 impl Preview {
     pub fn start(open: bool, wake: impl Fn() + Send + 'static) -> Preview {
-        let (tx, jobs) = mpsc::channel::<String>();
+        let (tx, jobs) = mpsc::channel::<Key>();
         let (out, rx) = mpsc::channel::<Loaded>();
         std::thread::Builder::new()
             .name("preview".into())
             .spawn(move || worker(jobs, out, wake))
             .expect("preview thread");
-        Preview { open, tx, rx, current: None, cache: VecDeque::new(), job: None, scroll_to_match: false, picture: None }
+        Preview { open, tx, rx, current: None, cache: VecDeque::new(), job: None, scroll_to_match: false, picture: None, saw_cjk: false }
     }
 
     /// Call every frame with the selected row; starts loading when it changed.
     pub fn select(&mut self, row: Option<&Row>) {
         for loaded in self.rx.try_iter().collect::<Vec<_>>() {
-            if self.cache.len() >= CACHE {
-                self.cache.pop_front();
-            }
-            self.cache.retain(|c| c.path != loaded.path);
+            self.saw_cjk |= match &loaded.content {
+                Content::Text { text, .. } | Content::Picture { text, .. } => crate::app::has_cjk(text),
+                Content::Folder { entries, .. } => entries.iter().any(|e| crate::app::has_cjk(&e.0)),
+                _ => false,
+            };
+            self.cache.retain(|c| c.key != loaded.key);
             self.cache.push_back(loaded);
+            // the oldest go first, beyond so many or so much
+            let mut bytes: usize = self.cache.iter().map(|c| c.content.bytes()).sum();
+            while self.cache.len() > 1 && (self.cache.len() > CACHE || bytes > CACHE_BYTES) {
+                if let Some(old) = self.cache.pop_front() {
+                    bytes -= old.content.bytes();
+                }
+            }
         }
-        let path = row.map(|r| r.path.clone());
-        if path == self.current {
+        let key = row.map(key_of);
+        if key == self.current {
             return;
         }
-        self.current = path.clone();
+        self.current = key.clone();
         self.scroll_to_match = true;
-        if let Some(path) = path {
-            if self.cache.iter().any(|c| c.path == path) {
+        if let Some(key) = key {
+            if self.cache.iter().any(|c| c.key == key) {
                 return;
             }
-            let _ = self.tx.send(path);
+            let _ = self.tx.send(key);
         }
     }
 
     fn loaded(&self) -> Option<&Loaded> {
-        let path = self.current.as_ref()?;
-        self.cache.iter().find(|c| &c.path == path)
+        let key = self.current.as_ref()?;
+        self.cache.iter().find(|c| &c.key == key)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -261,11 +295,11 @@ impl Preview {
             }
             Content::Picture { width, height, rgba, place, text } => {
                 let (w, h, rgba, place, text) = (*width, *height, rgba.clone(), place.clone(), text.clone());
-                let path = self.current.clone().unwrap_or_default();
-                if self.picture.as_ref().is_none_or(|(p, _)| p != &path) {
+                let key = self.current.clone().unwrap_or_default();
+                if self.picture.as_ref().is_none_or(|(k, _)| k != &key) {
                     let image = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba);
                     let texture = ui.ctx().load_texture("preview-picture", image, egui::TextureOptions::LINEAR);
-                    self.picture = Some((path, texture));
+                    self.picture = Some((key, texture));
                 }
                 if let Some((_, texture)) = &self.picture {
                     // the whole picture, as large as the pane allows
@@ -298,11 +332,12 @@ impl Preview {
         needles: &[String],
         took: Duration,
     ) {
-        let path = self.current.clone().unwrap_or_default();
-        let stale = !matches!(&self.job, Some(h) if h.path == path && h.needles == needles);
+        let key = self.current.clone().unwrap_or_default();
+        let path = key.0.clone();
+        let stale = !matches!(&self.job, Some(h) if h.key == key && h.needles == needles);
         if stale {
             let (job, hits, first) = highlight(text, needles, p, mono);
-            self.job = Some(Highlighted { path: path.clone(), needles: needles.to_vec(), job, hits, first });
+            self.job = Some(Highlighted { key, needles: needles.to_vec(), job, hits, first });
             self.scroll_to_match = true;
         }
         let Some(Highlighted { job, hits, first, .. }) = &self.job else { return };
@@ -410,20 +445,20 @@ fn highlight(text: &str, needles: &[String], p: &Palette, mono: bool) -> (Layout
 
 // ---------------------------------------------------------------- worker
 
-fn worker(jobs: Receiver<String>, out: Sender<Loaded>, wake: impl Fn()) {
+fn worker(jobs: Receiver<Key>, out: Sender<Loaded>, wake: impl Fn()) {
     let sandbox = Sandbox::beside_current_exe();
-    while let Ok(mut path) = jobs.recv() {
+    while let Ok(mut key) = jobs.recv() {
         // Only the newest selection matters.
         loop {
             std::thread::sleep(DEBOUNCE);
             match jobs.try_iter().last() {
-                Some(newer) => path = newer,
+                Some(newer) => key = newer,
                 None => break,
             }
         }
         let t = Instant::now();
-        let content = load(&path, sandbox.as_ref());
-        if out.send(Loaded { path, content, took: t.elapsed() }).is_err() {
+        let content = load(&key.0, sandbox.as_ref());
+        if out.send(Loaded { key, content, took: t.elapsed() }).is_err() {
             return;
         }
         wake();

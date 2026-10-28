@@ -79,7 +79,7 @@ pub(crate) enum Page {
 }
 
 /// Chinese, Japanese or Korean letters: the fonts for them are loaded then.
-fn has_cjk(s: &str) -> bool {
+pub(crate) fn has_cjk(s: &str) -> bool {
     s.chars().any(|c| matches!(c as u32, 0x1100..=0x11FF | 0x2E80..=0x9FFF | 0xAC00..=0xD7AF | 0xF900..=0xFAFF | 0xFF00..=0xFFEF | 0x20000..=0x3FFFF))
 }
 
@@ -1676,7 +1676,7 @@ impl WheretiApp {
                 });
                 let icon = file_icons.get(ui.ctx(), &row.path, row.is_dir);
                 if content_start.is_some_and(|s| i >= s) {
-                    let line = snippets.get(&row.path);
+                    let line = snippets.get(row);
                     let others = copies.get(&row.path).map_or(&[][..], |v| v.as_slice());
                     let hovered = resp.hovered();
                     paint_content_row(ui, p, rect, row, icon.as_ref(), &line, others, i == selected, hovered, tz, now, &needles);
