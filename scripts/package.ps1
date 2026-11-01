@@ -70,8 +70,26 @@ if ($Release) {
     }
 }
 
+# Paths of the PC that builds (the user folder with cargo's sources, the
+# repository) end up in the programs through panic messages and generated
+# code. They are renamed, so a published file says nothing about that PC, and
+# every file is checked for them before it is signed.
+$cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE ".cargo" }
+$env:CARGO_ENCODED_RUSTFLAGS = @("--remap-path-prefix=$cargoHome=cargo", "--remap-path-prefix=$repoRoot=whereti") -join [char]0x1f
+function Assert-NoLocalPaths([string]$File) {
+    $text = [IO.File]::ReadAllText($File, [Text.Encoding]::GetEncoding(28591))
+    foreach ($local in @($env:USERPROFILE, $repoRoot)) {
+        foreach ($form in @($local, $local.Replace("\", "/"))) {
+            if ($text.IndexOf($form, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                throw "$File contains the local path $form. It would be published with the release."
+            }
+        }
+    }
+}
+
 Write-Host "`n== Programs ==" -ForegroundColor Cyan
 Invoke-Native "building the programs" { cargo build --release --locked -p whereti-app -p whereti-service -p whereti-extract -p whereti-cli }
+foreach ($p in $programs) { Assert-NoLocalPaths (Join-Path $repoRoot "target\release\$p") }
 
 # ONNX Runtime for recognising what is in photos (PLAN.md §55): Microsoft's
 # own build, from its GitHub release, used only if the DLL's SHA-256 and its
@@ -128,6 +146,7 @@ try {
 }
 $setup = Join-Path $dist $(if ($Release) { "whereti-setup-$version.exe" } else { "whereti-setup-$version-dev.exe" })
 Copy-Item (Join-Path $repoRoot "target\release\whereti-setup.exe") $setup
+Assert-NoLocalPaths $setup
 # What the installer will install is what is in the payload folder (the
 # signed programs in a release), byte for byte: it unpacks and compares them.
 $check = Start-Process -FilePath $setup -ArgumentList "--check-payload `"$payload`"" -Wait -PassThru
