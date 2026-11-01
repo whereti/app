@@ -61,7 +61,8 @@ if ($Release) {
     $dev = [regex]::Match($license, 'pub const DEV_PUBLIC_KEY_HEX: &str = "([0-9a-f]{64})"').Groups[1].Value
     if (-not $public -or $public -eq $dev) { throw "license.rs still has the development public key. Run whereti.licenses/scripts/new-key.mjs and paste the production key." }
     $links = Get-Content (Join-Path $repoRoot "crates\whereti-app\src\links.rs") -Raw
-    if ($links -match 'BUY_(PERSONAL|BUSINESS): &str = "https://whereti\.com/supporter/#') { throw "links.rs still has placeholder checkout links. Paste the Lemon Squeezy links." }
+    # Business goes to the website on purpose (the PC count is chosen there)
+    if ($links -notmatch 'BUY_PERSONAL: &str = "https://whereti\.lemonsqueezy\.com/checkout/buy/') { throw "links.rs has no Lemon Squeezy checkout for Personal. Paste the link." }
     }    # Found now, not after ten minutes of compiling.
     $thumbprint = if ($env:WHERETI_SIGN_THUMBPRINT) { $env:WHERETI_SIGN_THUMBPRINT } else { "5DF397C236D87DA3DB0137E9CBFDF29319241E4A" }
     if (-not (Get-ChildItem Cert:\CurrentUser\My | Where-Object { $_.Thumbprint -eq $thumbprint })) {
