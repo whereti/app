@@ -10,7 +10,9 @@
 
 param(
     [Parameter(Mandatory)][string]$Version,
-    [Parameter(Mandatory)][string]$Sha256
+    [Parameter(Mandatory)][string]$Sha256,
+    # the day the GitHub release came out (yyyy-MM-dd); today by default
+    [string]$ReleaseDate = (Get-Date -Format "yyyy-MM-dd")
 )
 
 $ErrorActionPreference = "Stop"
@@ -18,11 +20,14 @@ $repoRoot = Split-Path -Parent $PSScriptRoot
 $out = Join-Path $repoRoot "dist\winget\$Version"
 New-Item -ItemType Directory -Force $out | Out-Null
 $id = "SoftwareHive.whereti"
-$schema = "1.9.0"
+# winget-pkgs refuses manifests on a deprecated schema: keep this at the
+# newest version under github.com/microsoft/winget-cli/tree/master/schemas/JSON/manifests
+$schema = "1.28.0"
 $url = "https://github.com/whereti/app/releases/download/v$Version/whereti-setup-$Version.exe"
 
 $manifestVersion = @"
 # yaml-language-server: `$schema=https://aka.ms/winget-manifest.version.$schema.schema.json
+
 PackageIdentifier: $id
 PackageVersion: $Version
 DefaultLocale: en-US
@@ -34,6 +39,7 @@ ManifestVersion: $schema
 # ProductCode is the key it writes under ...\CurrentVersion\Uninstall.
 $manifestInstaller = @"
 # yaml-language-server: `$schema=https://aka.ms/winget-manifest.installer.$schema.schema.json
+
 PackageIdentifier: $id
 PackageVersion: $Version
 MinimumOSVersion: 10.0.17763.0
@@ -48,6 +54,7 @@ InstallerSwitches:
   Silent: /S
   SilentWithProgress: /S
 UpgradeBehavior: install
+ReleaseDate: $ReleaseDate
 ProductCode: whereti
 AppsAndFeaturesEntries:
 - DisplayName: whereti
@@ -63,6 +70,7 @@ ManifestVersion: $schema
 
 $manifestLocale = @"
 # yaml-language-server: `$schema=https://aka.ms/winget-manifest.defaultLocale.$schema.schema.json
+
 PackageIdentifier: $id
 PackageVersion: $Version
 PackageLocale: en-US
@@ -78,19 +86,20 @@ LicenseUrl: https://github.com/whereti/app/blob/main/LICENSE
 Copyright: Copyright (C) 2026 Software Hive S.R.L.
 ShortDescription: Find any file on your PC as you type, by its name or by the words inside it.
 Description: |-
-  whereti searches the names of every file on your drives and the words inside your documents
-  (PDF, Word, Excel, PowerPoint, e-mails, scans and photos), and opens apps and Windows settings.
-  Results appear while you type. Nothing about your files leaves your PC.
+  whereti searches the names of every file on your drives and the words inside your documents (PDF, Word, Excel, PowerPoint, e-mails, scans and photos), and opens apps and Windows settings. Results appear while you type. Everything is read and kept on your PC; whereti is free and open source.
 Moniker: whereti
 Tags:
-- search
-- file-search
 - desktop-search
-- everything
+- file-search
 - find
+- full-text-search
 - ocr
 - open-source
+- search
 ReleaseNotesUrl: https://github.com/whereti/app/releases/tag/v$Version
+Documentations:
+- DocumentLabel: Search tips
+  DocumentUrl: https://whereti.com/search/
 ManifestType: defaultLocale
 ManifestVersion: $schema
 "@
