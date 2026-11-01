@@ -94,4 +94,6 @@ administrator prompt, only when it changed).
 ## License
 
 [MIT](LICENSE). The bundled ONNX Runtime and the optional models keep their
-own licenses (MIT for ONNX Runtime and the Xenova model exports).
+own licenses (MIT for ONNX Runtime and the Xenova model exports). Beside ONNX
+Runtime, the installer puts the four Visual C++ runtime DLLs it needs,
+Microsoft's redistributable files, unchanged.

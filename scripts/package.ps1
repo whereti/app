@@ -75,7 +75,47 @@ if ($Release) {
 # code. They are renamed, so a published file says nothing about that PC, and
 # every file is checked for them before it is signed.
 $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE ".cargo" }
-$env:CARGO_ENCODED_RUSTFLAGS = @("--remap-path-prefix=$cargoHome=cargo", "--remap-path-prefix=$repoRoot=whereti") -join [char]0x1f
+# This replaces the rustflags of .cargo\config.toml, so the C runtime is
+# asked to be built in here too (see there).
+$env:CARGO_ENCODED_RUSTFLAGS = @("-Ctarget-feature=+crt-static", "--remap-path-prefix=$cargoHome=cargo", "--remap-path-prefix=$repoRoot=whereti") -join [char]0x1f
+
+# The DLLs a program or DLL loads at start (its import table).
+function Get-DllImports([string]$File) {
+    $b = [IO.File]::ReadAllBytes($File)
+    $pe = [BitConverter]::ToInt32($b, 0x3C)
+    $sections = [BitConverter]::ToUInt16($b, $pe + 6)
+    $optional = $pe + 24
+    $optionalSize = [BitConverter]::ToUInt16($b, $pe + 20)
+    # data directory 1 (imports); PE32+ has it at 120, PE32 at 104
+    $dirs = $optional + $(if ([BitConverter]::ToUInt16($b, $optional) -eq 0x20b) { 112 } else { 96 })
+    $importRva = [BitConverter]::ToUInt32($b, $dirs + 8)
+    $table = $optional + $optionalSize
+    $toOffset = {
+        param([uint32]$rva)
+        for ($i = 0; $i -lt $sections; $i++) {
+            $s = $table + 40 * $i
+            $va = [BitConverter]::ToUInt32($b, $s + 12)
+            $size = [Math]::Max([BitConverter]::ToUInt32($b, $s + 8), [BitConverter]::ToUInt32($b, $s + 16))
+            if ($rva -ge $va -and $rva -lt $va + $size) { return $rva - $va + [BitConverter]::ToUInt32($b, $s + 20) }
+        }
+        throw "$File is not a Windows program this script can read"
+    }
+    if ($importRva -eq 0) { return @() }
+    $names = @()
+    for ($d = & $toOffset $importRva; [BitConverter]::ToUInt32($b, $d + 12) -ne 0; $d += 20) {
+        $n = & $toOffset ([BitConverter]::ToUInt32($b, $d + 12))
+        $end = [Array]::IndexOf($b, [byte]0, [int]$n)
+        $names += [Text.Encoding]::ASCII.GetString($b, $n, $end - $n)
+    }
+    $names
+}
+# Our programs carry the C runtime (see .cargo\config.toml): one that needs
+# the Visual C++ runtime would not start on a PC without it.
+function Assert-NoVcRuntime([string]$File) {
+    $needs = Get-DllImports $File | Where-Object { $_ -match '^(vcruntime|msvcp|concrt)\d' }
+    if ($needs) { throw "$File needs $($needs -join ', '): it would not start on a Windows without the Visual C++ runtime." }
+}
+
 function Assert-NoLocalPaths([string]$File) {
     $text = [IO.File]::ReadAllText($File, [Text.Encoding]::GetEncoding(28591))
     foreach ($local in @($env:USERPROFILE, $repoRoot)) {
@@ -89,7 +129,10 @@ function Assert-NoLocalPaths([string]$File) {
 
 Write-Host "`n== Programs ==" -ForegroundColor Cyan
 Invoke-Native "building the programs" { cargo build --release --locked -p whereti-app -p whereti-service -p whereti-extract -p whereti-cli }
-foreach ($p in $programs) { Assert-NoLocalPaths (Join-Path $repoRoot "target\release\$p") }
+foreach ($p in $programs) {
+    Assert-NoLocalPaths (Join-Path $repoRoot "target\release\$p")
+    Assert-NoVcRuntime (Join-Path $repoRoot "target\release\$p")
+}
 
 # ONNX Runtime for recognising what is in photos (PLAN.md §55): Microsoft's
 # own build, from its GitHub release, used only if the DLL's SHA-256 and its
@@ -120,6 +163,28 @@ if ($ortSig.Status -ne "Valid" -or $ortSig.SignerCertificate.Subject -notmatch "
 # beside the programs for local runs too (whereti-extract loads it from there)
 Copy-Item $ortDll (Join-Path $repoRoot "target\release\onnxruntime.dll") -Force
 
+# onnxruntime.dll is built with the Visual C++ runtime as DLLs, which a
+# clean Windows does not have. Microsoft lets a program carry them in its own
+# folder: these four (what onnxruntime.dll imports) come from the Visual
+# Studio that builds, signed by Microsoft, and go beside it. Windows looks
+# for a DLL's DLLs in the program's folder first, so they are found there.
+$vcDlls = @("vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll", "msvcp140_1.dll")
+$ortNeeds = Get-DllImports $ortDll | Where-Object { $_ -match '^(vcruntime|msvcp|concrt)\d' } | ForEach-Object { $_.ToLowerInvariant() }
+$missing = $ortNeeds | Where-Object { $vcDlls -notcontains $_ }
+if ($missing) { throw "onnxruntime.dll also needs $($missing -join ', '): add it to `$vcDlls." }
+$vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+$vsPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+$vcRedist = Get-ChildItem (Join-Path $vsPath "VC\Redist\MSVC\*\x64\Microsoft.VC*.CRT") -Directory -ErrorAction SilentlyContinue |
+    Sort-Object { [version]$_.Parent.Parent.Name } -ErrorAction SilentlyContinue | Select-Object -Last 1
+if (-not $vcRedist) { throw "The Visual C++ runtime DLLs were not found under $vsPath\VC\Redist\MSVC." }
+foreach ($d in $vcDlls) {
+    $path = Join-Path $vcRedist.FullName $d
+    $sig = Get-AuthenticodeSignature $path
+    if ($sig.Status -ne "Valid" -or $sig.SignerCertificate.Subject -notmatch "O=Microsoft Corporation,") { throw "$path is not signed by Microsoft" }
+    Copy-Item $path (Join-Path $repoRoot "target\release\$d") -Force
+}
+Write-Host "Visual C++ runtime for onnxruntime.dll: $($vcRedist.FullName)"
+
 # emptied rather than deleted: an Explorer window open on dist keeps the folder itself busy
 if (Test-Path $dist) { Get-ChildItem $dist -Force | Remove-Item -Recurse -Force }
 New-Item -ItemType Directory -Force $payload | Out-Null
@@ -128,6 +193,7 @@ foreach ($p in $programs) {
 }
 # signed by Microsoft already: copied, never re-signed
 Copy-Item $ortDll (Join-Path $payload "onnxruntime.dll")
+foreach ($d in $vcDlls) { Copy-Item (Join-Path $repoRoot "target\release\$d") (Join-Path $payload $d) }
 
 if ($Release) {
     Write-Host "`n== Signing the programs ==" -ForegroundColor Cyan
@@ -147,6 +213,7 @@ try {
 $setup = Join-Path $dist $(if ($Release) { "whereti-setup-$version.exe" } else { "whereti-setup-$version-dev.exe" })
 Copy-Item (Join-Path $repoRoot "target\release\whereti-setup.exe") $setup
 Assert-NoLocalPaths $setup
+Assert-NoVcRuntime $setup
 # What the installer will install is what is in the payload folder (the
 # signed programs in a release), byte for byte: it unpacks and compares them.
 $check = Start-Process -FilePath $setup -ArgumentList "--check-payload `"$payload`"" -Wait -PassThru

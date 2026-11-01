@@ -29,8 +29,8 @@ jobs:
       - name: Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
       # A development payload for it: the debug programs, and one of them as a
-      # stand-in for onnxruntime.dll (package.ps1 fetches Microsoft's; here it
-      # only has to pack and unpack whole).
+      # stand-in for onnxruntime.dll and its runtime DLLs (package.ps1 takes
+      # Microsoft's; here they only have to pack and unpack whole).
       - name: Installer payload
         run: |
           cargo build --locked -p whereti-app -p whereti-service -p whereti-extract -p whereti-cli
@@ -38,7 +38,7 @@ jobs:
           $payload = Join-Path $env:RUNNER_TEMP "whereti-payload"
           New-Item -ItemType Directory -Force $payload | Out-Null
           foreach ($p in "whereti.exe", "whereti-service.exe", "whereti-extract.exe", "wt.exe") { Copy-Item "target\debug\$p" $payload }
-          Copy-Item "target\debug\whereti-extract.exe" (Join-Path $payload "onnxruntime.dll")
+          foreach ($d in "onnxruntime.dll", "vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll", "msvcp140_1.dll") { Copy-Item "target\debug\whereti-extract.exe" (Join-Path $payload $d) }
           "WHERETI_PAYLOAD=$payload" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
       - name: Installer tests
         run: cargo test --locked -p whereti-setup

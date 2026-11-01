@@ -1,0 +1,8 @@
+# The C runtime is built into every program: a clean Windows has no Visual
+# C++ runtime (VCRUNTIME140.dll), and without it the installer could not even
+# start (winget's install test runs on such a Windows). onnxruntime.dll, which
+# is Microsoft's build and needs the runtime, gets its own copy beside it
+# (scripts/package.ps1). package.ps1 sets CARGO_ENCODED_RUSTFLAGS, which
+# replaces this, so it repeats the flag.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

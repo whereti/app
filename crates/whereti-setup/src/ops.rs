@@ -16,13 +16,19 @@ use windows::Win32::System::Registry::{
 };
 
 /// The programs the installer carries, compressed at build time (see build.rs).
-pub const PAYLOAD: [(&str, &[u8]); 5] = [
+pub const PAYLOAD: [(&str, &[u8]); 9] = [
     ("whereti.exe", include_bytes!(concat!(env!("WHERETI_PAYLOAD_DIR"), "/whereti.exe.zst"))),
     ("whereti-service.exe", include_bytes!(concat!(env!("WHERETI_PAYLOAD_DIR"), "/whereti-service.exe.zst"))),
     ("whereti-extract.exe", include_bytes!(concat!(env!("WHERETI_PAYLOAD_DIR"), "/whereti-extract.exe.zst"))),
     ("wt.exe", include_bytes!(concat!(env!("WHERETI_PAYLOAD_DIR"), "/wt.exe.zst"))),
     // ONNX Runtime, Microsoft's signed build: what is in photos (PLAN.md §55)
     ("onnxruntime.dll", include_bytes!(concat!(env!("WHERETI_PAYLOAD_DIR"), "/onnxruntime.dll.zst"))),
+    // the Visual C++ runtime onnxruntime.dll is built with, which a clean
+    // Windows does not have (our own programs carry theirs built in)
+    ("vcruntime140.dll", include_bytes!(concat!(env!("WHERETI_PAYLOAD_DIR"), "/vcruntime140.dll.zst"))),
+    ("vcruntime140_1.dll", include_bytes!(concat!(env!("WHERETI_PAYLOAD_DIR"), "/vcruntime140_1.dll.zst"))),
+    ("msvcp140.dll", include_bytes!(concat!(env!("WHERETI_PAYLOAD_DIR"), "/msvcp140.dll.zst"))),
+    ("msvcp140_1.dll", include_bytes!(concat!(env!("WHERETI_PAYLOAD_DIR"), "/msvcp140_1.dll.zst"))),
 ];
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

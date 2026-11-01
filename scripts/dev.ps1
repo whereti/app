@@ -37,7 +37,8 @@ function Same([string]$name) {
     (Test-Path $b) -and ((Get-FileHash $a).Hash -eq (Get-FileHash $b).Hash)
 }
 # the app too: the copy in Program Files is the one Windows starts
-$changed = @("whereti-service.exe", "whereti-extract.exe", "wt.exe", "whereti.exe", "onnxruntime.dll") | Where-Object { -not (Same $_) }
+$changed = @("whereti-service.exe", "whereti-extract.exe", "wt.exe", "whereti.exe", "onnxruntime.dll",
+    "vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll", "msvcp140_1.dll") | Where-Object { -not (Same $_) }
 
 if ($changed -and -not $AppOnly) {
     if (-not (Test-Path $installed)) { throw "whereti is not installed: run the installer once first" }
