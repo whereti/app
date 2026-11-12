@@ -9,4 +9,4 @@ description = "Where a photo was taken: its GPS position from EXIF, named offlin
 [dependencies]
 flate2 = "1.1.10"
 kamadak-exif = "0.6.1"
-whereti-guard = { version = "1.0.1", path = "../whereti-guard" }
+whereti-guard = { version = "1.0.2", path = "../whereti-guard" }
