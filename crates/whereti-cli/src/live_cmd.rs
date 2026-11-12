@@ -60,13 +60,13 @@ fn sync_all(index: &mut NameIndex, vols: &[Volume], open: &mut [HashSet<u64>], q
             JournalRead::Changes { batch, journal_records, journal_id, next_usn } => {
                 let stats = apply(index, v, vol, &batch)?;
                 if stats.needs_rescan {
-                    println!("  {letter}:  a folder was moved in from outside the index → full rescan");
+                    outln!("  {letter}:  a folder was moved in from outside the index → full rescan");
                     rescan.push(letter);
                     continue;
                 }
                 index.set_journal_position(v, journal_id, next_usn);
                 if !quiet {
-                    println!(
+                    outln!(
                         "  {letter}:  replayed {} journal records → {} files/folders re-read (+{} −{} ~{}) in {}",
                         num(journal_records as u64),
                         num(stats.records as u64),
@@ -78,7 +78,7 @@ fn sync_all(index: &mut NameIndex, vols: &[Volume], open: &mut [HashSet<u64>], q
                 }
             }
             JournalRead::Rescan(why) => {
-                println!("  {letter}:  {why} → full rescan");
+                outln!("  {letter}:  {why} → full rescan");
                 rescan.push(letter);
                 open[v].clear();
             }
@@ -115,7 +115,7 @@ fn save(index: &mut NameIndex, path: &std::path::Path) -> Result<(), String> {
         system::ensure_data_dir().map_err(|e| e.to_string())?;
     }
     let size = snapshot::save(index, path).map_err(|e| format!("cannot save {}: {e}", path.display()))?;
-    println!(
+    outln!(
         "  saved    {} ({}){} in {}",
         path.display(),
         bytes(size),
@@ -129,12 +129,12 @@ pub fn update(args: UpdateArgs) -> Result<(), String> {
     let path = args.index.unwrap_or_else(default_index_path);
     let t = Instant::now();
     let mut index = load(&path)?;
-    println!("  loaded   {} entries in {}", num(index.len() as u64), dur(t.elapsed()));
+    outln!("  loaded   {} entries in {}", num(index.len() as u64), dur(t.elapsed()));
     let vols = open_volumes(&index)?;
     let mut open = vec![HashSet::new(); vols.len()];
     sync_all(&mut index, &vols, &mut open, false)?;
     save(&mut index, &path)?;
-    println!("  total    {}", dur(t.elapsed()));
+    outln!("  total    {}", dur(t.elapsed()));
     Ok(())
 }
 
@@ -143,10 +143,10 @@ pub fn verify(args: VerifyArgs) -> Result<(), String> {
     let mut saved = load(&path)?;
     let vols = open_volumes(&saved)?;
     let mut open = vec![HashSet::new(); vols.len()];
-    println!("[1] saved index + journal replay");
+    outln!("[1] saved index + journal replay");
     sync_all(&mut saved, &vols, &mut open, false)?;
 
-    println!("[2] fresh full scan");
+    outln!("[2] fresh full scan");
     let mut scans = Vec::new();
     for v in saved.volumes() {
         scans.extend(scan_volume(v.letter(), default_threads())?);
@@ -155,24 +155,24 @@ pub fn verify(args: VerifyArgs) -> Result<(), String> {
 
     // Same moment for both: replay what happened during step 2, then re-read
     // the files that are still open (their size moves without journal records).
-    println!("[3] bring both to the same moment");
+    outln!("[3] bring both to the same moment");
     sync_all(&mut saved, &vols, &mut open, true)?;
     sync_all(&mut fresh, &vols, &mut open, true)?;
     let n = refresh_open(&mut saved, &vols, &open)?;
     refresh_open(&mut fresh, &vols, &open)?;
-    println!("  re-read {} files still open for writing", num(n as u64));
+    outln!("  re-read {} files still open for writing", num(n as u64));
 
     let (structure, meta) = differences(&saved, &fresh, args.samples, "");
-    println!();
-    println!("  paths that differ:            {}", num(structure as u64));
-    println!("  size/date/flags that differ: {}", num(meta.len() as u64));
+    outln!();
+    outln!("  paths that differ:            {}", num(structure as u64));
+    outln!("  size/date/flags that differ: {}", num(meta.len() as u64));
 
     // Files written since the snapshot but still open have no journal record
     // yet. Re-read exactly those in both indexes: if the logic is right, the
     // differences disappear; anything left is a bug.
     let mut meta_after = Vec::new();
     if !meta.is_empty() {
-        println!(
+        outln!(
             "[4] re-read the {} files whose size/date differ (written while open; the journal reports them at close)",
             meta.len()
         );
@@ -189,13 +189,13 @@ pub fn verify(args: VerifyArgs) -> Result<(), String> {
         }
         let (s2, m2) = differences(&saved, &fresh, args.samples, "      still: ");
         if s2 != 0 {
-            println!("  paths that differ after re-read: {}", num(s2 as u64));
+            outln!("  paths that differ after re-read: {}", num(s2 as u64));
         }
-        println!("  size/date that differ after re-read: {}", num(m2.len() as u64));
+        outln!("  size/date that differ after re-read: {}", num(m2.len() as u64));
         meta_after = m2;
     }
     let ok = structure == 0 && meta_after.is_empty();
-    println!(
+    outln!(
         "  result   {}",
         if !ok {
             "FAIL: indexes differ"
@@ -221,7 +221,7 @@ fn differences(a: &NameIndex, b: &NameIndex, samples: usize, prefix: &str) -> (u
     let pb: BTreeSet<_> = cb.iter().map(|e| (e.0.clone(), e.1)).collect();
     let structure: Vec<_> = pa.symmetric_difference(&pb).collect();
     for p in structure.iter().take(samples) {
-        println!("      path only on one side: {p:?}");
+        outln!("      path only on one side: {p:?}");
     }
     let meta: BTreeSet<String> = ca
         .symmetric_difference(&cb)
@@ -233,7 +233,7 @@ fn differences(a: &NameIndex, b: &NameIndex, samples: usize, prefix: &str) -> (u
         let side = |c: &BTreeSet<(String, bool, u64, u32, u16)>| {
             c.iter().find(|e| &e.0 == path).map(|e| format!("{} B, minute {}", e.2, e.3)).unwrap_or_default()
         };
-        println!("{pre}{path}: saved {} · fresh {}", side(&ca), side(&cb));
+        outln!("{pre}{path}: saved {} · fresh {}", side(&ca), side(&cb));
     }
     (structure.len(), meta.into_iter().collect())
 }

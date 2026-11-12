@@ -508,8 +508,13 @@ fn media(path: &Path, p: &mut Props) {
 }
 
 /// The text of the first `<tag>` in one XML part of a ZIP-based document.
+/// Read in the service itself: not from a document larger than the
+/// sandboxed reader takes (its list of parts alone could be huge).
 fn zip_xml_tag(path: &Path, part: &str, tag: &str) -> Option<String> {
     let file = whereti_extract::worker::open_real(path).ok()?;
+    if file.metadata().ok()?.len() > crate::content::MAX_DOCUMENT {
+        return None;
+    }
     let mut zip = zip::ZipArchive::new(file).ok()?;
     let mut entry = zip.by_name(part).ok()?;
     if entry.size() > 1 << 20 {

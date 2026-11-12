@@ -191,13 +191,41 @@ fn walk_all(folders: &[String]) {
     save_cache();
 }
 
+/// Windows' errors for a share that went away (the NAS turned off or asleep,
+/// the network or VPN dropped).
+const NET_GONE: [i32; 14] = [21, 51, 53, 54, 55, 59, 64, 67, 121, 1222, 1231, 1232, 1236, 2250];
+
+/// A folder inside the walk could not be read: is the share gone (the walk
+/// failed, what was known is kept), or is it only that folder (skipped)?
+/// Some folders are always refused or vanish while walked; anything else
+/// counts when the root cannot be read any more either.
+fn share_gone(e: &std::io::Error, root_readable: impl FnOnce() -> bool) -> bool {
+    use std::io::ErrorKind;
+    // (a lost network path counts as NotFound too: asked first)
+    if e.raw_os_error().is_some_and(|c| NET_GONE.contains(&c)) {
+        return true;
+    }
+    !matches!(e.kind(), ErrorKind::PermissionDenied | ErrorKind::NotFound) && !root_readable()
+}
+
 fn walk(root: &Path, out: &mut Vec<Entry>) -> Result<(), String> {
     std::fs::read_dir(root).map_err(|e| e.to_string())?;
+    let root_readable = || std::fs::read_dir(root).is_ok();
     let mut stack = vec![root.to_path_buf()];
     let mut seen = 0usize;
     while let Some(dir) = stack.pop() {
-        let Ok(read) = std::fs::read_dir(&dir) else { continue };
-        for item in read.flatten() {
+        let read = match std::fs::read_dir(&dir) {
+            Ok(read) => read,
+            Err(e) if share_gone(&e, root_readable) => return Err(e.to_string()),
+            Err(_) => continue,
+        };
+        for item in read {
+            // a failed step through a folder fails again: that folder ends there
+            let item = match item {
+                Ok(item) => item,
+                Err(e) if share_gone(&e, root_readable) => return Err(e.to_string()),
+                Err(_) => break,
+            };
             if out.len() >= MAX_ENTRIES {
                 return Ok(());
             }
@@ -354,6 +382,34 @@ mod tests {
 
     fn entry(path: &str, is_dir: bool, size: u64) -> Entry {
         Entry { path: path.into(), name: fold(path.rsplit('\\').next().unwrap()), is_dir, size, modified: 10 }
+    }
+
+    #[test]
+    fn a_share_going_away_fails_the_walk() {
+        let os = std::io::Error::from_raw_os_error;
+        // refused or gone meanwhile: only that folder is skipped
+        assert!(!share_gone(&os(5), || false));
+        assert!(!share_gone(&os(2), || false));
+        assert!(!share_gone(&os(3), || false));
+        // the network name is no longer available
+        assert!(share_gone(&os(64), || true));
+        assert!(share_gone(&os(53), || true));
+        // anything else: whether the root can still be read
+        assert!(!share_gone(&os(1920), || true));
+        assert!(share_gone(&os(1920), || false));
+    }
+
+    #[test]
+    fn a_walk_lists_what_is_inside_and_fails_without_its_root() {
+        let root = std::env::temp_dir().join(format!("whereti-walk-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        std::fs::write(root.join("a").join("one.txt"), "1").unwrap();
+        let mut out = Vec::new();
+        assert!(walk(&root, &mut out).is_ok());
+        assert_eq!(out.len(), 2);
+        // the root itself gone: the walk fails
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(walk(&root, &mut Vec::new()).is_err());
     }
 
     #[test]

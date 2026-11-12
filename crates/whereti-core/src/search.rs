@@ -62,6 +62,27 @@ const FEW_HITS: usize = 3;
 const MIN_CLOSE_LEN: usize = 4;
 /// Words longer than this get no close matches.
 const MAX_CLOSE_LEN: usize = 40;
+/// Close matches are looked for with this many words at most (the
+/// longest): each one costs a scan of every name, and a sentence pasted
+/// into the box would cost dozens.
+const MAX_CLOSE_WORDS: usize = 3;
+
+/// The plain words of `query` worth correcting, with their clause: the
+/// longest first, MAX_CLOSE_WORDS of them at most.
+fn close_words(query: &Query) -> Vec<(usize, &str)> {
+    let mut words: Vec<(usize, &str)> = query
+        .clauses
+        .iter()
+        .enumerate()
+        .filter_map(|(ci, c)| match (c.negated, c.any_of.as_slice()) {
+            (false, [Term::Text(t)]) if t.chars().count() >= MIN_CLOSE_LEN => Some((ci, t.as_str())),
+            _ => None,
+        })
+        .collect();
+    words.sort_by_key(|(_, t)| std::cmp::Reverse(t.len()));
+    words.truncate(MAX_CLOSE_WORDS);
+    words
+}
 
 enum Matcher {
     Text(Box<Finder<'static>>),
@@ -158,17 +179,7 @@ impl NameIndex {
     /// "anaul"). In index order, without the entries of `exact` (sorted):
     /// those where the near word starts a word of the name, then the others.
     fn close_entries(&self, query: &Query, exact: &[u32]) -> (Vec<u32>, Vec<u32>) {
-        let mut words: Vec<(usize, &str)> = query
-            .clauses
-            .iter()
-            .enumerate()
-            .filter_map(|(ci, c)| match (c.negated, c.any_of.as_slice()) {
-                (false, [Term::Text(t)]) if t.chars().count() >= MIN_CLOSE_LEN => Some((ci, t.as_str())),
-                _ => None,
-            })
-            .collect();
-        words.sort_by_key(|(_, t)| std::cmp::Reverse(t.len()));
-        for (ci, word) in words {
+        for (ci, word) in close_words(query) {
             let found = self.close_for_word(query, exact, ci, word);
             if !found.0.is_empty() || !found.1.is_empty() {
                 return found;
@@ -991,6 +1002,24 @@ mod tests {
             }
         }
         idx
+    }
+
+    #[test]
+    fn close_matches_are_looked_for_with_the_longest_few_words_only() {
+        let q = |text: &str| Query {
+            clauses: text
+                .split(' ')
+                .map(|w| whereti_query::Clause { negated: false, any_of: vec![Term::Text(w.into())] })
+                .collect(),
+        };
+        let query = q("abcd abcdefgh abc abcdef abcdefg abcde");
+        let words: Vec<&str> = close_words(&query).into_iter().map(|(_, w)| w).collect();
+        assert_eq!(words, ["abcdefgh", "abcdefg", "abcdef"]);
+        // the clause each word came from, for the search without it
+        assert_eq!(close_words(&query)[0].0, 1);
+        let short = q("raport anaul");
+        assert_eq!(close_words(&short).len(), 2);
+        assert!(close_words(&q("abc ab")).is_empty());
     }
 
     fn searchable(idx: &NameIndex) -> Vec<u32> {

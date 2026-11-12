@@ -2,7 +2,7 @@
 
 use std::os::windows::process::CommandExt;
 
-use windows_sys::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS, HANDLE};
+use windows_sys::Win32::Foundation::{GetLastError, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, HANDLE, WAIT_OBJECT_0};
 use windows_sys::Win32::System::Threading::{CreateEventW, CreateMutexW, SetEvent, WaitForSingleObject, INFINITE};
 use windows_sys::Win32::UI::Shell::ShellExecuteW;
 use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
@@ -11,12 +11,41 @@ fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain([0]).collect()
 }
 
+/// The folder a file is started in: the one it is in, as when it is
+/// double-clicked in Explorer (a .bat or a portable program may look for
+/// files beside it). None for a link, a drive or share root, or a folder too
+/// long to be a current directory.
+fn work_dir(path: &str) -> Option<String> {
+    // \\?\C:\x and \\?\UNC\server\share\x: their usual forms
+    let path = match path.strip_prefix(r"\\?\") {
+        Some(rest) => match rest.strip_prefix(r"UNC\") {
+            Some(unc) => format!(r"\\{unc}"),
+            None => rest.to_string(),
+        },
+        None => path.to_string(),
+    };
+    let b = path.as_bytes();
+    let local = b.len() > 2 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'\\';
+    if !local && !path.starts_with(r"\\") {
+        return None; // a URL, ms-settings: or a shell name
+    }
+    let dir = std::path::Path::new(&path).parent()?.to_str()?.to_string();
+    // a current directory must fit in MAX_PATH with its final backslash
+    (dir.encode_utf16().count() < 258).then_some(dir)
+}
+
+/// `work_dir` as a NUL-terminated string, or none.
+fn wide_dir(path: &str) -> Option<Vec<u16>> {
+    work_dir(path).map(|d| wide(&d))
+}
+
 /// Opens a file or folder with its default program.
 pub fn open(path: &str) -> Result<(), String> {
-    let (verb, file) = (wide("open"), wide(path));
+    let (verb, file, dir) = (wide("open"), wide(path), wide_dir(path));
+    let dir_ptr = dir.as_ref().map_or(std::ptr::null(), |d| d.as_ptr());
     // SAFETY: NUL-terminated strings; no window handle needed.
     let r = unsafe {
-        ShellExecuteW(std::ptr::null_mut(), verb.as_ptr(), file.as_ptr(), std::ptr::null(), std::ptr::null(), SW_SHOWNORMAL)
+        ShellExecuteW(std::ptr::null_mut(), verb.as_ptr(), file.as_ptr(), std::ptr::null(), dir_ptr, SW_SHOWNORMAL)
     };
     if r as isize > 32 {
         Ok(())
@@ -31,13 +60,14 @@ pub fn open(path: &str) -> Result<(), String> {
 /// initialised on the thread.
 pub fn open_and_wait(path: &str) -> Result<(), String> {
     use windows_sys::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOASYNC, SHELLEXECUTEINFOW};
-    let (verb, file) = (wide("open"), wide(path));
+    let (verb, file, dir) = (wide("open"), wide(path), wide_dir(path));
     // SAFETY: zeroed struct with its size set; the strings outlive the call.
     let mut info: SHELLEXECUTEINFOW = unsafe { std::mem::zeroed() };
     info.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
     info.fMask = SEE_MASK_NOASYNC;
     info.lpVerb = verb.as_ptr();
     info.lpFile = file.as_ptr();
+    info.lpDirectory = dir.as_ref().map_or(std::ptr::null(), |d| d.as_ptr());
     info.nShow = SW_SHOWNORMAL;
     // SAFETY: a valid struct.
     if unsafe { ShellExecuteExW(&mut info) } != 0 {
@@ -70,12 +100,14 @@ pub fn claim_instance(show: bool) -> Instance {
     // SAFETY: plain object creation; handles live for the whole process.
     unsafe {
         let _mutex = CreateMutexW(std::ptr::null(), 0, mutex_name.as_ptr());
-        let first = GetLastError() != ERROR_ALREADY_EXISTS;
+        // access denied: a whereti running as administrator owns it
+        let first = !matches!(GetLastError(), ERROR_ALREADY_EXISTS | ERROR_ACCESS_DENIED);
+        // may be null (denied too): then no show requests go either way
         let event = CreateEventW(std::ptr::null(), 0, 0, event_name.as_ptr());
         if first {
             Instance::First { show_requests: event }
         } else {
-            if show {
+            if show && !event.is_null() {
                 // this launch may bring a window to the front (the user
                 // started it); the whereti already running may not, unless
                 // allowed: else its window opens behind the others
@@ -102,11 +134,16 @@ pub fn register_restart_hidden() {
 
 /// Calls `on_show` each time another launch asks this instance to show itself.
 pub fn listen_for_show_requests(event: HANDLE, on_show: impl Fn() + Send + 'static) {
+    if event.is_null() {
+        return; // the event could not be made: nobody can ask
+    }
     let event = event as usize;
-    std::thread::spawn(move || loop {
+    std::thread::spawn(move || {
         // SAFETY: the event handle stays open for the life of the process.
-        unsafe { WaitForSingleObject(event as HANDLE, INFINITE) };
-        on_show();
+        // A failed wait would fail again at once: the thread ends instead.
+        while unsafe { WaitForSingleObject(event as HANDLE, INFINITE) } == WAIT_OBJECT_0 {
+            on_show();
+        }
     });
 }
 
@@ -332,6 +369,23 @@ mod tests {
         move_once(&old, &new);
         assert_eq!(std::fs::read_to_string(&new).unwrap(), "old");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn files_start_in_their_own_folder() {
+        assert_eq!(work_dir(r"C:\Tools\run.bat").as_deref(), Some(r"C:\Tools"));
+        assert_eq!(work_dir(r"C:\Tools").as_deref(), Some(r"C:\"));
+        assert_eq!(work_dir(r"\\nas\share\dir\a.exe").as_deref(), Some(r"\\nas\share\dir"));
+        assert_eq!(work_dir(r"\\?\C:\Tools\run.bat").as_deref(), Some(r"C:\Tools"));
+        assert_eq!(work_dir(r"\\?\UNC\nas\share\dir\a.exe").as_deref(), Some(r"\\nas\share\dir"));
+        // nothing for a root, a link or a shell name
+        assert_eq!(work_dir(r"C:\"), None);
+        assert_eq!(work_dir(r"\\nas\share"), None);
+        assert_eq!(work_dir("https://whereti.com/download"), None);
+        assert_eq!(work_dir("ms-settings:display"), None);
+        // too long to be a current directory
+        let deep = format!(r"C:\{}\a.bat", "d".repeat(300));
+        assert_eq!(work_dir(&deep), None);
     }
 
     #[test]

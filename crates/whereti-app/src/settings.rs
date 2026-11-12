@@ -69,6 +69,38 @@ fn settings_file() -> PathBuf {
     base.join("whereti").join("settings.txt")
 }
 
+/// The settings file's text. One that cannot be read (saved in another
+/// encoding by hand, say) is moved aside to settings.unreadable.txt, over
+/// an older one, so the defaults saved next do not take its place.
+fn read_settings(path: &std::path::Path) -> Option<String> {
+    let text = match std::fs::read(path) {
+        Ok(bytes) => decode_settings(&bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(_) => None,
+    };
+    if text.is_none() {
+        let _ = std::fs::rename(path, path.with_file_name("settings.unreadable.txt"));
+    }
+    text
+}
+
+/// UTF-8 (with or without a BOM), or UTF-16 with a BOM (Notepad's
+/// "UTF-16 LE" and "UTF-16 BE"). Text with NULs in it is not a settings
+/// file (UTF-16 without a BOM, say).
+fn decode_settings(bytes: &[u8]) -> Option<String> {
+    let utf16 = |rest: &[u8], word: fn([u8; 2]) -> u16| {
+        let words: Vec<u16> = rest.chunks(2).map(|c| <[u8; 2]>::try_from(c).ok().map(word)).collect::<Option<_>>()?;
+        String::from_utf16(&words).ok()
+    };
+    let text = match bytes {
+        [0xFF, 0xFE, rest @ ..] => utf16(rest, u16::from_le_bytes),
+        [0xFE, 0xFF, rest @ ..] => utf16(rest, u16::from_be_bytes),
+        [0xEF, 0xBB, 0xBF, rest @ ..] => String::from_utf8(rest.to_vec()).ok(),
+        _ => String::from_utf8(bytes.to_vec()).ok(),
+    };
+    text.filter(|t| !t.contains('\0'))
+}
+
 impl SettingsState {
     pub fn load() -> SettingsState {
         let mut s = SettingsState {
@@ -92,9 +124,9 @@ impl SettingsState {
             license_error: None,
             logo: None,
         };
-        if let Ok(text) = std::fs::read_to_string(settings_file()) {
-            // Tolerate a UTF-8 BOM and stray spaces: the file may be edited by hand.
-            for line in text.trim_start_matches('\u{feff}').lines() {
+        if let Some(text) = read_settings(&settings_file()) {
+            // Tolerate stray spaces: the file may be edited by hand.
+            for line in text.lines() {
                 match line.trim().split_once('=').map(|(k, v)| (k.trim(), v.trim())) {
                     Some(("hotkey", v)) if crate::tray::parse(v).is_some() => s.hotkey = Some(v.to_string()),
                     Some(("theme", "light")) => s.theme = ThemeChoice::Light,
@@ -1369,4 +1401,37 @@ fn toggle(ui: &mut egui::Ui, p: &Palette, on: &mut bool, name: &str) -> egui::Re
     let x = egui::lerp(rect.left() + 12.0..=rect.right() - 12.0, t);
     ui.painter().circle_filled(egui::pos2(x, rect.center().y), 8.5, Color32::WHITE);
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn settings_saved_by_hand_in_other_encodings_are_read() {
+        let text = "theme=dark\n";
+        let le: Vec<u8> = [0xFF, 0xFE].into_iter().chain(text.encode_utf16().flat_map(u16::to_le_bytes)).collect();
+        let be: Vec<u8> = [0xFE, 0xFF].into_iter().chain(text.encode_utf16().flat_map(u16::to_be_bytes)).collect();
+        assert_eq!(decode_settings(text.as_bytes()).as_deref(), Some(text));
+        assert_eq!(decode_settings(&[b"\xEF\xBB\xBF".as_slice(), text.as_bytes()].concat()).as_deref(), Some(text));
+        assert_eq!(decode_settings(&le).as_deref(), Some(text));
+        assert_eq!(decode_settings(&be).as_deref(), Some(text));
+        // UTF-16 without a BOM, or cut in half: not read
+        assert_eq!(decode_settings(&le[2..]), None);
+        assert_eq!(decode_settings(&le[..le.len() - 1]), None);
+    }
+
+    #[test]
+    fn an_unreadable_settings_file_is_moved_aside() {
+        let dir = std::env::temp_dir().join(format!("whereti-settings-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (file, aside) = (dir.join("settings.txt"), dir.join("settings.unreadable.txt"));
+        assert_eq!(read_settings(&file), None);
+        std::fs::write(&aside, "older").unwrap();
+        std::fs::write(&file, b"theme=\xFF\n").unwrap();
+        assert_eq!(read_settings(&file), None);
+        assert!(!file.exists());
+        assert_eq!(std::fs::read(&aside).unwrap(), b"theme=\xFF\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

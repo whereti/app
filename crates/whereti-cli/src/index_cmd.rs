@@ -53,7 +53,7 @@ pub fn run(args: IndexArgs) -> Result<(), String> {
     let exclusions = Exclusions::defaults(windows_dir.as_deref());
     let t = Instant::now();
     let (index, stats) = build(scans, &exclusions);
-    println!(
+    outln!(
         "  build    {} kept, {} excluded ({}) in {}",
         num(stats.kept as u64),
         num(stats.excluded as u64),
@@ -61,15 +61,15 @@ pub fn run(args: IndexArgs) -> Result<(), String> {
         dur(t.elapsed())
     );
     let mem = index.memory_bytes();
-    println!("  memory   {} = {:.1} B/entry", bytes(mem as u64), mem as f64 / index.len().max(1) as f64);
+    outln!("  memory   {} = {:.1} B/entry", bytes(mem as u64), mem as f64 / index.len().max(1) as f64);
 
     if path == system::default_index_path() {
         system::ensure_data_dir().map_err(|e| format!("cannot create {}: {e}", system::data_dir().display()))?;
     }
     let t = Instant::now();
     let size = snapshot::save(&index, &path).map_err(|e| format!("cannot save {}: {e}", path.display()))?;
-    println!("  saved    {} ({}) in {}", path.display(), bytes(size), dur(t.elapsed()));
-    println!("  total    {}", dur(total.elapsed()));
+    outln!("  saved    {} ({}) in {}", path.display(), bytes(size), dur(t.elapsed()));
+    outln!("  total    {}", dur(total.elapsed()));
     print_memory();
     Ok(())
 }
@@ -79,8 +79,8 @@ pub(crate) fn scan_volume(letter: char, threads: usize) -> Result<Option<VolumeS
     let t = Instant::now();
     let scan = whereti_engine::sync::scan_volume(letter, threads)?;
     match &scan {
-        Some(s) => println!("  {letter}:  scanned {} entries in {}", num(s.scan.entries.len() as u64), dur(t.elapsed())),
-        None => println!("  {letter}:  skipped (not NTFS)"),
+        Some(s) => outln!("  {letter}:  scanned {} entries in {}", num(s.scan.entries.len() as u64), dur(t.elapsed())),
+        None => outln!("  {letter}:  skipped (not NTFS)"),
     }
     Ok(scan)
 }

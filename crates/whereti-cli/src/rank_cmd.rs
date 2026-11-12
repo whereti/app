@@ -179,22 +179,22 @@ pub fn run(args: RankArgs) -> Result<(), String> {
             misses.push((place - k + 1, c, first));
         }
     }
-    println!("{} searches from {}", cases.len(), path.display());
+    outln!("{} searches from {}", cases.len(), path.display());
     if skipped > 0 {
-        println!("({skipped} more not counted: their file is gone or in a skipped folder)");
+        outln!("({skipped} more not counted: their file is gone or in a skipped folder)");
     }
-    println!();
-    println!("{:<34}{:>6}  {:>6}  {:>6}  {:>6}   MRR", "", "1st", "top 3", "top 10", "missed");
+    outln!();
+    outln!("{:<34}{:>6}  {:>6}  {:>6}  {:>6}   MRR", "", "1st", "top 3", "top 10", "missed");
     for (w, label) in [(0, "one word"), (1, "two words")] {
-        println!("{}", scores[w][0].line(&format!("{label}, without what you open")));
-        println!("{}", scores[w][1].line(&format!("{label}, as the app ranks")));
+        outln!("{}", scores[w][0].line(&format!("{label}, without what you open")));
+        outln!("{}", scores[w][1].line(&format!("{label}, as the app ranks")));
     }
     misses.sort_by_key(|m| std::cmp::Reverse(m.0));
     if !misses.is_empty() && args.worst > 0 {
-        println!("\nworst, as the app ranks (place, search, expected; then what came first):");
+        outln!("\nworst, as the app ranks (place, search, expected; then what came first):");
         for (rank, c, first) in misses.iter().take(args.worst) {
             let place = if *rank > DEPTH as usize { format!(">{DEPTH}") } else { rank.to_string() };
-            println!("  {place:>4}  {:<24} {}\n        first: {first}", format!("\"{}\"", c.query), c.expected);
+            outln!("  {place:>4}  {:<24} {}\n        first: {first}", format!("\"{}\"", c.query), c.expected);
         }
     }
     Ok(())

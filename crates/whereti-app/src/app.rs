@@ -89,6 +89,8 @@ fn service_text(msg: &str) -> String {
         // warnings under the results
         whereti_i18n::tr_both("content: and loc: cannot be negated (!) or be one of several choices with other kinds of words; that part of the search is not applied"),
         whereti_i18n::tr_both("dupe: compares files by name, size and content; content: and loc: are not applied to it"),
+        whereti_i18n::tr_both("the search is too long; use fewer words or conditions"),
+        whereti_i18n::tr_both("not every set of same-size files was compared yet; search again to go on, or narrow it (size:, ext:, path:)"),
     ];
     known.iter().fold(msg.to_string(), |text, (en, local)| text.replace(en, local))
 }
@@ -110,6 +112,9 @@ pub struct WheretiApp {
     /// Enter (or Ctrl+Enter: `true`) pressed before the results of the
     /// search typed came, and that search's generation: done when they come.
     pending_open: Option<(bool, u64)>,
+    /// Network files being opened (the NAS may take a while): not opened
+    /// a second time meanwhile.
+    opening: std::collections::HashSet<String>,
     total: u64,
     /// `rows[content_start..]` were found in file contents (not by name).
     content_start: Option<usize>,
@@ -237,6 +242,7 @@ impl WheretiApp {
             rows: Vec::new(),
             rows_generation: 0,
             pending_open: None,
+            opening: std::collections::HashSet::new(),
             total: 0,
             content_start: None,
             close_start: None,
@@ -751,11 +757,18 @@ impl WheretiApp {
         } else if crate::win::is_network_path(&path) {
             // a NAS asleep can take a while to answer: opened off this
             // thread, and the window goes once it is open
+            if !self.opening.insert(path.clone()) {
+                return; // already on its way (a second Enter or double-click)
+            }
             let generation = self.generation;
-            self.background.run(move || {
-                let result = shell::open_and_wait(&path);
-                Finished::Opened { path, generation, result }
-            });
+            let job_path = path.clone();
+            if !self.background.run(move || {
+                let result = shell::open_and_wait(&job_path);
+                Finished::Opened { path: job_path, generation, result }
+            }) {
+                self.opening.remove(&path);
+                return;
+            }
             self.flash(tr("Opening…"));
             return;
         } else {
@@ -840,7 +853,9 @@ impl WheretiApp {
                 _ => false,
             })
         });
-        let current = self.rows_generation == self.generation && !typing;
+        // "The service is not running" hides the rows: no file key acts on them
+        let offline = self.offline.is_some();
+        let current = self.rows_generation == self.generation && !typing && !offline;
         if current {
             self.file_keys(ctx);
         }
@@ -917,6 +932,8 @@ impl WheretiApp {
             self.list_moved = true;
             // moving in the list: the user picks the row, not Enter pressed before
             self.pending_open = None;
+            // and Ctrl+C is for the file again, not for a label clicked before
+            ctx.with_plugin(|s: &mut egui::text_selection::LabelSelectionState| s.clear_selection());
         }
         if menu && current && !self.is_launch(self.selected) {
             if let (Some(hwnd), Some(row)) = (self.hwnd, self.rows.get(self.selected)) {
@@ -925,7 +942,9 @@ impl WheretiApp {
                 }
             }
         }
-        if (ctrl_enter || enter) && !current {
+        if offline {
+            // nothing to open on screen
+        } else if (ctrl_enter || enter) && !current {
             // a letter typed this frame starts the next search after these keys
             self.pending_open = Some((ctrl_enter, self.generation + typing as u64));
         } else if ctrl_enter {
@@ -964,6 +983,8 @@ impl WheretiApp {
         }
         let range = self.search_id.and_then(|id| egui::text_edit::TextEditState::load(ctx, id)).and_then(|s| s.cursor.char_range());
         let selected_text = range.is_some_and(|r| !r.is_empty());
+        // text selected in a label (the path above the preview): Ctrl+C is for it
+        let label_text = ctx.with_plugin(|s: &mut egui::text_selection::LabelSelectionState| s.has_selection()).unwrap_or(false);
         let at_end = range.is_none_or(|r| r.primary.index.0 >= self.query.chars().count());
         // Delete acts on the file only when the list is what the user is in:
         // they moved in the list since they last typed, or the box is empty
@@ -971,7 +992,7 @@ impl WheretiApp {
         // with Delete is still the box). Never with Shift, Ctrl or Alt held.
         let list_focus = delete_is_for_list(self.query.is_empty(), self.list_moved, self.typed_since_shown);
         let (rename, delete, copy) = ctx.input_mut(|i| {
-            let copy = !selected_text && i.events.iter().any(|e| matches!(e, egui::Event::Copy));
+            let copy = !selected_text && !label_text && i.events.iter().any(|e| matches!(e, egui::Event::Copy));
             if copy {
                 i.events.retain(|e| !matches!(e, egui::Event::Copy));
             }
@@ -1040,7 +1061,11 @@ impl WheretiApp {
     fn deleted(&mut self, path: &str, permanent: bool, result: Result<bool, String>) {
         match result {
             Ok(true) => {
-                if let Some(i) = self.rows.iter().position(|r| r.path == path) {
+                // the row, and (a folder) the rows of what was inside it
+                // (the apps on top are not files: left as they are)
+                let (inside, apps) = (format!("{path}\\"), self.launch_items.len());
+                let gone = |r: &Row| r.path == path || r.path.starts_with(&inside);
+                while let Some(i) = self.rows.iter().skip(apps).position(gone).map(|i| i + apps) {
                     self.remove_row(i);
                 }
                 self.flash(if permanent { tr("Deleted") } else { tr("Moved to the Recycle Bin") });
@@ -1054,16 +1079,19 @@ impl WheretiApp {
     fn take_finished(&mut self, ctx: &egui::Context) {
         while let Ok(done) = self.background.rx.try_recv() {
             match done {
-                Finished::Opened { path, generation, result } => match result {
-                    Ok(()) => {
-                        crate::usage::record(&path);
-                        // unless the user went on to something else meanwhile
-                        if self.visible && generation == self.generation {
-                            self.hide(ctx);
+                Finished::Opened { path, generation, result } => {
+                    self.opening.remove(&path);
+                    match result {
+                        Ok(()) => {
+                            crate::usage::record(&path);
+                            // unless the user went on to something else meanwhile
+                            if self.visible && generation == self.generation {
+                                self.hide(ctx);
+                            }
                         }
+                        Err(e) => self.flash(e),
                     }
-                    Err(e) => self.flash(e),
-                },
+                }
                 Finished::Copied(result) => self.copied(result),
                 Finished::Deleted { path, permanent, result } => self.deleted(&path, permanent, result),
                 Finished::Renamed { path, new_path, result } => self.renamed(&path, &new_path, result),
@@ -1267,7 +1295,7 @@ impl WheretiApp {
 
     fn apply_rename(&mut self) {
         let Some(r) = self.renaming.as_mut() else { return };
-        let name = r.name.trim().to_string();
+        let name = windows_name(&r.name).to_string();
         let old = r.path.rsplit('\\').next().unwrap_or("");
         if name.is_empty() || name == old {
             self.renaming = None;
@@ -2030,8 +2058,10 @@ impl WheretiApp {
         if clicked {
             match &mut self.scan {
                 None => {
-                    self.scan = Some(Scan { generation: self.generation, query: self.query.clone(), looked: 0, total: 0, found: 0, running: true });
-                    self.searcher.scan(crate::searcher::ScanJob { generation: self.generation, query: self.query.clone(), skip: 0 });
+                    // with the filter tab, as the search itself
+                    let query = self.effective_query().0;
+                    self.scan = Some(Scan { generation: self.generation, query: query.clone(), looked: 0, total: 0, found: 0, running: true });
+                    self.searcher.scan(crate::searcher::ScanJob { generation: self.generation, query, skip: 0 });
                 }
                 Some(s) => s.running = false, // Stop: the next step is simply not asked for
             }
@@ -2949,6 +2979,12 @@ impl WheretiApp {
     }
 }
 
+/// A new name as Windows keeps it: no spaces around it and no dots at its
+/// end ("report. " is saved as "report").
+fn windows_name(typed: &str) -> &str {
+    typed.trim().trim_end_matches(['.', ' '])
+}
+
 /// Windows' "Animation effects" setting (Accessibility, Visual effects).
 /// Whether Delete is meant for the selected file and not for the search
 /// text: the user moved in the list since they last typed, or the box is
@@ -3439,10 +3475,10 @@ impl Background {
 
     /// Runs `job` on a new thread with OLE (and so COM) set up, as
     /// Explorer's file operations and the clipboard need, and wakes the
-    /// window with what it returns.
-    fn run(&self, job: impl FnOnce() -> Finished + Send + 'static) {
+    /// window with what it returns. False if the thread could not start.
+    fn run(&self, job: impl FnOnce() -> Finished + Send + 'static) -> bool {
         let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
-        let _ = std::thread::Builder::new().name("file action".into()).spawn(move || {
+        std::thread::Builder::new().name("file action".into()).spawn(move || {
             // SAFETY: once on this new thread, undone below before it ends.
             let ole = unsafe { windows::Win32::System::Ole::OleInitialize(None) }.is_ok();
             let done = job();
@@ -3452,13 +3488,23 @@ impl Background {
             }
             let _ = tx.send(done);
             ctx.request_repaint();
-        });
+        })
+        .is_ok()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_new_name_loses_what_windows_drops() {
+        assert_eq!(windows_name("  new.txt "), "new.txt");
+        assert_eq!(windows_name("new."), "new");
+        assert_eq!(windows_name("new . . "), "new");
+        assert_eq!(windows_name(".gitignore"), ".gitignore");
+        assert_eq!(windows_name(" . . "), "");
+    }
 
     #[test]
     fn delete_is_for_the_file_only_when_the_user_is_in_the_list() {

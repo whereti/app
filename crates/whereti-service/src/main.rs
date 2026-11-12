@@ -64,9 +64,13 @@ fn flag_value<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
 
 fn service_main(_args: Vec<OsString>) {
     if let Err(e) = run_service() {
-        if let Ok(log) = open_log() {
-            log.log(format!("service failed: {e}"));
-        }
+        log_failure(&e);
+    }
+}
+
+fn log_failure(e: &str) {
+    if let Ok(log) = open_log() {
+        log.log(format!("service failed: {e}"));
     }
 }
 
@@ -75,6 +79,8 @@ fn open_log() -> Result<Logger, String> {
     Logger::file(&dir.join("service.log"), false).map_err(|e| e.to_string())
 }
 
+/// An error only when the service could not even tell Windows how it is;
+/// a start that fails after that is logged and reported as a failure.
 fn run_service() -> Result<(), String> {
     let (stop_tx, stop_rx) = mpsc::channel();
     let handler = move |control| match control {
@@ -89,19 +95,32 @@ fn run_service() -> Result<(), String> {
         _ => ServiceControlHandlerResult::NotImplemented,
     };
     let status = service_control_handler::register(SERVICE_NAME, handler).map_err(|e| e.to_string())?;
-    let set = |state, accept, wait: u64| {
+    let report = |state, accept, wait: u64, exit_code| {
         let _ = status.set_service_status(ServiceStatus {
             service_type: ServiceType::OWN_PROCESS,
             current_state: state,
             controls_accepted: accept,
-            exit_code: ServiceExitCode::Win32(0),
+            exit_code,
             checkpoint: 0,
             wait_hint: Duration::from_secs(wait),
             process_id: None,
         });
     };
+    let set = |state: ServiceState, accept: ServiceControlAccept, wait: u64| report(state, accept, wait, ServiceExitCode::NO_ERROR);
     set(ServiceState::StartPending, ServiceControlAccept::empty(), 10);
+    if let Err(e) = serve(&set, stop_rx) {
+        // written down first: the process may end once it says stopped
+        log_failure(&e);
+        // stopped with an error, not cleanly: Windows then applies the
+        // restart-on-failure actions set at install
+        report(ServiceState::Stopped, ServiceControlAccept::empty(), 0, ServiceExitCode::ServiceSpecific(1));
+    }
+    Ok(())
+}
 
+/// Starts the engine and the pipe, runs until told to stop, and stops
+/// them. An error before it runs leaves the stopped status to the caller.
+fn serve(set: &dyn Fn(ServiceState, ServiceControlAccept, u64), stop_rx: mpsc::Receiver<()>) -> Result<(), String> {
     let log = open_log()?;
     log.log(format!("whereti service {} starting", env!("CARGO_PKG_VERSION")));
     let engine = Engine::start(Config::default(), log);
@@ -114,7 +133,6 @@ fn run_service() -> Result<(), String> {
         Err(e) => {
             engine.log(format!("cannot open {}: {e}", whereti_ipc::PIPE_NAME));
             engine.stop();
-            set(ServiceState::Stopped, ServiceControlAccept::empty(), 0);
             return Err(e.to_string());
         }
     };

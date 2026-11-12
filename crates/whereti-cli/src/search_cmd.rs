@@ -74,17 +74,17 @@ fn run_via_service(mut client: Client, args: &SearchArgs) -> Result<(), String> 
     let round_trip = t.elapsed();
     let tz = date_ctx();
     for w in &reply.warnings {
-        println!("note: {w}");
+        outln!("note: {w}");
     }
     let first_close = reply.rows.len() - (reply.close as usize).min(reply.rows.len());
     for (k, r) in reply.rows.iter().enumerate() {
         if k == first_close {
-            println!("close matches (one letter off):");
+            outln!("close matches (one letter off):");
         }
         print_row(r, &tz);
     }
-    println!();
-    println!(
+    outln!();
+    outln!(
         "{} results · {} in the service, {} round trip (via the whereti service)",
         num(reply.total),
         dur_fine(Duration::from_micros(reply.micros)),
@@ -102,16 +102,16 @@ fn run_via_service(mut client: Client, args: &SearchArgs) -> Result<(), String> 
         let named: std::collections::HashSet<&str> = reply.rows.iter().map(|r| r.path.as_str()).collect();
         let extra: Vec<&Row> = c.rows.iter().filter(|r| !named.contains(r.path.as_str())).collect();
         if !extra.is_empty() || c.note.is_some() {
-            println!();
-            println!("found in content:");
+            outln!();
+            outln!("found in content:");
             for r in &extra {
                 print_row(r, &tz);
             }
             if let Some(n) = &c.note {
-                println!("note: {n}");
+                outln!("note: {n}");
             }
-            println!();
-            println!(
+            outln!();
+            outln!(
                 "{} files contain the words · {} in the service, {} round trip",
                 num(c.total),
                 dur_fine(Duration::from_micros(c.micros)),
@@ -137,7 +137,7 @@ fn run_via_service(mut client: Client, args: &SearchArgs) -> Result<(), String> 
 
 fn print_row(r: &Row, tz: &whereti_query::DateCtx) {
     let size = if r.is_dir { "<dir>".to_string() } else { bytes(r.size) };
-    println!("{size:>10}  {}  {}", local_time(r.modified, tz), r.path);
+    outln!("{size:>10}  {}  {}", local_time(r.modified, tz), r.path);
 }
 
 fn run_local(args: &SearchArgs) -> Result<(), String> {
@@ -176,12 +176,12 @@ fn run_local(args: &SearchArgs) -> Result<(), String> {
     let first = t.elapsed();
 
     for w in &results.warnings {
-        println!("note: {w}");
+        outln!("note: {w}");
     }
     let first_close = results.hits.len() - results.close;
     for (k, &i) in results.hits.iter().enumerate() {
         if k == first_close {
-            println!("close matches (one letter off):");
+            outln!("close matches (one letter off):");
         }
         let row = Row {
             path: index.full_path(i),
@@ -192,8 +192,8 @@ fn run_local(args: &SearchArgs) -> Result<(), String> {
         };
         print_row(&row, &ctx);
     }
-    println!();
-    println!(
+    outln!();
+    outln!(
         "{} results · searched {} entries in {} · index loaded in {}",
         num(results.total as u64),
         num(index.len() as u64),
@@ -225,7 +225,7 @@ fn print_percentiles(label: &str, mut times: Vec<Duration>) {
     }
     times.sort_unstable();
     let pct = |p: f64| times[((times.len() - 1) as f64 * p).round() as usize];
-    println!(
+    outln!(
         "{label}: min {} · p50 {} · p99 {} · max {}",
         dur_fine(times[0]),
         dur_fine(pct(0.5)),
@@ -254,21 +254,21 @@ pub fn status(args: StatusArgs) -> Result<(), String> {
         Response::Status(s) => s,
         other => return Err(format!("unexpected reply: {other:?}")),
     };
-    println!("state          {}", s.state);
-    println!("entries        {}", num(s.entries));
+    outln!("state          {}", s.state);
+    outln!("entries        {}", num(s.entries));
     for v in &s.volumes {
-        println!("volume         {}:  journal position {}", v.letter, num(v.next_usn as u64));
+        outln!("volume         {}:  journal position {}", v.letter, num(v.next_usn as u64));
     }
-    println!("last change    {}", s.last_change_secs.map_or("none yet".into(), |x| format!("{x} s ago")));
-    println!("open files     {} (re-read every 30 s until closed)", num(s.open_files));
-    println!(
+    outln!("last change    {}", s.last_change_secs.map_or("none yet".into(), |x| format!("{x} s ago")));
+    outln!("open files     {} (re-read every 30 s until closed)", num(s.open_files));
+    outln!(
         "uptime         {} s · CPU used {} · memory {}",
         s.uptime_secs,
         dur(Duration::from_millis(s.cpu_ms)),
         bytes(s.private_bytes)
     );
     let c = &s.content;
-    println!(
+    outln!(
         "content        {} · {} documents, {} waiting, {} unreadable · {} on disk",
         c.state,
         num(c.files),
@@ -276,16 +276,16 @@ pub fn status(args: StatusArgs) -> Result<(), String> {
         num(c.failed),
         bytes(c.disk_bytes)
     );
-    println!("photos         {}", if c.tags.is_empty() { "off" } else { c.tags.as_str() });
+    outln!("photos         {}", if c.tags.is_empty() { "off" } else { c.tags.as_str() });
     match &s.work_folders {
-        Some(f) if !f.is_empty() => println!("works in       {}", f.join(" · ")),
-        Some(_) => println!("works in       (nothing learnt yet)"),
-        None => println!("works in       off"),
+        Some(f) if !f.is_empty() => outln!("works in       {}", f.join(" · ")),
+        Some(_) => outln!("works in       (nothing learnt yet)"),
+        None => outln!("works in       off"),
     }
     if args.log {
-        println!();
+        outln!();
         for line in &s.recent_log {
-            println!("{line}");
+            outln!("{line}");
         }
     }
     Ok(())
@@ -367,8 +367,8 @@ pub fn exclusions(args: ExclusionsArgs) -> Result<(), String> {
             // with what each one left out at the last scan, when the service knows
             for p in &paths {
                 match cfg.skipped.iter().find(|(r, _)| r == p) {
-                    Some((_, n)) => println!("{n:>10}  {p}"),
-                    None => println!("{:>10}  {p}", "-"),
+                    Some((_, n)) => outln!("{n:>10}  {p}"),
+                    None => outln!("{:>10}  {p}", "-"),
                 }
             }
             return Ok(());
@@ -390,7 +390,7 @@ pub fn exclusions(args: ExclusionsArgs) -> Result<(), String> {
     }
     match client.call(&Request::SetExclusions { paths }).map_err(|e| e.to_string())? {
         Response::Ok => {
-            println!("saved - the service is rebuilding the index (a few seconds); `wt status` shows progress");
+            outln!("saved - the service is rebuilding the index (a few seconds); `wt status` shows progress");
             Ok(())
         }
         Response::Error(e) => Err(e),
@@ -430,7 +430,7 @@ pub fn content(args: ContentArgs) -> Result<(), String> {
         };
         return match client.call(&Request::SetPhotoTags { on }).map_err(|e| e.to_string())? {
             Response::Ok => {
-                println!("recognising objects and animals in photos: {}", if on { "on (the model downloads first)" } else { "off" });
+                outln!("recognising objects and animals in photos: {}", if on { "on (the model downloads first)" } else { "off" });
                 Ok(())
             }
             Response::Error(e) => Err(e),
@@ -440,7 +440,7 @@ pub fn content(args: ContentArgs) -> Result<(), String> {
     match (args.action.as_str(), args.path) {
         ("list", _) => {
             for p in &paths {
-                println!("{p}");
+                outln!("{p}");
             }
             return Ok(());
         }
@@ -462,7 +462,7 @@ pub fn content(args: ContentArgs) -> Result<(), String> {
     }
     match client.call(&Request::SetContentFolders { paths }).map_err(|e| e.to_string())? {
         Response::Ok => {
-            println!("saved - the service indexes the difference in the background; `wt status` shows progress");
+            outln!("saved - the service indexes the difference in the background; `wt status` shows progress");
             Ok(())
         }
         Response::Error(e) => Err(e),

@@ -45,7 +45,7 @@ use crate::engine::Shared;
 use crate::system::{self, Background};
 
 /// Documents larger than this are recorded as too large, not read.
-const MAX_DOCUMENT: u64 = 64 << 20;
+pub(crate) const MAX_DOCUMENT: u64 = 64 << 20;
 /// Of a text file, only the beginning is indexed.
 const TEXT_HEAD: u64 = 8 << 20;
 /// Characters indexed from an Outlook mailbox (its newest messages).
@@ -142,11 +142,12 @@ pub struct Content {
     dir: PathBuf,
     /// Properties of photos, music, videos and Office files (props.rs).
     props: Mutex<crate::props::PropStore>,
-    /// Files whose reading once took the service down (a parser crash
-    /// aborts the process): never read in-process again (crash.txt).
-    crashed: Mutex<HashSet<u64>>,
-    /// The files being read in-process now (reading.txt).
-    reading_now: Mutex<Vec<u64>>,
+    /// Files whose reading took the service down (a parser crash aborts
+    /// the process): not read in-process again while unchanged (crash.txt).
+    crashed: Mutex<Crashed>,
+    /// The files being read in-process now, with their size and date
+    /// (reading.txt).
+    reading_now: Mutex<Vec<(u64, Stamp)>>,
     /// Pictures wait for the round of the models after this one: a search
     /// of the documents not indexed yet leaves them out.
     pictures_wait: AtomicBool,
@@ -593,14 +594,14 @@ impl Content {
     /// Notes a file being read in-process, `on` before and off after (a
     /// crash then names it). The indexing and a search of the documents not
     /// indexed yet may each be reading one: every one is listed.
-    fn reading(&self, key: u64, on: bool) {
+    fn reading(&self, c: &Candidate, on: bool) {
         let mut now = self.reading_now.lock();
         if on {
-            now.push(key);
-        } else if let Some(i) = now.iter().position(|&k| k == key) {
+            now.push((c.key, (c.size, c.modified)));
+        } else if let Some(i) = now.iter().position(|&(k, _)| k == c.key) {
             now.swap_remove(i);
         }
-        let text: String = now.iter().map(|k| format!("{k}\n")).collect();
+        let text: String = now.iter().map(|(k, (size, modified))| format!("{k} {size} {modified}\n")).collect();
         let _ = std::fs::write(self.dir.join("reading.txt"), text);
     }
 
@@ -994,13 +995,19 @@ impl Content {
         // photos, pictures, music and videos: not counted as documents
         *self.not_documents.lock() = wanted.values().filter(|c| c.media_only || c.photo_only || is_picture(&c.path)).map(|c| c.key).collect();
         self.locked.lock().retain(|k, _| wanted.contains_key(k));
-        let crashed = self.crashed.lock().clone();
+        let crashed = {
+            let mut crashed = self.crashed.lock();
+            if crashed.tidy(&wanted, known) {
+                crashed.save(&self.dir.join("crash.txt"));
+            }
+            crashed.clone()
+        };
         // Recognition on: photos not looked at yet by the model are read again;
         // off: photos that carry tags are read again without them. Kept per
         // photo (props `tagged`), so a pass cut short goes on after a restart.
         // While the model fails, the photos wait for it (nothing is read again).
         let want_tags = self.tags_ready();
-        let mut tagger = self.tagger_for_round(wanted.values().filter(|c| is_picture(&c.path) && !crashed.contains(&c.key)));
+        let mut tagger = self.tagger_for_round(wanted.values().filter(|c| is_picture(&c.path) && !crashed.skips(c)));
         let can_tag = tagger.is_some();
         // photos' text (OCR): wherever the photo is, when Windows has OCR
         let ocr_on = sandbox.is_some() && whereti_extract::ocr_available();
@@ -1009,7 +1016,7 @@ impl Content {
             let redo: Vec<u64> = wanted
                 .values()
                 .filter(|c| is_picture(&c.path) && known.contains_key(&c.key) && crate::props::has_props(&ext_of(&c.path)))
-                .filter(|c| !crashed.contains(&c.key))
+                .filter(|c| !crashed.skips(c))
                 // read without the model but should be (on), or with it and should not be (off);
                 // photos with no properties yet are only redone when recognition is on
                 .filter(|c| match props.get(c.key) {
@@ -1048,7 +1055,7 @@ impl Content {
                 .filter(|c| {
                     !c.photo_only
                         && !c.media_only
-                        && !crashed.contains(&c.key)
+                        && !crashed.skips(c)
                         && known.get(&c.key).is_some_and(|i| i.size == c.size && i.modified == c.modified && i.status == Status::Ok)
                         && !vectors.contains(c.key)
                         && !is_picture(&c.path)
@@ -1069,7 +1076,7 @@ impl Content {
                     known.get(&c.key).is_some_and(|i| i.size == c.size && i.modified == c.modified)
                         && !store.contains(c.key)
                         && !for_meaning.contains(&c.key)
-                        && !crashed.contains(&c.key)
+                        && !crashed.skips(c)
                         && crate::props::has_props(&ext_of(&c.path))
                 })
                 .map(|c| Candidate { props_only: true, media_only: false, photo_only: false, path: c.path.clone(), ..*c })
@@ -1205,8 +1212,9 @@ impl Content {
             let mut kept: Option<Vec<u16>> = None;
             // the file's work; `false`: nothing was read (no rest after it)
             let worked = 'file: {
-                // a file that once crashed a parser is not read in-process again
-                if crashed.contains(&c.key) {
+                // a file that crashed a parser is not read in-process again
+                // (until it changes)
+                if crashed.skips(&c) {
                     if !c.props_only && !c.meaning_only {
                         let what = Indexed { size: c.size, modified: c.modified, status: Status::Failed };
                         index.put(c.key, what, "").map_err(|e| e.to_string())?;
@@ -1217,7 +1225,7 @@ impl Content {
                 }
                 // the crash marker is set only around what runs in this process
                 // (a sandboxed read cut short by a shutdown is no crash)
-                let mark = |on: bool| self.reading(c.key, on);
+                let mark = |on: bool| self.reading(&c, on);
                 // read again for its meaning: its properties only when missing
                 let ext = ext_of(&c.path);
                 let props_wanted = crate::props::has_props(&ext) && !(c.meaning_only && self.props.lock().contains(c.key));
@@ -1639,6 +1647,23 @@ impl ScanPlan {
         let has = |w: &String| folded.contains(w.as_str());
         self.needles.iter().all(has) && self.any.iter().all(|list| list.iter().any(|entry| entry.iter().all(has)))
     }
+
+    /// The steps count every document of the plan ("looked in 120 of
+    /// 300"): someone who cannot list another account's folders does not
+    /// count the documents in them either (one check per folder, without
+    /// the name index held). Each document is still checked for reading
+    /// before it is opened.
+    pub fn keep_listed(&mut self, caller: &dyn Caller) {
+        if caller.is_admin() {
+            return;
+        }
+        let folder = |p: &str| p.rsplit_once('\\').map_or(String::new(), |(f, _)| f.to_string());
+        let mut folders: Vec<String> = self.candidates.iter().map(|c| folder(&c.path)).collect();
+        folders.sort_unstable();
+        folders.dedup();
+        let ok: HashSet<String> = folders.iter().zip(caller.can_list(&folders)).filter(|(_, ok)| *ok).map(|(f, _)| f.clone()).collect();
+        self.candidates.retain(|c| ok.contains(&folder(&c.path)));
+    }
 }
 
 impl Content {
@@ -1669,7 +1694,7 @@ impl Content {
         let mut candidates: Vec<Candidate> = files_in(idx, &self.folders(), &[])
             .into_values()
             .filter(|c| !known.contains_key(&c.key) && !c.photo_only && !c.media_only && !is_mailbox(&c.path))
-            .filter(|c| !crashed.contains(&c.key) && !(pictures_wait && is_picture(&c.path)))
+            .filter(|c| !crashed.skips(c) && !(pictures_wait && is_picture(&c.path)))
             .collect();
         drop(known);
         if !filters.clauses.is_empty() {
@@ -1709,7 +1734,7 @@ impl Content {
                 i += 1;
                 if ok {
                     // parsed in this process (a photo's place): marked like the indexing does
-                    if let Ok((_, text)) = extract(c, sandbox.as_ref(), None, None, &mut Looked::No, &|on| self.reading(c.key, on)) {
+                    if let Ok((_, text)) = extract(c, sandbox.as_ref(), None, None, &mut Looked::No, &|on| self.reading(c, on)) {
                         let folded = fold(&text);
                         if plan.matches(&folded) {
                             rows.push(Row { path: c.path.clone(), is_dir: false, size: c.size, modified: c.modified, flags: 0 });
@@ -1870,29 +1895,117 @@ const PHOTO_EXTS: &[&str] = whereti_query::kinds::PHOTOS;
 /// What cameras and phones write (PHOTOS without PNG and WebP).
 const CAMERA_EXTS: &[&str] = &["jpg", "jpeg", "jpe", "jfif", "heic", "heif", "hif", "avif", "jxl", "tif", "tiff"];
 
-/// Keys of files whose in-process reading crashed the service: those
-/// named in reading.txt at start (they were being read when the service
-/// went down) are added to crash.txt for good.
-fn load_crashed(dir: &Path, log: &dyn Fn(String)) -> HashSet<u64> {
+/// A file's size and last write (minutes), as the name index has them.
+type Stamp = (u64, u32);
+
+/// A file was being read this many times when the service went down: from
+/// then on it is skipped. Once is no proof (a power cut, a restart).
+const CRASHES_TO_SKIP: u8 = 2;
+
+/// Files whose in-process reading was under way when the service went
+/// down (crash.txt, one `key size modified times` per line): by key, the
+/// file as it was then. A file is skipped only while it stays so: a new
+/// version, or another file given the same record later, is read again.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Crashed(HashMap<u64, Crash>);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Crash {
+    /// `None`: from a crash.txt of an older version, which kept only keys.
+    stamp: Option<Stamp>,
+    times: u8,
+}
+
+impl Crashed {
+    fn parse(text: &str) -> Crashed {
+        let mut out = HashMap::new();
+        for line in text.lines() {
+            let mut f = line.split_whitespace();
+            let Some(key) = f.next().and_then(|k| k.parse().ok()) else { continue };
+            let crash = match (f.next(), f.next(), f.next()) {
+                // an older line: that file was skipped already, and stays so
+                // until the content index's own record of it binds it (`tidy`)
+                (None, _, _) => Crash { stamp: None, times: CRASHES_TO_SKIP },
+                (size, modified, times) => Crash {
+                    stamp: size.and_then(|s| s.parse().ok()).zip(modified.and_then(|m| m.parse().ok())),
+                    times: times.and_then(|t| t.parse().ok()).unwrap_or(1),
+                },
+            };
+            out.insert(key, crash);
+        }
+        Crashed(out)
+    }
+
+    fn save(&self, path: &Path) {
+        let text: String = self
+            .0
+            .iter()
+            .map(|(k, c)| match c.stamp {
+                Some((size, modified)) => format!("{k} {size} {modified} {}\n", c.times),
+                None => format!("{k} ? ? {}\n", c.times),
+            })
+            .collect();
+        let _ = std::fs::write(path, text);
+    }
+
+    /// Not read in-process: the service went down while reading it, as it
+    /// is now, CRASHES_TO_SKIP times.
+    fn skips(&self, c: &Candidate) -> bool {
+        self.0.get(&c.key).is_some_and(|x| x.times >= CRASHES_TO_SKIP && x.stamp.is_none_or(|s| s == (c.size, c.modified)))
+    }
+
+    /// The service went down while `key` (as `stamp`) was read: how many
+    /// times now, for that file as it is.
+    fn blame(&mut self, key: u64, stamp: Option<Stamp>) -> u8 {
+        let c = self.0.entry(key).or_insert(Crash { stamp, times: 0 });
+        if c.stamp != stamp {
+            *c = Crash { stamp, times: 0 };
+        }
+        c.times = c.times.saturating_add(1);
+        c.times
+    }
+
+    /// At each round: a line of an older crash.txt takes the size and date
+    /// the content index recorded for that file when it skipped it; a file
+    /// gone or changed since is no longer blamed. True when something changed.
+    fn tidy(&mut self, wanted: &HashMap<u64, Candidate>, known: &HashMap<u64, Indexed>) -> bool {
+        let before = self.clone();
+        for (k, c) in self.0.iter_mut().filter(|(_, c)| c.stamp.is_none()) {
+            c.stamp = known.get(k).filter(|i| i.status == Status::Failed).map(|i| (i.size, i.modified));
+        }
+        self.0.retain(|k, c| c.stamp.is_some_and(|s| wanted.get(k).is_some_and(|w| (w.size, w.modified) == s)));
+        *self != before
+    }
+}
+
+/// The files whose in-process reading crashed the service: those named in
+/// reading.txt at start (they were being read when the service went down)
+/// are added to crash.txt, with their size and date then.
+fn load_crashed(dir: &Path, log: &dyn Fn(String)) -> Crashed {
     let list = dir.join("crash.txt");
-    let mut set: HashSet<u64> =
-        std::fs::read_to_string(&list).map(|t| t.lines().filter_map(|l| l.trim().parse().ok()).collect()).unwrap_or_default();
+    let mut crashed = Crashed::parse(&std::fs::read_to_string(&list).unwrap_or_default());
     let reading = dir.join("reading.txt");
-    let named: Vec<u64> =
-        std::fs::read_to_string(&reading).map(|t| t.lines().filter_map(|l| l.trim().parse().ok()).collect()).unwrap_or_default();
-    let mut added = false;
-    for k in named {
-        if set.insert(k) {
-            log(format!("content: file {k} stopped the service while it was read; it is skipped from now on"));
-            added = true;
+    let named: Vec<(u64, Option<Stamp>)> = std::fs::read_to_string(&reading)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| {
+            let mut f = l.split_whitespace();
+            let key = f.next()?.parse().ok()?;
+            Some((key, f.next().and_then(|s| s.parse().ok()).zip(f.next().and_then(|m| m.parse().ok()))))
+        })
+        .collect();
+    for &(k, stamp) in &named {
+        if crashed.blame(k, stamp) >= CRASHES_TO_SKIP {
+            log(format!("content: file {k} was being read each time the service went down; it is skipped until it changes"));
+        } else {
+            log(format!("content: file {k} was being read when the service went down; it is skipped if that happens again"));
         }
     }
-    if added {
-        let text: String = set.iter().map(|k| format!("{k}\n")).collect();
-        let _ = std::fs::write(&list, text);
+    if !named.is_empty() {
+        crashed.save(&list);
     }
     let _ = std::fs::write(&reading, "");
-    set
+    crashed
 }
 
 /// Where a photo was taken, as text for the index: "Rome, Lazio, Italy"
@@ -2805,16 +2918,68 @@ mod tests {
         assert_eq!(document_counts(&known, &HashSet::new()), (4, 2));
     }
 
+    fn candidate(key: u64, size: u64, modified: u32) -> Candidate {
+        Candidate {
+            key,
+            path: format!(r"C:\Docs\{key}.pdf"),
+            size,
+            modified,
+            photo_only: false,
+            media_only: false,
+            props_only: false,
+            meaning_only: false,
+        }
+    }
+
     #[test]
-    fn a_file_that_crashed_the_service_is_skipped_for_good() {
+    fn a_file_that_crashed_the_service_twice_is_skipped_until_it_changes() {
         let dir = std::env::temp_dir().join(format!("whereti-crash-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("reading.txt"), "42").unwrap();
-        let set = load_crashed(&dir, &|_| {});
-        assert!(set.contains(&42));
+        let file = candidate(42, 1000, 77);
+        // once (a power cut, maybe): still read
+        std::fs::write(dir.join("reading.txt"), "42 1000 77\n").unwrap();
+        let once = load_crashed(&dir, &|_| {});
+        assert!(!once.skips(&file));
         // the next start remembers it, and nothing new is blamed
-        let again = load_crashed(&dir, &|_| {});
-        assert_eq!(again.len(), 1);
+        assert_eq!(load_crashed(&dir, &|_| {}), once);
+        // twice: skipped, while it stays as it was
+        std::fs::write(dir.join("reading.txt"), "42 1000 77\n").unwrap();
+        let twice = load_crashed(&dir, &|_| {});
+        assert!(twice.skips(&file));
+        assert!(!twice.skips(&candidate(42, 1001, 77)), "a new version is read again");
+        assert!(!twice.skips(&candidate(42, 1000, 78)));
+        assert!(!twice.skips(&candidate(43, 1000, 77)));
+        // a crash while another version was read starts the count again
+        let mut c = twice.clone();
+        assert_eq!(c.blame(42, Some((5, 5))), 1);
+        // gone or changed: no longer blamed at all
+        let mut c = twice.clone();
+        let wanted: HashMap<u64, Candidate> = [(42, candidate(42, 1000, 77))].into();
+        assert!(!c.tidy(&wanted, &HashMap::new()));
+        assert!(c.tidy(&[(42, candidate(42, 2000, 90))].into(), &HashMap::new()));
+        assert!(c.0.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_crash_list_of_an_older_version_still_counts_until_its_files_change() {
+        let dir = std::env::temp_dir().join(format!("whereti-crash-old-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("crash.txt"), "42\n43\n").unwrap();
+        let mut c = load_crashed(&dir, &|_| {});
+        assert!(c.skips(&candidate(42, 1, 1)) && c.skips(&candidate(43, 9, 9)));
+        // 42 was skipped as 1000 bytes at 77, and is still so; 43 the content
+        // index does not know (another file has its record now)
+        let known: HashMap<u64, Indexed> = [(42, Indexed { size: 1000, modified: 77, status: Status::Failed })].into();
+        let wanted: HashMap<u64, Candidate> = [(42, candidate(42, 1000, 77)), (43, candidate(43, 5, 5))].into();
+        assert!(c.tidy(&wanted, &known));
+        assert!(c.skips(&candidate(42, 1000, 77)) && !c.skips(&candidate(42, 1001, 77)));
+        assert!(!c.skips(&candidate(43, 5, 5)));
+        // saved and read back the same
+        c.save(&dir.join("crash.txt"));
+        assert_eq!(load_crashed(&dir, &|_| {}), c);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2824,16 +2989,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let content = Content::open(&dir, &|_| {});
         let named = || std::fs::read_to_string(dir.join("reading.txt")).unwrap();
-        content.reading(7, true);
-        content.reading(9, true);
+        let (a, b) = (candidate(7, 10, 1), candidate(9, 20, 2));
+        content.reading(&a, true);
+        content.reading(&b, true);
         // one ends: the other is still named
-        content.reading(7, false);
-        assert_eq!(named(), "9\n");
-        content.reading(7, true);
+        content.reading(&a, false);
+        assert_eq!(named(), "9 20 2\n");
+        content.reading(&a, true);
         drop(content);
-        // the service went down while both were read: both are skipped from now on
-        let set = load_crashed(&dir, &|_| {});
-        assert_eq!(set, [7, 9].into());
+        // the service went down while both were read: both are blamed once
+        let crashed = load_crashed(&dir, &|_| {});
+        assert_eq!(crashed.0.len(), 2);
+        assert_eq!(crashed.0[&7], Crash { stamp: Some((10, 1)), times: 1 });
         assert_eq!(named(), "");
         let _ = std::fs::remove_dir_all(&dir);
     }

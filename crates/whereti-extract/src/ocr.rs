@@ -89,7 +89,8 @@ impl Ocr {
 
     /// The text of a scanned PDF, page by page; `None` when the PDF has
     /// enough text of its own (`own_chars` letters and digits, all its pages
-    /// read). `truncated` when the page limit or the time stopped it.
+    /// read). `truncated` when the page limit or the time stopped it, or a
+    /// page could not be read (the others are kept).
     pub(crate) fn pdf_if_scanned(&self, bytes: &[u8], own_chars: usize) -> windows::core::Result<Option<(String, bool)>> {
         let until = until();
         let stream = memory_stream(bytes)?;
@@ -106,20 +107,29 @@ impl Ocr {
                 truncated = true;
                 break;
             }
-            let page = doc.GetPage(i)?;
-            let options = PdfPageRenderOptions::new()?;
-            options.SetDestinationWidth(PAGE_WIDTH)?;
-            let image = InMemoryRandomAccessStream::new()?;
-            page.RenderWithOptionsToStreamAsync(&image, &options)?.join()?;
-            image.Seek(0)?;
-            let bitmap = self.decode(&image.cast()?)?;
-            let text = self.read(&bitmap)?;
-            if !text.trim().is_empty() {
-                out.push_str(&text);
-                out.push_str("\n\n");
+            // a page that fails is left out, not the pages read
+            match self.page(&doc, i) {
+                Ok(text) if !text.trim().is_empty() => {
+                    out.push_str(&text);
+                    out.push_str("\n\n");
+                }
+                Ok(_) => {}
+                Err(_) => truncated = true,
             }
         }
         Ok(Some((keep_if_words(out), truncated)))
+    }
+
+    /// The text of page `i`, drawn and read.
+    fn page(&self, doc: &PdfDocument, i: u32) -> windows::core::Result<String> {
+        let page = doc.GetPage(i)?;
+        let options = PdfPageRenderOptions::new()?;
+        options.SetDestinationWidth(PAGE_WIDTH)?;
+        let image = InMemoryRandomAccessStream::new()?;
+        page.RenderWithOptionsToStreamAsync(&image, &options)?.join()?;
+        image.Seek(0)?;
+        let bitmap = self.decode(&image.cast()?)?;
+        self.read(&bitmap)
     }
 
     /// Decodes to BGRA, turned by EXIF, no larger than the OCR accepts.
@@ -258,14 +268,32 @@ pub(crate) fn memory_stream(bytes: &[u8]) -> windows::core::Result<IRandomAccess
 }
 
 /// Keeps OCR text only if it has real words: at least three of three or
-/// more letters. A photo of a face reads as "l .. I" and is dropped.
+/// more letters, or (Chinese, Japanese, Korean, which OCR reads a
+/// character at a time) six of their characters. A photo of a face reads
+/// as "l .. I" and is dropped.
 pub(crate) fn keep_if_words(text: String) -> String {
     let words = text.split_whitespace().filter(|w| w.chars().filter(|c| c.is_alphabetic()).count() >= 3).count();
-    if words >= 3 {
+    if words >= 3 || text.chars().filter(|&c| is_cjk(c)).count() >= 6 {
         text
     } else {
         String::new()
     }
+}
+
+/// A Han, Hiragana, Katakana or Hangul character.
+fn is_cjk(c: char) -> bool {
+    matches!(c as u32,
+        0x3040..=0x30FF // Hiragana, Katakana
+        | 0x31F0..=0x31FF // Katakana extensions
+        | 0x3400..=0x4DBF // Han, extension A
+        | 0x4E00..=0x9FFF // Han
+        | 0xF900..=0xFAFF // Han compatibility
+        | 0xFF66..=0xFF9D // halfwidth Katakana
+        | 0x1100..=0x11FF // Hangul Jamo
+        | 0x3130..=0x318F // Hangul compatibility Jamo
+        | 0xAC00..=0xD7AF // Hangul syllables
+        | 0x20000..=0x323AF // Han, extensions B to H
+    )
 }
 
 #[cfg(test)]
@@ -276,6 +304,17 @@ mod tests {
     fn stray_letters_are_dropped() {
         assert_eq!(keep_if_words("l .. I\n,".into()), "");
         assert_eq!(keep_if_words("Total to pay 58.40\nDue date March".into()), "Total to pay 58.40\nDue date March");
+    }
+
+    #[test]
+    fn chinese_japanese_and_korean_text_is_kept() {
+        // as Windows' OCR reads them: a character at a time
+        for text in ["发 票 总 金 额 合 计 58.40", "請 求 書 の お 支 払 い", "合 計 ゴ ー ル ド カ ー ド", "청 구 서 합 계 금 액"] {
+            assert_eq!(keep_if_words(text.into()), text);
+        }
+        // a few stray ones are still dropped
+        assert_eq!(keep_if_words("口 l 一 .. I".into()), "");
+        assert!(!is_cjk('a') && !is_cjk('ă') && !is_cjk('Ж') && !is_cjk('。'));
     }
 
     #[test]

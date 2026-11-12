@@ -38,14 +38,24 @@ pub fn default_index_path() -> PathBuf {
 /// junction). Such a folder is removed, without following links inside it,
 /// and made again: it holds nothing the service cannot rebuild.
 pub fn ensure_data_dir() -> io::Result<PathBuf> {
-    let dir = data_dir();
+    ensure_dir_at(data_dir())
+}
+
+fn ensure_dir_at(dir: PathBuf) -> io::Result<PathBuf> {
     if let Ok(meta) = std::fs::symlink_metadata(&dir) {
         if is_ours(&dir, &meta) {
             return Ok(dir);
         }
         let link = meta.file_type().is_symlink() || is_reparse(&meta);
-        // a link goes, not what it points to; a real folder goes whole
-        let removed = if link { std::fs::remove_dir(&dir).or_else(|_| std::fs::remove_file(&dir)) } else { std::fs::remove_dir_all(&dir) };
+        // a link goes, not what it points to; a real folder goes whole; a
+        // file in its place too
+        let removed = if link {
+            std::fs::remove_dir(&dir).or_else(|_| std::fs::remove_file(&dir))
+        } else if meta.is_dir() {
+            std::fs::remove_dir_all(&dir)
+        } else {
+            std::fs::remove_file(&dir)
+        };
         if let Err(e) = removed {
             return Err(io::Error::other(format!("{} is not whereti's and cannot be removed: {e}", dir.display())));
         }
@@ -66,8 +76,10 @@ pub fn ensure_data_dir() -> io::Result<PathBuf> {
     let err = io::Error::last_os_error();
     // SAFETY: allocated by the SDDL conversion.
     unsafe { LocalFree(sd) };
-    if ok == 0 && !dir.is_dir() {
-        return Err(err);
+    // there already: someone made it again since it was removed, unless it
+    // is ours after all (another start of the service, at the same moment)
+    if ok == 0 && !std::fs::symlink_metadata(&dir).is_ok_and(|meta| is_ours(&dir, &meta)) {
+        return Err(io::Error::other(format!("{} cannot be made: {err}", dir.display())));
     }
     Ok(dir)
 }
@@ -298,6 +310,17 @@ pub fn maintenance_pool() -> rayon::ThreadPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_file_in_the_data_folder_s_place_is_replaced() {
+        let dir = std::env::temp_dir().join(format!("whereti-data-{}", std::process::id()));
+        let _ = std::fs::remove_dir(&dir);
+        std::fs::write(&dir, "not a folder").unwrap();
+        let made = ensure_dir_at(dir.clone());
+        assert!(made.is_ok(), "{made:?}");
+        assert!(std::fs::symlink_metadata(&dir).unwrap().is_dir());
+        let _ = std::fs::remove_dir(&dir);
+    }
 
     #[test]
     fn a_child_s_cpu_counts_as_ours() {

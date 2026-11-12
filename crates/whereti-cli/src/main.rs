@@ -9,6 +9,17 @@ use std::time::{Duration, Instant};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
+/// `println!` for everything wt prints (defined before the modules, which
+/// use it): see `out`.
+macro_rules! outln {
+    () => {
+        $crate::out(format_args!(""))
+    };
+    ($($arg:tt)*) => {
+        $crate::out(format_args!($($arg)*))
+    };
+}
+
 mod extract_cmd;
 mod index_cmd;
 mod inspect_cmd;
@@ -112,6 +123,31 @@ fn serve(args: ServeArgs) -> Result<(), String> {
     whereti_engine::run_foreground(cfg, args.seconds)
 }
 
+/// Writes one line to the standard output. A reader that went away
+/// (`wt search x | more`, then quitting more) ends wt quietly, with success:
+/// `println!` would panic there, and a panic stops wt as a crash.
+fn out(args: std::fmt::Arguments) {
+    use std::io::Write;
+    let written = {
+        let mut stdout = std::io::stdout().lock();
+        stdout.write_fmt(args).and_then(|()| stdout.write_all(b"\n"))
+    };
+    if let Err(e) = written {
+        if output_closed(&e) {
+            std::process::exit(0);
+        }
+        eprintln!("error: cannot write the output: {e}");
+        std::process::exit(1);
+    }
+}
+
+/// Whether a write failed because the other end of the pipe is closed.
+fn output_closed(e: &std::io::Error) -> bool {
+    const ERROR_BROKEN_PIPE: i32 = 109;
+    const ERROR_NO_DATA: i32 = 232;
+    e.kind() == std::io::ErrorKind::BrokenPipe || matches!(e.raw_os_error(), Some(ERROR_BROKEN_PIPE | ERROR_NO_DATA))
+}
+
 fn main() -> ExitCode {
     // a panic stops the program at once, except in a guarded parser
     whereti_guard::stop_on_panic();
@@ -150,8 +186,8 @@ fn scan(args: ScanArgs) -> Result<ExitCode, String> {
     let n = vol.ntfs;
     let mft_bytes = n.mft_valid_data_length as u64;
 
-    println!("whereti scan {letter}:");
-    println!(
+    outln!("whereti scan {letter}:");
+    outln!(
         "  volume   cluster {} B · sector {} B · record {} B · MFT {} ({} record slots) · opened in {}",
         n.bytes_per_cluster,
         n.bytes_per_sector,
@@ -161,15 +197,15 @@ fn scan(args: ScanArgs) -> Result<ExitCode, String> {
         dur(open_time),
     );
     match vol.query_usn_journal() {
-        Ok(j) => println!(
+        Ok(j) => outln!(
             "  journal  id {:#018x} · next USN {} · max size {}",
             j.usn_journal_id,
             num(j.next_usn as u64),
             bytes(j.maximum_size)
         ),
-        Err(e) => println!("  journal  not available ({e})"),
+        Err(e) => outln!("  journal  not available ({e})"),
     }
-    println!();
+    outln!();
 
     let mut raw: Option<MftScan> = None;
     let mut scan_start_usn = None;
@@ -187,8 +223,8 @@ fn scan(args: ScanArgs) -> Result<ExitCode, String> {
                 let s = &scan.stats;
                 let files = scan.entries.iter().filter(|e| !e.is_dir).count();
                 let total_size: u64 = scan.entries.iter().filter(|e| !e.is_dir).map(|e| e.size).sum();
-                println!("[direct MFT]  {} in {}", per_sec(scan.entries.len(), elapsed), dur(elapsed));
-                println!(
+                outln!("[direct MFT]  {} in {}", per_sec(scan.entries.len(), elapsed), dur(elapsed));
+                outln!(
                     "  read     {} at {}/s · {} fragment(s) · {} · {} parser threads",
                     bytes(s.bytes_read),
                     bytes((s.bytes_read as f64 / elapsed.as_secs_f64().max(1e-9)) as u64),
@@ -196,7 +232,7 @@ fn scan(args: ScanArgs) -> Result<ExitCode, String> {
                     if args.buffered { "buffered" } else { "unbuffered" },
                     s.threads
                 );
-                println!(
+                outln!(
                     "  records  {} in use ({} base + {} extension) · {} free · {} corrupt · {} without name",
                     num(s.in_use),
                     num(s.base_records),
@@ -205,7 +241,7 @@ fn scan(args: ScanArgs) -> Result<ExitCode, String> {
                     num(s.corrupt_records),
                     num(s.records_without_name)
                 );
-                println!(
+                outln!(
                     "  entries  {} names = {} files + {} folders · {} of file data",
                     num(scan.entries.len() as u64),
                     num(files as u64),
@@ -213,15 +249,15 @@ fn scan(args: ScanArgs) -> Result<ExitCode, String> {
                     bytes(total_size)
                 );
                 print_index_estimate(&scan, s.total_records);
-                println!();
+                outln!();
                 if s.corrupt_records > 0 {
                     ok = false;
                 }
                 raw = Some(scan);
             }
             Err(e) => {
-                println!("[direct MFT]  FAILED: {e}");
-                println!();
+                outln!("[direct MFT]  FAILED: {e}");
+                outln!();
                 ok = false;
             }
         }
@@ -233,14 +269,14 @@ fn scan(args: ScanArgs) -> Result<ExitCode, String> {
         match usn_enum::enumerate(&vol) {
             Ok(entries) => {
                 let elapsed = t.elapsed();
-                println!("[ENUM_USN_DATA]  {} in {}", per_sec(entries.len(), elapsed), dur(elapsed));
-                println!("  note     names, parents and attributes only - no sizes or dates");
-                println!();
+                outln!("[ENUM_USN_DATA]  {} in {}", per_sec(entries.len(), elapsed), dur(elapsed));
+                outln!("  note     names, parents and attributes only - no sizes or dates");
+                outln!();
                 usn = Some(entries);
             }
             Err(e) => {
-                println!("[ENUM_USN_DATA]  FAILED: {e}");
-                println!();
+                outln!("[ENUM_USN_DATA]  FAILED: {e}");
+                outln!();
                 ok = false;
             }
         }
@@ -248,7 +284,7 @@ fn scan(args: ScanArgs) -> Result<ExitCode, String> {
 
     if let (Some(raw), Some(usn)) = (&raw, &usn) {
         let r = compare::compare(raw, usn, scan_start_usn, args.samples);
-        println!("[compare]  {} records matched exactly", num(r.matched as u64));
+        outln!("[compare]  {} records matched exactly", num(r.matched as u64));
         diff_line("missing from direct MFT (must be 0)", &r.only_usn);
         diff_line("name differs", &r.name_mismatch);
         diff_line("parent differs", &r.parent_mismatch);
@@ -256,8 +292,8 @@ fn scan(args: ScanArgs) -> Result<ExitCode, String> {
         diff_line("changed during scan (fixed by USN replay)", &r.changed_during_scan);
         diff_line("only in direct MFT (not listed by API)", &r.only_raw);
         let verdict = if r.raw_covers_api() { "PASS" } else { "FAIL" };
-        println!("  result   {verdict}: direct MFT {} what the API sees", if r.raw_covers_api() { "covers" } else { "does NOT cover" });
-        println!();
+        outln!("  result   {verdict}: direct MFT {} what the API sees", if r.raw_covers_api() { "covers" } else { "does NOT cover" });
+        outln!();
         ok &= r.raw_covers_api();
     }
 
@@ -294,7 +330,7 @@ fn print_index_estimate(scan: &MftScan, total_records: u64) {
     let names = scan.names.len() as u64;
     let n = entries.len().max(1) as u64;
     let total = names + n * FIXED_PER_ENTRY + total_records * 4;
-    println!(
+    outln!(
         "  index    estimated {} in RAM = {:.1} B/entry (names avg {:.1} B UTF-8)",
         bytes(total),
         total as f64 / n as f64,
@@ -308,7 +344,7 @@ fn print_sample_paths(letter: char, scan: &MftScan, samples: usize) {
         return;
     }
     let parents: HashMap<u64, (u64, &str)> = raw.iter().map(|e| (e.record, (e.parent, scan.name(e)))).collect();
-    println!("[sample paths]");
+    outln!("[sample paths]");
     let step = (raw.len() / samples).max(1);
     for e in raw.iter().step_by(step).take(samples) {
         let mut parts = vec![scan.name(e)];
@@ -330,15 +366,15 @@ fn print_sample_paths(letter: char, scan: &MftScan, samples: usize) {
         parts.reverse();
         let path = format!("{letter}:\\{}", parts.join("\\"));
         let size = if e.is_dir { "<dir>".to_string() } else { bytes(e.size) };
-        println!("  {path}  [{size}, modified {}]{}", filetime(e.modified), if complete { "" } else { "  (orphan)" });
+        outln!("  {path}  [{size}, modified {}]{}", filetime(e.modified), if complete { "" } else { "  (orphan)" });
     }
-    println!();
+    outln!();
 }
 
 fn diff_line(label: &str, d: &Diff) {
-    println!("  {:<44} {}", label, num(d.count as u64));
+    outln!("  {:<44} {}", label, num(d.count as u64));
     for s in &d.samples {
-        println!("      {s}");
+        outln!("      {s}");
     }
 }
 
@@ -349,7 +385,7 @@ fn print_memory() {
     c.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
     // SAFETY: valid pointer and size for the current process.
     if unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) } != 0 {
-        println!(
+        outln!(
             "[process]  peak working set {} · private {} (spike data structures, not the final index)",
             bytes(c.PeakWorkingSetSize as u64),
             bytes(c.PagefileUsage as u64)
@@ -419,6 +455,17 @@ fn filetime(ft: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_closed_pipe_is_told_from_other_write_errors() {
+        use std::io::{Error, ErrorKind};
+        assert!(output_closed(&Error::from(ErrorKind::BrokenPipe)));
+        assert!(output_closed(&Error::from_raw_os_error(109)));
+        assert!(output_closed(&Error::from_raw_os_error(232)));
+        // a full disk is an error, not a reader that went away
+        assert!(!output_closed(&Error::from_raw_os_error(112)));
+        assert!(!output_closed(&Error::from(ErrorKind::PermissionDenied)));
+    }
 
     #[test]
     fn formats_numbers_like_the_ui() {

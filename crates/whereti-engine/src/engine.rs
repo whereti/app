@@ -160,7 +160,10 @@ impl Engine {
             activity: crate::activity::Activity::open(cfg.index_path.parent().unwrap_or(std::path::Path::new("."))),
         });
         let content_dir = if cfg.index_path == system::default_index_path() {
-            let _ = system::ensure_data_dir();
+            // the content index then fails to open, and says so in its state
+            if let Err(e) = system::ensure_data_dir() {
+                shared.log.log(format!("the data folder is not ready: {e}"));
+            }
             system::data_dir().join("content")
         } else {
             cfg.index_path.with_file_name("content")
@@ -222,6 +225,20 @@ impl Engine {
         if for_everyone && !caller.is_admin() {
             return Response::Error("only an administrator of this PC can change this setting".into());
         }
+        // a search too long to be worth its cost is refused before any work
+        // (each `path:` term costs tables the size of the index)
+        match &req {
+            Request::Search(r) if too_long(&r.query) => {
+                return Response::Search(SearchReply { warnings: vec![TOO_LONG.to_string()], ..Default::default() });
+            }
+            Request::ContentSearch(r) | Request::MeaningSearch(r) if too_long(&r.query) => {
+                return Response::Content(Default::default());
+            }
+            Request::ScanUnindexed(r) if too_long(&r.query) => {
+                return Response::Scan(whereti_ipc::ScanReply { done: true, ..Default::default() });
+            }
+            _ => {}
+        }
         match req {
             Request::Hello { .. } => Response::Hello {
                 version: PROTOCOL_VERSION,
@@ -251,11 +268,17 @@ impl Engine {
                 if crate::dupes::unsupported(&query) {
                     warnings.push("dupe: compares files by name, size and content; content: and loc: are not applied to it".to_string());
                 }
-                if found.out_of_time {
+                if found.out_of_time && caller.is_admin() {
                     warnings.push(format!(
                         "the largest {} of {} sets of same-size files were compared so far; search again to go on, or narrow it (size:, ext:, path:)",
                         found.checked, found.total
                     ));
+                } else if found.out_of_time {
+                    // the sets counted hold other people's files too: no number
+                    // (the app translates this text too: change both together)
+                    warnings.push(
+                        "not every set of same-size files was compared yet; search again to go on, or narrow it (size:, ext:, path:)".to_string(),
+                    );
                 }
                 Response::Search(SearchReply {
                     total: found.groups.len() as u64,
@@ -308,19 +331,26 @@ impl Engine {
                 };
                 // Names only from folders the caller can list, as in Explorer:
                 // another account's documents stay unseen (one check per folder).
+                // The properties were read as SYSTEM: a file found by them is
+                // shown only to whom may read it, as FileInfo asks.
                 // When some go, look deeper (twice at most) so the list stays full.
                 let want = opts.limit;
                 let mut depth = want;
                 let res = loop {
                     let mut res = run(SearchOptions { limit: depth, ..opts });
-                    let shown = listable(idx, &res.hits, caller);
+                    let mut shown = listable(idx, &res.hits, caller);
+                    if !prop_clauses.is_empty() {
+                        let hits = &res.hits;
+                        keep_readable(&mut shown, |i| (!idx.is_dir(hits[i])).then(|| idx.full_path(hits[i])), caller);
+                    }
                     let gone_exact = drop_hits(&mut res, &shown);
                     let kept_exact = res.hits.len() - res.close;
                     let more = res.total > kept_exact && kept_exact < want && depth < want * 16 && depth < 100_000;
                     if !more {
-                        if gone_exact > 0 {
+                        if gone_exact > 0 || !caller.is_admin() {
                             // the matches not looked at may be someone else's
-                            // too: count only those the caller may see
+                            // too: count only those the caller may see (an
+                            // administrator's account may see them all anyway)
                             res.total = kept_exact;
                         }
                         // the exact matches first, the close ones after, `want` in all
@@ -360,6 +390,8 @@ impl Engine {
                 let skipped = guard.as_ref().map(|i| i.skipped()).unwrap_or_default();
                 drop(guard);
                 let mut content_folders = self.content.folders();
+                // found as SYSTEM: every profile's documents and OneDrive
+                let mut default_content_folders = content::default_folders();
                 // what is set for everyone, but not other people's folder
                 // names: someone who cannot change it sees only what they may list
                 let (exclusions, skipped) = if caller.is_admin() {
@@ -370,6 +402,8 @@ impl Engine {
                     let skipped = skipped.into_iter().filter(|(r, _)| exclusions.contains(r)).collect();
                     let ok = caller_sees(caller, &content_folders);
                     content_folders = content_folders.into_iter().zip(ok).filter_map(|(p, ok)| ok.then_some(p)).collect();
+                    let ok = caller_sees(caller, &default_content_folders);
+                    default_content_folders = default_content_folders.into_iter().zip(ok).filter_map(|(p, ok)| ok.then_some(p)).collect();
                     (exclusions, skipped)
                 };
                 Response::Config(ConfigReply {
@@ -382,7 +416,7 @@ impl Engine {
                         .map(|(id, rules)| (id.to_string(), rules.iter().map(|r| r.to_string()).collect()))
                         .collect(),
                     content_folders,
-                    default_content_folders: content::default_folders(),
+                    default_content_folders,
                 })
             }
             Request::ContentSearch(r) => {
@@ -397,11 +431,12 @@ impl Engine {
             Request::ScanUnindexed(r) => {
                 let query = whereti_query::parse(&r.query, &system::date_ctx());
                 // the name index is held only while the list is made
-                let plan = {
+                let mut plan = {
                     let guard = self.shared.index.read();
                     let Some(idx) = guard.as_ref() else { return Response::Scan(Default::default()) };
                     self.content.scan_plan(idx, &query)
                 };
+                plan.keep_listed(caller);
                 let budget = Duration::from_millis(r.budget_ms.clamp(200, 5000) as u64);
                 Response::Scan(self.content.scan_run(&plan, r.skip, budget, r.limit.clamp(1, 500) as usize, caller))
             }
@@ -1701,6 +1736,33 @@ fn load_skipped(index_path: &std::path::Path) -> Vec<(char, String, u64)> {
         .collect()
 }
 
+/// Clears `shown[i]` where the caller may not read the file `path(i)`
+/// names (asked in one batch; only those still shown, and `None`, a
+/// folder, is left as it is).
+fn keep_readable(shown: &mut [bool], path: impl Fn(usize) -> Option<String>, caller: &dyn Caller) {
+    let (ask, paths): (Vec<usize>, Vec<String>) =
+        (0..shown.len()).filter(|&i| shown[i]).filter_map(|i| path(i).map(|p| (i, p))).unzip();
+    for (i, ok) in ask.into_iter().zip(caller.can_read(&paths)) {
+        shown[i] &= ok;
+    }
+}
+
+/// A search longer than this, or with more conditions, is refused: the
+/// service answers everyone, and one search must not hold it up.
+const MAX_QUERY_BYTES: usize = 4096;
+const MAX_QUERY_TERMS: usize = 64;
+/// Said when a search is refused for its length (the app translates it:
+/// whereti-i18n, screens/search.rs; change both together).
+const TOO_LONG: &str = "the search is too long; use fewer words or conditions";
+
+fn too_long(text: &str) -> bool {
+    fn count(terms: &[whereti_query::Term]) -> usize {
+        terms.iter().map(|t| if let whereti_query::Term::All(inner) = t { count(inner) } else { 1 }).sum()
+    }
+    text.len() > MAX_QUERY_BYTES
+        || whereti_query::parse(text, &system::date_ctx()).clauses.iter().map(|c| count(&c.any_of)).sum::<usize>() > MAX_QUERY_TERMS
+}
+
 /// For each hit: is its folder one the caller may list? Each folder is
 /// asked about once.
 fn listable(idx: &NameIndex, hits: &[u32], caller: &dyn Caller) -> Vec<bool> {
@@ -1808,6 +1870,35 @@ mod tests {
         }
         let paths = vec![r"C:\Users\ana".to_string(), r"\node_modules".into(), r"D:\Work".into()];
         assert_eq!(caller_sees(&OnlyD, &paths), [false, true, true]);
+    }
+
+    #[test]
+    fn a_search_too_long_is_refused() {
+        assert!(!too_long("factura enel ext:pdf path:c:\\users dm:thisyear"));
+        let words: Vec<String> = (0..MAX_QUERY_TERMS).map(|i| format!("w{i}")).collect();
+        assert!(!too_long(&words.join(" ")));
+        assert!(too_long(&format!("{} more", words.join(" "))));
+        // the conditions inside one choice count too
+        let paths: Vec<String> = (0..40).map(|i| format!("path:c:\\d{i}\\")).collect();
+        assert!(too_long(&format!("{} | {}", paths.join(" | "), paths.join(" | "))));
+        assert!(too_long(&"a".repeat(MAX_QUERY_BYTES + 1)));
+        assert!(!too_long(&"a".repeat(MAX_QUERY_BYTES)));
+    }
+
+    #[test]
+    fn properties_are_answered_only_for_files_the_caller_may_read() {
+        struct OnlyMine;
+        impl Caller for OnlyMine {
+            fn can_read(&self, p: &[String]) -> Vec<bool> {
+                assert!(p.iter().all(|p| !p.contains("hidden")), "asked about a hit already gone");
+                p.iter().map(|p| p.contains("mine")).collect()
+            }
+        }
+        let paths = [Some(r"C:\mine\a.jpg"), Some(r"C:\ana\b.jpg"), Some(r"C:\hidden\c.jpg"), None, Some(r"C:\mine\d.mp3")];
+        // the third went already (its folder cannot be listed); the fourth is a folder
+        let mut shown = [true, true, false, true, true];
+        keep_readable(&mut shown, |i| paths[i].map(String::from), &OnlyMine);
+        assert_eq!(shown, [true, false, false, true, true]);
     }
 
     #[test]

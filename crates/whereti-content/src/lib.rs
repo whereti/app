@@ -72,6 +72,7 @@ pub fn split_key(key: u64) -> (char, u64) {
     (char::from_u32((key >> 48) as u32).unwrap_or('?'), key & 0xFFFF_FFFF_FFFF)
 }
 
+#[derive(Clone, Copy)]
 struct Fields {
     key: Field,
     size: Field,
@@ -129,7 +130,12 @@ impl ContentIndex {
         let (schema, f) = schema();
         if current == Some(FORMAT) {
             match Index::open_in_dir(dir) {
-                Ok(i) if i.schema() == schema => return Self::with_index(i, f),
+                // the segments are read only now: one missing or cut short
+                // is damage too, not something that passes
+                Ok(i) if i.schema() == schema => match Self::with_index(i, f) {
+                    Err(e) if damaged(&e) => {}
+                    other => return other,
+                },
                 Ok(_) => {}
                 Err(e) if damaged(&e) => {}
                 Err(e) => return Err(e),
@@ -355,15 +361,20 @@ impl ContentIndex {
 fn damaged(e: &tantivy::TantivyError) -> bool {
     use tantivy::directory::error::OpenReadError;
     use tantivy::TantivyError as E;
-    matches!(
-        e,
-        E::DataCorruption(_)
-            | E::IncompatibleIndex(_)
-            | E::SchemaError(_)
-            | E::DeserializeError(_)
-            | E::FieldNotFound(_)
-            | E::OpenReadError(OpenReadError::FileDoesNotExist(_) | OpenReadError::IncompatibleIndex(_))
-    )
+    // a file cut short or with garbage at its end (not one locked for a moment)
+    let cut = |io: &std::io::Error| matches!(io.kind(), std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::InvalidData);
+    match e {
+        E::IoError(io) | E::OpenReadError(OpenReadError::IoError { io_error: io, .. }) => cut(io),
+        _ => matches!(
+            e,
+            E::DataCorruption(_)
+                | E::IncompatibleIndex(_)
+                | E::SchemaError(_)
+                | E::DeserializeError(_)
+                | E::FieldNotFound(_)
+                | E::OpenReadError(OpenReadError::FileDoesNotExist(_) | OpenReadError::IncompatibleIndex(_))
+        ),
+    }
 }
 
 /// A file Tantivy writes (its metadata, locks and segments named by a
@@ -477,6 +488,37 @@ mod tests {
         // the settings and other stores beside the index stay
         assert_eq!(std::fs::read_to_string(dir.path().join("photo-tags.txt")).unwrap(), "on\n");
         assert!(dir.path().join("meaning.bin").exists());
+    }
+
+    #[test]
+    fn a_segment_file_missing_or_cut_short_starts_the_index_over() {
+        let segment_file = |dir: &Path, ext: &str| {
+            std::fs::read_dir(dir).unwrap().flatten().map(|e| e.path()).find(|p| p.extension().is_some_and(|x| x == ext)).unwrap()
+        };
+        let filled = |dir: &Path| {
+            let idx = ContentIndex::open(dir).unwrap();
+            idx.put(key('C', 6), ok(1), "raport anual").unwrap();
+            idx.commit().unwrap();
+        };
+        for cut in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            filled(dir.path());
+            std::fs::write(dir.path().join("photo-tags.txt"), "on\n").unwrap();
+            let term = segment_file(dir.path(), "term");
+            if cut {
+                let bytes = std::fs::read(&term).unwrap();
+                std::fs::write(&term, &bytes[..bytes.len() / 2]).unwrap();
+            } else {
+                std::fs::remove_file(&term).unwrap();
+            }
+            let idx = ContentIndex::open(dir.path()).unwrap_or_else(|e| panic!("cut {cut}: {e}"));
+            assert_eq!(idx.docs(), 0, "cut {cut}");
+            // usable again, and what is beside it stays
+            idx.put(key('C', 7), ok(1), "contract").unwrap();
+            idx.commit().unwrap();
+            assert_eq!(idx.search("contract", 5).unwrap().total, 1);
+            assert!(dir.path().join("photo-tags.txt").exists());
+        }
     }
 
     #[test]

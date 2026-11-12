@@ -154,6 +154,9 @@ pub fn install(log: &mut dyn FnMut(&str)) -> Result<(), String> {
         own_file()?;
     }
     let _one = one_at_a_time()?;
+    // first of all: the cleanup an uninstall left running stops here, before
+    // there are files of this install it could delete
+    let _ = std::fs::remove_file(dir.join(REMOVED));
     log("Stopping the running whereti…");
     stop_service();
     close_running(&dir);
@@ -380,6 +383,9 @@ fn close_running(dir: &Path) {
         OpenProcess, QueryFullProcessImageNameW, TerminateProcess, WaitForSingleObject, PROCESS_NAME_WIN32,
         PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
     };
+    // also the programs of another account (the app of the user who asked
+    // for the install, when UAC took another administrator's password)
+    enable_debug_privilege();
     let folder = dir.to_string_lossy().to_lowercase();
     let folder = folder.trim_end_matches('\\').to_string() + "\\";
     let me = std::process::id();
@@ -417,6 +423,34 @@ fn close_running(dir: &Path) {
             WaitForSingleObject(h, 10_000);
             let _ = CloseHandle(h);
         }
+    }
+}
+
+/// Turns on SeDebugPrivilege, which an administrator has but off: it lets
+/// this process close programs of every account. Without it, only ours.
+fn enable_debug_privilege() {
+    use windows::Win32::Foundation::LUID;
+    use windows::Win32::Security::{
+        AdjustTokenPrivileges, LookupPrivilegeValueW, LUID_AND_ATTRIBUTES, SE_DEBUG_NAME, SE_PRIVILEGE_ENABLED,
+        TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES,
+    };
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    // SAFETY: our own process token, closed below; a privilege list of one.
+    unsafe {
+        let mut token = HANDLE::default();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES, &mut token).is_err() {
+            return;
+        }
+        let mut luid = LUID::default();
+        if LookupPrivilegeValueW(PCWSTR::null(), SE_DEBUG_NAME, &mut luid).is_ok() {
+            let privileges = TOKEN_PRIVILEGES {
+                PrivilegeCount: 1,
+                Privileges: [LUID_AND_ATTRIBUTES { Luid: luid, Attributes: SE_PRIVILEGE_ENABLED }],
+            };
+            // not granted: closing the other accounts' programs fails, as before
+            let _ = AdjustTokenPrivileges(token, false, Some(&privileges), 0, None, None);
+        }
+        let _ = CloseHandle(token);
     }
 }
 
@@ -680,19 +714,24 @@ pub fn uninstall(log: &mut dyn FnMut(&str)) -> Result<(), String> {
             }
         }
     }
+    // Marks the folder as removed: an install takes the mark away first
+    // thing, and the cleanup below goes on only while it is there.
+    let marked = dir.is_dir() && std::fs::write(dir.join(REMOVED), b"").is_ok();
+    if marked {
+        delete_at_restart(&dir.join(REMOVED));
+    }
     if dir.is_dir() {
         delete_at_restart(&dir);
+    }
+    if !marked {
+        return Ok(());
     }
     // The uninstaller's window may stay open a while (it says "removed"):
     // the folder goes once it closes, tried for 2 minutes.
     // Programs by their full path, run from System32: nothing is looked up
     // in a folder a user could write to.
     let sys = system32();
-    let script = format!(
-        "for /l %i in (1,1,60) do @if exist \"{dir}\\\" (rmdir /s /q \"{dir}\" >nul 2>&1 & if exist \"{dir}\\\" \"{ping}\" 127.0.0.1 -n 3 >nul)",
-        ping = sys.join("PING.EXE").display(),
-        dir = dir.display()
-    );
+    let script = cleanup_script(&dir, &sys.join("PING.EXE"));
     {
         use std::os::windows::process::CommandExt;
         let _ = hidden(&sys.join("cmd.exe"))
@@ -704,6 +743,24 @@ pub fn uninstall(log: &mut dyn FnMut(&str)) -> Result<(), String> {
             .spawn();
     }
     Ok(())
+}
+
+/// The mark an uninstall leaves in the folder for its cleanup (see `uninstall`).
+const REMOVED: &str = "whereti.removed";
+
+/// The cmd line that empties and removes the install folder after an
+/// uninstall, tried every 2 s for 2 minutes. It goes on only while the mark
+/// is there, and deletes nothing but the programs moved aside (`*.old`), then
+/// the mark and the folder itself if that leaves it empty: the files of a
+/// whereti installed again meanwhile are never touched.
+fn cleanup_script(dir: &Path, ping: &Path) -> String {
+    let dir = dir.display();
+    let mark = format!("{dir}\\{REMOVED}");
+    let old = format!("{dir}\\*{OLD}");
+    format!(
+        "for /l %i in (1,1,60) do @if exist \"{mark}\" (del /f /q \"{old}\" >nul 2>&1 & if exist \"{old}\" (\"{ping}\" 127.0.0.1 -n 3 >nul) else (del /f /q \"{mark}\" >nul 2>&1 & rmdir \"{dir}\" >nul 2>&1))",
+        ping = ping.display()
+    )
 }
 
 // ---------------------------------------------------------------- per user (not elevated)
@@ -917,6 +974,25 @@ mod tests {
         // as the app reads it: spaces around are fine
         assert_eq!(noted("theme=dark\n autostart_offered = yes \n"), None);
         assert_eq!(noted("autostart_offered=yes\n"), None);
+    }
+
+    #[test]
+    fn the_cleanup_after_an_uninstall_waits_for_the_mark_and_deletes_only_what_was_moved_aside() {
+        let script = super::cleanup_script(
+            std::path::Path::new(r"C:\Program Files\whereti"),
+            std::path::Path::new(r"C:\Windows\System32\PING.EXE"),
+        );
+        assert_eq!(
+            script,
+            concat!(
+                r#"for /l %i in (1,1,60) do @if exist "C:\Program Files\whereti\whereti.removed" "#,
+                r#"(del /f /q "C:\Program Files\whereti\*.old" >nul 2>&1 & "#,
+                r#"if exist "C:\Program Files\whereti\*.old" ("C:\Windows\System32\PING.EXE" 127.0.0.1 -n 3 >nul) "#,
+                r#"else (del /f /q "C:\Program Files\whereti\whereti.removed" >nul 2>&1 & rmdir "C:\Program Files\whereti" >nul 2>&1))"#,
+            )
+        );
+        // never the whole tree: a whereti installed again keeps its files
+        assert!(!script.contains("/s"));
     }
 
     #[test]

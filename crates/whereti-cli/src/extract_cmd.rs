@@ -41,7 +41,7 @@ pub fn run(args: ExtractArgs) -> Result<(), String> {
         match sandbox.extract_file(f, args.max) {
             Ok(e) => {
                 ok += 1;
-                println!(
+                outln!(
                     "ok    {:>9} → {:>9} chars{} in {}  {}",
                     bytes(size),
                     e.text.chars().count(),
@@ -52,18 +52,18 @@ pub fn run(args: ExtractArgs) -> Result<(), String> {
                 if args.show > 0 {
                     let sample: String = e.text.chars().take(args.show).collect();
                     for line in sample.lines() {
-                        println!("      | {line}");
+                        outln!("      | {line}");
                     }
                 }
             }
             Err(e) => {
                 failed += 1;
-                println!("fail  {:>9} in {}  {}: {e}", bytes(size), dur(t.elapsed()), f.display());
+                outln!("fail  {:>9} in {}  {}: {e}", bytes(size), dur(t.elapsed()), f.display());
             }
         }
     }
     if args.files.len() > 1 {
-        println!("\n{ok} extracted, {failed} failed");
+        outln!("\n{ok} extracted, {failed} failed");
     }
     if failed > 0 {
         return Err(format!("{failed} of {} files could not be extracted", ok + failed));

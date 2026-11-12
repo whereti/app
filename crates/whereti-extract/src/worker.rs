@@ -484,7 +484,8 @@ impl Sandbox {
         use std::os::windows::io::AsRawHandle;
         let file = open_real(path).map_err(SandboxError::Io)?;
         let worker = Sandbox { exe: self.exe.clone(), timeout: Duration::from_secs(60), memory_limit: self.memory_limit, max_file: self.max_file, ocr_languages: Vec::new() };
-        let result = worker.run_with(&["--mailbox".to_string(), "--max".to_string(), max_chars.to_string()], Vec::new(), Some(file.as_raw_handle()));
+        let result =
+            worker.run_with(&["--mailbox".to_string(), "--max".to_string(), max_chars.to_string()], Vec::new(), Some(file.as_raw_handle()), max_chars);
         drop(file);
         result
     }
@@ -494,12 +495,7 @@ impl Sandbox {
         if !self.ocr_languages.is_empty() {
             args.extend(["--ocr-lang".to_string(), self.ocr_languages.join(",")]);
         }
-        self.run(&args, bytes)
-    }
-
-    /// Runs the worker with `args`, `bytes` on its stdin, inside the job.
-    fn run(&self, args: &[String], bytes: Vec<u8>) -> Result<Extracted, SandboxError> {
-        self.run_with(args, bytes, None)
+        self.run_with(&args, bytes, None, max_chars)
     }
 
     /// For the tests: the worker's exit code with `args` (a `--probe-...`).
@@ -516,9 +512,17 @@ impl Sandbox {
         child.exit_code()
     }
 
-    /// `run`; `give`: a handle duplicated into the worker (and only into it)
-    /// once it is in its job, its value sent first on stdin.
-    fn run_with(&self, args: &[String], bytes: Vec<u8>, give: Option<std::os::windows::io::RawHandle>) -> Result<Extracted, SandboxError> {
+    /// Runs the worker with `args`, `bytes` on its stdin, inside the job.
+    /// `give`: a handle duplicated into the worker (and only into it) once
+    /// it is in its job, its value sent first on stdin. `max_chars`: the
+    /// text it was asked for at most, which bounds what is read back.
+    fn run_with(
+        &self,
+        args: &[String],
+        bytes: Vec<u8>,
+        give: Option<std::os::windows::io::RawHandle>,
+        max_chars: usize,
+    ) -> Result<Extracted, SandboxError> {
         // The worker stops its slow work (OCR, the documents in an archive)
         // a quarter before the timeout, so what it read gets back in time.
         let budget = (self.timeout.as_millis() as u64 * 3 / 4).to_string();
@@ -541,18 +545,22 @@ impl Sandbox {
         let writer = PipeThread::start(move || {
             let _ = stdin.write_all(&bytes);
         });
-        let mut stdout = child.stdout.take().expect("piped");
+        let stdout = child.stdout.take().expect("piped");
+        let stderr = child.stderr.take().expect("piped");
+        let child = std::sync::Arc::new(child);
+        // `T` or `F`, then at most 4 bytes a character, and some room: a
+        // worker that sends more (a document took it over) is stopped
+        let cap = max_chars.saturating_mul(4).saturating_add(64 << 10);
+        let killer = child.clone();
         let reader = PipeThread::start(move || {
-            let mut out = Vec::new();
-            let _ = stdout.read_to_end(&mut out);
-            out
+            let (out, over) = read_capped(stdout, cap);
+            if over {
+                killer.kill();
+            }
+            (out, over)
         });
-        let mut stderr = child.stderr.take().expect("piped");
-        let err_reader = PipeThread::start(move || {
-            let mut out = String::new();
-            let _ = stderr.read_to_string(&mut out);
-            out
-        });
+        // an error message: its head is enough, the rest is read and dropped
+        let err_reader = PipeThread::start(move || String::from_utf8_lossy(&read_head(stderr, ERR_CAP)).into_owned());
 
         let finished = child.wait_for(self.timeout);
         if !finished {
@@ -562,8 +570,11 @@ impl Sandbox {
         // its pipes close with it (the job ends anything it could have left)
         drop(job);
         writer.finish();
-        let out = reader.finish();
+        let (out, over) = reader.finish();
         let err = err_reader.finish();
+        if over {
+            return Err(SandboxError::Extract(ExtractError::Damaged(format!("the extractor sent more than {} KB of text", cap >> 10))));
+        }
         if !finished {
             return Err(SandboxError::Failed(format!("took longer than {:.1} s", self.timeout.as_secs_f32())));
         }
@@ -671,12 +682,9 @@ fn probe_sandbox(exe: &Path) -> (bool, String, Option<std::time::Instant>) {
         let (mut child, _) = crate::spawn::spawn(exe, &[std::ffi::OsStr::new("--probe-sandbox")], restricted, false, &job, &[])
             .map_err(|e| (e.to_string(), false))?;
         drop(child.stdin.take());
-        let mut stdout = child.stdout.take().ok_or(("no stdout".to_string(), false))?;
-        let reader = PipeThread::start(move || {
-            let mut out = String::new();
-            let _ = stdout.read_to_string(&mut out);
-            out
-        });
+        let stdout = child.stdout.take().ok_or(("no stdout".to_string(), false))?;
+        // one short line: its head is enough, the rest is read and dropped
+        let reader = PipeThread::start(move || String::from_utf8_lossy(&read_head(stdout, ERR_CAP)).into_owned());
         let finished = child.wait_for(Duration::from_secs(20));
         if !finished {
             child.kill();
@@ -742,6 +750,58 @@ impl<T: Send + Default + 'static> PipeThread<T> {
             }
         }
     }
+
+    /// Its result, if it comes within `timeout`; else `None`, and the
+    /// thread is left to end once its pipe closes (kill the worker first).
+    fn within(&self, timeout: Duration) -> Option<T> {
+        self.result.recv_timeout(timeout).ok()
+    }
+}
+
+/// What is kept of a worker's error messages (and of the probe's answer).
+const ERR_CAP: usize = 4 << 10;
+/// The longest line a model's worker answers: a text's vector takes under
+/// 1 KB, a photo's tags less; an error message may be longer.
+const LINE_CAP: usize = 256 << 10;
+
+/// At most `cap` bytes from `r`; `true` when it had more (the rest is not
+/// read). What a worker sends is read through this: a worker that a
+/// document took over could otherwise fill the service's memory.
+fn read_capped(r: impl Read, cap: usize) -> (Vec<u8>, bool) {
+    let mut out = Vec::new();
+    let _ = r.take(cap as u64 + 1).read_to_end(&mut out);
+    let over = out.len() > cap;
+    out.truncate(cap);
+    (out, over)
+}
+
+/// The first `cap` bytes from `r`; the rest is read and dropped, so the
+/// worker is not held up writing it.
+fn read_head(mut r: impl Read, cap: usize) -> Vec<u8> {
+    let (head, over) = read_capped(&mut r, cap);
+    if over {
+        let _ = std::io::copy(&mut r, &mut std::io::sink());
+    }
+    head
+}
+
+/// One line of at most `cap` bytes, without its line end; `None` at the
+/// end. A longer line is an error, and nothing more should be read.
+fn line_within(r: &mut impl std::io::BufRead, cap: usize) -> std::io::Result<Option<String>> {
+    use std::io::BufRead;
+    let mut line = Vec::new();
+    if r.take(cap as u64 + 1).read_until(b'\n', &mut line)? == 0 {
+        return Ok(None);
+    }
+    if line.last() == Some(&b'\n') {
+        line.pop();
+        if line.last() == Some(&b'\r') {
+            line.pop();
+        }
+    } else if line.len() > cap {
+        return Err(std::io::Error::new(std::io::ErrorKind::FileTooLarge, format!("a line longer than {} KB", cap >> 10)));
+    }
+    String::from_utf8(line).map(Some).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
 // Broker side of the photo tags: one worker process that keeps the model
@@ -760,6 +820,9 @@ pub struct TagWorker {
     pub timeout: Duration,
     running: Option<RunningTagger>,
 }
+
+/// What `TagWorker` answers for a file of no bytes, without asking.
+const EMPTY: &str = "empty file";
 
 /// The text model's worker (search by meaning): the same process kind as
 /// `TagWorker`, in its `--embed` mode.
@@ -804,13 +867,14 @@ struct RunningTagger {
     _job: Job,
     child: crate::spawn::Child,
     stdin: std::fs::File,
-    lines: std::sync::mpsc::Receiver<String>,
+    /// Its answers, a line each; an error ends them (a line too long).
+    lines: std::sync::mpsc::Receiver<Result<String, String>>,
 }
 
 impl Drop for RunningTagger {
     fn drop(&mut self) {
-        let _ = self.stdin.write_all(&0u32.to_le_bytes());
-        let _ = self.stdin.flush();
+        // killed without a word: a worker that stopped reading would hold
+        // up a write to its stdin
         self.child.kill();
         let _ = self.child.wait_for(Duration::from_secs(5));
     }
@@ -856,12 +920,18 @@ impl TagWorker {
             child.kill();
             return Err(format!("the tagger stopped: {e}"));
         }
-        let (tx, lines) = std::sync::mpsc::channel();
+        // a few answers ahead at most: a worker that sends more waits
+        let (tx, lines) = std::sync::mpsc::sync_channel(2);
         std::thread::spawn(move || {
-            use std::io::BufRead;
-            for line in std::io::BufReader::new(stdout).lines() {
-                let Ok(line) = line else { return };
-                if tx.send(line).is_err() {
+            let mut stdout = std::io::BufReader::new(stdout);
+            loop {
+                let line = match line_within(&mut stdout, LINE_CAP) {
+                    Ok(Some(line)) => Ok(line),
+                    Err(e) if e.kind() == std::io::ErrorKind::FileTooLarge => Err(format!("the worker sent {e}")),
+                    _ => return,
+                };
+                let end = line.is_err();
+                if tx.send(line).is_err() || end {
                     return;
                 }
             }
@@ -871,6 +941,10 @@ impl TagWorker {
 
     /// The tags of one photo: `(label, share)`, best first.
     pub fn tags(&mut self, bytes: &[u8]) -> Result<Vec<(usize, f32)>, String> {
+        // the photo's trouble, not the model's
+        if bytes.is_empty() {
+            return Err(format!("{}: {EMPTY}", crate::tags::UNDECODABLE));
+        }
         let list = self.ask(bytes)?;
         Ok(list
             .split(',')
@@ -881,19 +955,47 @@ impl TagWorker {
             .collect())
     }
 
-    /// One request; the answer after `ok<TAB>`.
+    /// One request; the answer after `ok<TAB>`. Nothing is empty: a zero
+    /// length tells the worker to stop.
     fn ask(&mut self, bytes: &[u8]) -> Result<String, String> {
+        if bytes.is_empty() {
+            return Err(EMPTY.into());
+        }
         if self.running.is_none() {
             self.running = Some(self.start()?);
         }
         let run = self.running.as_mut().expect("started");
-        let sent = run.stdin.write_all(&(bytes.len() as u32).to_le_bytes()).and_then(|_| run.stdin.write_all(bytes)).and_then(|_| run.stdin.flush());
-        if let Err(e) = sent {
+        // written by a thread of its own: a worker that stops reading its
+        // stdin without ending would hold this one up for good
+        let mut stdin = match run.stdin.try_clone() {
+            Ok(s) => s,
+            Err(e) => {
+                self.running = None;
+                return Err(format!("the tagger stopped: {e}"));
+            }
+        };
+        let mut request = Vec::with_capacity(4 + bytes.len());
+        request.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        request.extend_from_slice(bytes);
+        let writer = PipeThread::start(move || Some(stdin.write_all(&request).and_then(|_| stdin.flush()).map_err(|e| e.to_string())));
+        let sent = writer.within(self.timeout);
+        if !matches!(sent, Some(Some(Ok(())))) {
+            // killed first, so the write ends too
+            run.child.kill();
+            writer.finish();
             self.running = None;
-            return Err(format!("the tagger stopped: {e}"));
+            return Err(match sent {
+                Some(Some(Err(e))) => format!("the tagger stopped: {e}"),
+                _ => format!("the tagger took no request in {} s", self.timeout.as_secs()),
+            });
         }
         let line = match run.lines.recv_timeout(self.timeout) {
-            Ok(line) => line,
+            Ok(Ok(line)) => line,
+            Ok(Err(e)) => {
+                // what else it sends is no answer to anything
+                self.running = None;
+                return Err(e);
+            }
             Err(_) => {
                 // too slow, out of memory or crashed: a new one next time
                 self.running = None;
@@ -1133,6 +1235,39 @@ mod tests {
         assert_eq!(reader.finish(), b"partial");
         assert!(t.elapsed() < Duration::from_secs(10), "{:?}", t.elapsed());
         drop(write);
+    }
+
+    #[test]
+    fn what_a_worker_sends_is_read_up_to_a_cap() {
+        use std::io::Cursor;
+        assert_eq!(read_capped(Cursor::new(b"Fabc"), 4), (b"Fabc".to_vec(), false));
+        assert_eq!(read_capped(Cursor::new(b"Fabcd"), 4), (b"Fabc".to_vec(), true));
+        // the rest of an error message is read, not kept
+        let mut long = Cursor::new(vec![b'x'; 10_000]);
+        assert_eq!(read_head(&mut long, 100).len(), 100);
+        assert_eq!(long.position(), 10_000);
+
+        let mut lines = Cursor::new(b"ok\t1:0.5\r\nerr\tno\nlast".to_vec());
+        assert_eq!(line_within(&mut lines, 16).unwrap().as_deref(), Some("ok\t1:0.5"));
+        assert_eq!(line_within(&mut lines, 16).unwrap().as_deref(), Some("err\tno"));
+        assert_eq!(line_within(&mut lines, 16).unwrap().as_deref(), Some("last"));
+        assert!(line_within(&mut lines, 16).unwrap().is_none());
+        // exactly the cap fits, one byte more does not
+        let mut lines = Cursor::new(b"abcd\nabcde\n".to_vec());
+        assert_eq!(line_within(&mut lines, 4).unwrap().as_deref(), Some("abcd"));
+        assert_eq!(line_within(&mut lines, 4).unwrap_err().kind(), std::io::ErrorKind::FileTooLarge);
+    }
+
+    #[test]
+    fn an_empty_file_is_not_sent_to_the_model() {
+        // a zero length would stop the worker: refused before it starts
+        let missing = std::env::temp_dir().join(format!("whereti-no-model-{}", std::process::id()));
+        let mut tagger = TagWorker::with_exe(missing.with_extension("exe"), &missing);
+        let e = tagger.tags(&[]).unwrap_err();
+        assert!(e.starts_with(crate::tags::UNDECODABLE) && e.ends_with("empty file"), "{e}");
+        assert!(tagger.running.is_none());
+        let mut embedder = EmbedWorker::with_exe(missing.with_extension("exe"), &missing, &missing);
+        assert_eq!(embedder.embed("").unwrap_err(), "empty file");
     }
 
     #[test]

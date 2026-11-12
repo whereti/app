@@ -40,9 +40,9 @@ pub fn run(args: InspectArgs) -> Result<(), String> {
     let frn = ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64;
     let record = frn & FRN_MASK;
     let ft = ((info.ftLastWriteTime.dwHighDateTime as u64) << 32) | info.ftLastWriteTime.dwLowDateTime as u64;
-    println!("path              {}", args.path.display());
-    println!("MFT record        {record} (sequence {})", frn >> 48);
-    println!("Windows says      modified minute {}", ft / 600_000_000);
+    outln!("path              {}", args.path.display());
+    outln!("MFT record        {record} (sequence {})", frn >> 48);
+    outln!("Windows says      modified minute {}", ft / 600_000_000);
 
     // the drive of the full path (a relative path or `.` names none)
     let full = std::fs::canonicalize(&args.path).map_err(|e| format!("cannot resolve {}: {e}", args.path.display()))?;
@@ -58,28 +58,28 @@ pub fn run(args: InspectArgs) -> Result<(), String> {
         Some(r) => {
             let std = r.std.unwrap_or_default();
             let names: Vec<_> = r.names.iter().map(|n| (n.parent_ref & FRN_MASK, n.namespace, n.name.as_str())).collect();
-            println!(
+            outln!(
                 "MFT record says   modified minute {} · size {:?} · names {names:?} · attribute list {}",
                 std.modified / 600_000_000,
                 r.data_size,
                 r.has_attribute_list
             );
         }
-        None => println!("MFT record says   not in use"),
+        None => outln!("MFT record says   not in use"),
     }
 
     let path = args.index.unwrap_or_else(default_index_path);
     let index = snapshot::load(&path).map_err(|e| e.to_string())?;
     let Some(v) = index.volume_index(letter) else {
-        println!("index             volume {letter}: not indexed");
+        outln!("index             volume {letter}: not indexed");
         return Ok(());
     };
     let entries = index.entries_for_record(v, record);
     if entries.is_empty() {
-        println!("index             no entry for this record");
+        outln!("index             no entry for this record");
     }
     for e in entries {
-        println!(
+        outln!(
             "index entry {e:>8}  modified minute {} · size {} · flags {:#06x} · {}",
             index.modified(e),
             index.size(e),
