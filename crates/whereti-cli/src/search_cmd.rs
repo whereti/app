@@ -296,7 +296,9 @@ pub fn status(args: StatusArgs) -> Result<(), String> {
 fn query_text(args: &[String]) -> String {
     args.iter()
         .map(|a| {
-            if !a.contains(char::is_whitespace) || a.contains('"') {
+            // `"raport | factura"`: a whole search in one argument, as a shell
+            // that reads `|` itself needs it (PowerShell, cmd), not one name
+            if !a.contains(char::is_whitespace) || a.contains('"') || a.contains('|') {
                 return a.clone();
             }
             // `name:value with spaces` quotes the value, so the function stays
@@ -482,5 +484,8 @@ mod tests {
         assert_eq!(q(&[r"!path:C:\Program Files"]), r#"!path:"C:\Program Files""#);
         assert_eq!(q(&[r"C:\Program Files"]), r#""C:\Program Files""#);
         assert_eq!(q(&[r#"say "hi" there"#]), r#"say "hi" there"#);
+        // a search with | is passed whole: the parser reads its spaces
+        assert_eq!(q(&["raport | factura"]), "raport | factura");
+        assert_eq!(q(&["content:chirie | content:rata", "ext:pdf"]), "content:chirie | content:rata ext:pdf");
     }
 }

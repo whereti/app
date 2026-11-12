@@ -410,7 +410,9 @@ impl Exclusions {
                 _ => continue,
             };
             let comps: Vec<String> = rest.split('\\').filter(|c| !c.is_empty()).map(fold).collect();
-            if !comps.is_empty() {
+            // a path with `*` in it names no file, and one that starts with
+            // `**` would pass for the any-depth rule above without its name
+            if !comps.is_empty() && !comps.iter().any(|c| c.contains('*')) {
                 out.push((id, comps));
             }
         }

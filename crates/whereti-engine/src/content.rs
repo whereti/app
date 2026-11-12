@@ -580,8 +580,8 @@ impl Content {
         if !self.meaning_ready() {
             return None;
         }
-        let (words, _) = split_query(query);
-        let question = crate::meaning::question(&words)?;
+        let (wanted, _) = split_query(query);
+        let question = crate::meaning::question(&wanted.words)?;
         // never wait long behind the indexing for the model
         let mut model = self.model.try_lock_for(Duration::from_secs(3))?;
         let v = model.embed(&format!("query: {question}")).ok()?;
@@ -1426,8 +1426,8 @@ impl Content {
     ) -> ContentReply {
         let t = Instant::now();
         let Some(index) = self.index() else { return ContentReply::default() };
-        let (words, filters) = split_query(query);
-        if words.trim().is_empty() {
+        let (wanted, filters) = split_query(query);
+        if wanted.is_empty() {
             return ContentReply::default();
         }
         let (prop_clauses, filters) = crate::props::split(&filters);
@@ -1440,7 +1440,7 @@ impl Content {
         let mut seen: HashSet<u32> = HashSet::new();
         let (mut depth, mut looked) = (SEARCH_DEPTH, 0usize);
         loop {
-            let hits = match index.search(&words, depth) {
+            let hits = match index.search_any(&wanted.words, &wanted.any, depth) {
                 Ok(h) => h,
                 Err(e) => return ContentReply { note: Some(format!("content search failed: {e}")), ..Default::default() },
             };
@@ -1627,8 +1627,18 @@ fn content_hash(cache: &HashCache, path: &str, size: u64, read: bool) -> Hashed 
 /// What a "search the documents not indexed yet" goes through.
 #[derive(Default)]
 pub struct ScanPlan {
+    /// Folded words the text must have, all of them.
     needles: Vec<String>,
+    /// And of each list, all the words of one entry at least.
+    any: Vec<Vec<Vec<String>>>,
     candidates: Vec<Candidate>,
+}
+
+impl ScanPlan {
+    fn matches(&self, folded: &str) -> bool {
+        let has = |w: &String| folded.contains(w.as_str());
+        self.needles.iter().all(has) && self.any.iter().all(|list| list.iter().any(|entry| entry.iter().all(has)))
+    }
 }
 
 impl Content {
@@ -1636,10 +1646,19 @@ impl Content {
     /// query's other conditions, newest first. Needs the name index (held
     /// briefly by the caller); reads nothing.
     pub fn scan_plan(&self, idx: &NameIndex, query: &Query) -> ScanPlan {
-        let (words, filters) = split_query(query);
-        let needles: Vec<String> =
-            words.split_whitespace().map(|w| fold(w.trim_matches('"'))).filter(|w| !w.is_empty()).collect();
-        if needles.is_empty() {
+        let (wanted, filters) = split_query(query);
+        let folded = |text: &str| -> Vec<String> {
+            text.split_whitespace().map(|w| fold(w.trim_matches('"'))).filter(|w| !w.is_empty()).collect()
+        };
+        let needles = folded(&wanted.words);
+        // an entry without a word to look for leaves its list asking for nothing
+        let any: Vec<Vec<Vec<String>>> = wanted
+            .any
+            .iter()
+            .map(|list| list.iter().map(|entry| folded(entry)).filter(|e| !e.is_empty()).collect::<Vec<_>>())
+            .filter(|list| !list.is_empty())
+            .collect();
+        if needles.is_empty() && any.is_empty() {
             return ScanPlan::default();
         }
         // not files that crashed the service, nor pictures merely waiting for
@@ -1665,7 +1684,7 @@ impl Content {
             candidates.retain(|c| keep.contains(&c.path));
         }
         candidates.sort_by(|a, b| b.modified.cmp(&a.modified).then(a.key.cmp(&b.key)));
-        ScanPlan { needles, candidates }
+        ScanPlan { needles, any, candidates }
     }
 
     /// One step: reads documents from `skip` on, for about `budget`, and
@@ -1692,7 +1711,7 @@ impl Content {
                     // parsed in this process (a photo's place): marked like the indexing does
                     if let Ok((_, text)) = extract(c, sandbox.as_ref(), None, None, &mut Looked::No, &|on| self.reading(c.key, on)) {
                         let folded = fold(&text);
-                        if plan.needles.iter().all(|w| folded.contains(w.as_str())) {
+                        if plan.matches(&folded) {
                             rows.push(Row { path: c.path.clone(), is_dir: false, size: c.size, modified: c.modified, flags: 0 });
                         }
                     }
@@ -1747,32 +1766,86 @@ fn ext_of(path: &str) -> String {
     path.rsplit_once('.').map(|(_, e)| e).filter(|e| !e.contains('\\')).unwrap_or("").to_ascii_lowercase()
 }
 
+/// What a query asks of the text of files.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Wanted {
+    /// Every one of these words.
+    pub words: String,
+    /// And of each list, one entry at least (`content:a | content:b`).
+    pub any: Vec<Vec<String>>,
+}
+
+impl Wanted {
+    pub fn is_empty(&self) -> bool {
+        self.words.trim().is_empty() && self.any.is_empty()
+    }
+}
+
+/// The words of a `|` list when all of them are of one kind (`pick` tells).
+fn all_of<'a>(terms: &'a [Term], pick: impl Fn(&'a Term) -> Option<&'a String>) -> Option<Vec<String>> {
+    terms.iter().map(|t| pick(t).cloned()).collect()
+}
+
+fn content_word(t: &Term) -> Option<&String> {
+    match t {
+        Term::Content(w) => Some(w),
+        _ => None,
+    }
+}
+
 /// Separates the words to look for in file contents from the conditions
 /// that filter the files. With `content:` terms, plain words stay name
 /// conditions (`raport content:total` = name has „raport”, text has „total”).
-pub fn split_query(query: &Query) -> (String, Query) {
+/// A `|` list of words of one kind asks for one of them (`loc:roma | loc:paris`).
+pub fn split_query(query: &Query) -> (Wanted, Query) {
     // content: makes the other words name filters; loc: does not (a photo's
     // name says nothing, its text is where it was taken)
-    let content_clause = |c: &Clause| !c.negated && matches!(c.any_of.as_slice(), [Term::Content(_)]);
-    let explicit = query.clauses.iter().any(content_clause);
+    let explicit = query.clauses.iter().any(|c| !c.negated && !c.any_of.is_empty() && all_of(&c.any_of, content_word).is_some());
     let mut words = Vec::new();
+    let mut any = Vec::new();
     let mut filters = Query::default();
+    // the place names are in the text of photos: look among photos only
+    let among_photos = |filters: &mut Query| {
+        let photos = PHOTO_EXTS.iter().chain(whereti_query::kinds::RAW).map(|e| e.to_string()).collect();
+        filters.clauses.push(Clause { negated: false, any_of: vec![Term::Ext(photos)] });
+    };
     for c in &query.clauses {
+        let places = all_of(&c.any_of, |t| if let Term::Place(w) = t { Some(w) } else { None });
+        let texts = all_of(&c.any_of, |t| if let Term::Text(w) = t { Some(w) } else { None });
         match (c.negated, c.any_of.as_slice()) {
             (false, [Term::Content(t)]) => words.push(t.clone()),
             (false, [Term::Place(t)]) => {
-                // the place names are in the text of photos: look among photos only
                 words.push(t.clone());
-                let photos = PHOTO_EXTS.iter().chain(whereti_query::kinds::RAW).map(|e| e.to_string()).collect();
-                filters.clauses.push(Clause { negated: false, any_of: vec![Term::Ext(photos)] });
+                among_photos(&mut filters);
             }
             (false, [Term::Text(t)]) if !explicit => words.push(t.clone()),
-            // a negated or OR-ed content term cannot filter by name
+            (false, [_, _, ..]) if all_of(&c.any_of, content_word).is_some() => any.extend(all_of(&c.any_of, content_word)),
+            (false, [_, _, ..]) if places.is_some() => {
+                any.extend(places);
+                among_photos(&mut filters);
+            }
+            (false, [_, _, ..]) if texts.is_some() && !explicit => any.extend(texts),
+            // negated, or in a list with another kind of word: it cannot
+            // filter by name either (`not_applied` says so)
             _ if c.any_of.iter().any(|t| matches!(t, Term::Content(_) | Term::Place(_))) => {}
             _ => filters.clauses.push(c.clone()),
         }
     }
-    (words.join(" "), filters)
+    (Wanted { words: words.join(" "), any }, filters)
+}
+
+/// A warning for a `content:` or `loc:` condition that `split_query` leaves
+/// out: one that is negated, or in a `|` list with another kind of word.
+pub fn not_applied(query: &Query) -> Option<String> {
+    let in_text = |t: &Term| matches!(t, Term::Content(_) | Term::Place(_));
+    let left_out = |c: &Clause| {
+        let one_kind = all_of(&c.any_of, content_word).is_some() || c.any_of.iter().all(|t| matches!(t, Term::Place(_)));
+        c.any_of.iter().any(in_text) && (c.negated || !one_kind)
+    };
+    query.clauses.iter().any(left_out).then(|| {
+        "content: and loc: cannot be negated (!) or put in a | list with other kinds of words; that part of the search is not applied"
+            .to_string()
+    })
 }
 
 struct Candidate {
@@ -2456,12 +2529,12 @@ mod tests {
     #[test]
     fn loc_looks_for_the_place_among_photos() {
         let ctx = DateCtx { now: 0, tz_offset: 0 };
-        let (words, filters) = split_query(&parse("loc:Roma", &ctx));
-        assert_eq!(words, "roma");
+        let (wanted, filters) = split_query(&parse("loc:Roma", &ctx));
+        assert_eq!(wanted.words, "roma");
         assert!(filters.clauses.iter().any(|c| matches!(c.any_of.as_slice(), [Term::Ext(e)] if e.contains(&"heic".to_string()))));
         // with other words, all of them must be in the photo's text
-        let (words, _) = split_query(&parse("loc:italia plaja", &ctx));
-        assert_eq!(words, "italia plaja");
+        let (wanted, _) = split_query(&parse("loc:italia plaja", &ctx));
+        assert_eq!(wanted.words, "italia plaja");
     }
 
     #[test]
@@ -2477,7 +2550,8 @@ mod tests {
 
     fn split(q: &str) -> (String, usize) {
         let (w, f) = split_query(&parse(q, &DateCtx { now: 0, tz_offset: 0 }));
-        (w, f.clauses.len())
+        assert!(w.any.is_empty(), "{q}: no | list expected");
+        (w.words, f.clauses.len())
     }
 
     #[test]
@@ -2487,6 +2561,56 @@ mod tests {
         assert_eq!(split("*.pdf"), ("".into(), 1));
         assert_eq!(split("raport content:total"), ("total".into(), 1), "with content:, words stay name conditions");
         assert_eq!(split("!content:x factura"), ("factura".into(), 0), "a negated content term is ignored");
+    }
+
+    #[test]
+    fn a_list_of_words_of_one_kind_asks_for_one_of_them() {
+        let ctx = DateCtx { now: 0, tz_offset: 0 };
+        let wanted = |q: &str| split_query(&parse(q, &ctx));
+        let list = |words: &[&str]| vec![words.iter().map(|w| w.to_string()).collect::<Vec<_>>()];
+
+        let (w, f) = wanted("content:chirie | content:rata");
+        assert_eq!((w.words.as_str(), &w.any, f.clauses.len()), ("", &list(&["chirie", "rata"]), 0));
+        assert_eq!(wanted("content:chirie|content:rata").0, w, "with or without spaces");
+
+        // places: among photos, as a single loc: is
+        let (w, f) = wanted("loc:roma | loc:paris");
+        assert_eq!(w.any, list(&["roma", "paris"]));
+        assert!(matches!(f.clauses.as_slice(), [Clause { negated: false, any_of }] if matches!(any_of.as_slice(), [Term::Ext(_)])));
+
+        // plain words: in the text too, unless content: says which words are for the text
+        let (w, f) = wanted("factura | chitanta 2024");
+        assert_eq!((w.words.as_str(), &w.any, f.clauses.len()), ("2024", &list(&["factura", "chitanta"]), 0));
+        let (w, f) = wanted("factura | chitanta content:total");
+        assert_eq!((w.words.as_str(), w.any.len(), f.clauses.len()), ("total", 0, 1));
+
+        // nothing to look for in the text: no content search at all
+        assert!(wanted("ext:pdf").0.is_empty() && !wanted("content:a|content:b").0.is_empty());
+    }
+
+    #[test]
+    fn a_condition_on_the_text_that_is_left_out_is_said() {
+        let ctx = DateCtx { now: 0, tz_offset: 0 };
+        let warned = |q: &str| not_applied(&parse(q, &ctx)).is_some();
+        assert!(warned("raport !content:draft"));
+        assert!(warned("!loc:roma"));
+        assert!(warned("loc:roma | paris"), "a place or a name: two kinds of words");
+        assert!(warned("content:a | loc:b"));
+        assert!(!warned("content:a | content:b") && !warned("loc:roma | loc:paris"));
+        assert!(!warned("raport content:total loc:roma") && !warned("raport | factura !tmp"));
+    }
+
+    #[test]
+    fn the_documents_not_indexed_yet_take_lists_too() {
+        let plan = ScanPlan {
+            needles: vec![fold("2024")],
+            any: vec![vec![vec![fold("factura")], vec![fold("contract"), fold("chirie")]]],
+            candidates: Vec::new(),
+        };
+        assert!(plan.matches(&fold("Factura din 2024")));
+        assert!(plan.matches(&fold("contract de chirie, 2024")));
+        assert!(!plan.matches(&fold("contract de vânzare, 2024")), "an entry of two words needs both");
+        assert!(!plan.matches(&fold("factura din 2023")));
     }
 
     #[test]
@@ -2519,6 +2643,7 @@ mod tests {
         };
         let plan = ScanPlan {
             needles: vec![fold("chirie"), fold("Iulie")],
+            any: Vec::new(),
             candidates: vec![
                 file("a.txt", "Chiria pe iulie: 1200 lei", 30),
                 file("b.txt", "nimic aici", 20),

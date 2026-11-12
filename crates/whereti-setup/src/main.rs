@@ -31,6 +31,8 @@ use eframe::egui::{
 static VERSION_MARK: &str = concat!("WHERETI-SETUP-VERSION=", env!("CARGO_PKG_VERSION"), "\0");
 
 fn main() {
+    // a panic stops the program at once, except in a guarded parser
+    whereti_guard::stop_on_panic();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let has = |a: &str| args.iter().any(|x| x.eq_ignore_ascii_case(a));
     let uninstalling = has("/uninstall") || has("--uninstall");
@@ -203,6 +205,8 @@ impl Setup {
                 elevated_or_not("--do-install", ops::install).map(|()| {
                     if !updated {
                         ops::set_autostart(autostart);
+                        // the app's first start keeps this answer
+                        ops::note_autostart_asked();
                     }
                 })
             };

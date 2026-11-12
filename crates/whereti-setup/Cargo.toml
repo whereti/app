@@ -16,6 +16,7 @@ windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Security"
 windows-service = "0.8.1"
 zstd = { version = "0.14.3", default-features = false }
 whereti-i18n = { version = "1.0.1", path = "../whereti-i18n" }
+whereti-guard = { version = "1.0.1", path = "../whereti-guard" }
 
 [build-dependencies]
 zstd = { version = "0.14.3", default-features = false, features = ["zstdmt"] }

@@ -36,6 +36,8 @@ pub(crate) use whereti_i18n::{trf, trn};
 use eframe::egui::{self, FontData, FontDefinitions, FontFamily};
 
 fn main() -> eframe::Result<()> {
+    // a panic stops the program at once, except in a guarded parser
+    whereti_guard::stop_on_panic();
     // --hidden: started with Windows (or restored by it after a restart):
     // wait in the tray, and never bring up a whereti that already runs
     let visible = !std::env::args().any(|a| a == "--hidden");

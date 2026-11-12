@@ -15,6 +15,7 @@ raw-window-handle = "0.6"
 serde_json = "1.0.154"
 tray-icon = "0.26.1"
 whereti-extract = { version = "1.0.1", path = "../whereti-extract" }
+whereti-guard = { version = "1.0.1", path = "../whereti-guard" }
 whereti-i18n = { version = "1.0.1", path = "../whereti-i18n" }
 whereti-ipc = { version = "1.0.1", path = "../whereti-ipc" }
 whereti-net = { version = "1.0.1", path = "../whereti-net" }

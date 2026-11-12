@@ -578,6 +578,16 @@ fn rules_that_look_around_parse_strictly() {
 }
 
 #[test]
+fn a_path_with_a_star_is_no_rule() {
+    // `C:\**` is not "everything on C:", nor the any-depth rule without its name
+    let paths = [r"C:\**", r"\**", r"C:\**\foo\bar", r"C:\Users\*\AppData", r"**\node_modules", r"C:\Temp"];
+    let e = Exclusions { paths: paths.iter().map(|p| p.to_string()).collect() };
+    let rules = e.for_volume('C');
+    assert_eq!(rules, vec![vec!["**".to_string(), "node_modules".to_string()], vec!["temp".to_string()]]);
+    assert!(rules.iter().all(|r| r[0] != "**" || r.len() == 2), "an any-depth rule always has its name");
+}
+
+#[test]
 fn app_internals_go_only_below_appdata() {
     let c = scan(vec![
         d(5, 5, "."),

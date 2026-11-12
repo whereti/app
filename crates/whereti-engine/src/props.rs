@@ -58,7 +58,7 @@ pub fn has_props(ext: &str) -> bool {
 /// camera's local time.
 pub fn read(path: &Path, ext: &str, tz_offset: i32) -> Props {
     // the readers return errors for bad files; this is for their bugs
-    std::panic::catch_unwind(|| read_inner(path, ext, tz_offset)).unwrap_or_default()
+    whereti_guard::guarded(|| read_inner(path, ext, tz_offset)).unwrap_or_default()
 }
 
 fn read_inner(path: &Path, ext: &str, tz_offset: i32) -> Props {

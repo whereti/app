@@ -10,6 +10,7 @@ default-members = [
     "crates/whereti-core",
     "crates/whereti-engine",
     "crates/whereti-extract",
+    "crates/whereti-guard",
     "crates/whereti-i18n",
     "crates/whereti-ipc",
     "crates/whereti-net",
@@ -30,4 +31,6 @@ repository = "https://github.com/whereti/app"
 debug = 1
 lto = "thin"
 codegen-units = 1
-panic = "abort"
+# "unwind", so that a parser of damaged files can be guarded: the programs
+# still stop at once on any other panic (crates/whereti-guard)
+panic = "unwind"

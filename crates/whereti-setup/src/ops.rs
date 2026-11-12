@@ -721,6 +721,34 @@ pub fn set_autostart(on: bool) {
     }
 }
 
+/// Notes in the user's settings that "Start whereti with Windows" was asked
+/// here: the app turns it on at its very first start unless it reads this,
+/// which would undo a box left unticked.
+pub fn note_autostart_asked() {
+    let Some(base) = std::env::var_os("APPDATA") else { return };
+    let dir = PathBuf::from(base).join("whereti");
+    let file = dir.join("settings.txt");
+    let text = match std::fs::read_to_string(&file) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        // a file that cannot be read is not written over
+        Err(_) => return,
+    };
+    if let Some(noted) = with_autostart_asked(&text) {
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::write(&file, noted);
+    }
+}
+
+/// The settings text with the line the app reads as "starting with Windows
+/// was offered"; `None` when it is there already.
+fn with_autostart_asked(text: &str) -> Option<String> {
+    const LINE: &str = "autostart_offered=yes";
+    let there = text.lines().any(|l| l.split_once('=').is_some_and(|(k, v)| (k.trim(), v.trim()) == ("autostart_offered", "yes")));
+    let gap = if text.is_empty() || text.ends_with('\n') { "" } else { "\n" };
+    (!there).then(|| format!("{text}{gap}{LINE}\n"))
+}
+
 /// Starts the installed app as the current (not elevated) user.
 pub fn launch_app() {
     start_app("--welcome");
@@ -880,6 +908,17 @@ pub fn remove_user_settings() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_answer_about_starting_with_windows_is_noted_once() {
+        use super::with_autostart_asked as noted;
+        assert_eq!(noted("").as_deref(), Some("autostart_offered=yes\n"));
+        assert_eq!(noted("theme=dark").as_deref(), Some("theme=dark\nautostart_offered=yes\n"));
+        assert_eq!(noted("theme=dark\n").as_deref(), Some("theme=dark\nautostart_offered=yes\n"));
+        // as the app reads it: spaces around are fine
+        assert_eq!(noted("theme=dark\n autostart_offered = yes \n"), None);
+        assert_eq!(noted("autostart_offered=yes\n"), None);
+    }
+
     #[test]
     fn every_packed_program_unpacks_whole() {
         let mut total = 0u64;

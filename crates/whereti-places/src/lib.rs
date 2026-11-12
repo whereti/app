@@ -230,7 +230,7 @@ pub fn place_of(lat: f64, lon: f64) -> Option<Place> {
 /// file's start (EXIF lives there in JPEG) or, for HEIC, the whole file.
 /// Never panics on a damaged file.
 pub fn gps(bytes: &[u8]) -> Option<(f64, f64)> {
-    std::panic::catch_unwind(|| gps_inner(bytes)).ok().flatten()
+    whereti_guard::guarded(|| gps_inner(bytes)).flatten()
 }
 
 fn gps_inner(bytes: &[u8]) -> Option<(f64, f64)> {

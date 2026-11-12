@@ -33,6 +33,8 @@ const DESCRIPTION: &str =
 define_windows_service!(ffi_service_main, service_main);
 
 fn main() {
+    // a panic stops the program at once, except in a guarded parser
+    whereti_guard::stop_on_panic();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
         Some("run") => service_dispatcher::start(SERVICE_NAME, ffi_service_main).map_err(|e| e.to_string()),

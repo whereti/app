@@ -72,6 +72,7 @@ and Windows Firewall keeps it off the network.
 | `whereti-app` | The app (egui): search window, preview, settings, tray |
 | `whereti-i18n` | The 8 languages |
 | `whereti-net` | HTTPS downloads (WinHTTP) with SHA-256 checks |
+| `whereti-guard` | What a bug met while parsing does: it costs that one file; anywhere else, the program stops at once |
 | `whereti-cli` | `wt`: search, status and diagnostics from the command line |
 | `whereti-setup` | The installer |
 

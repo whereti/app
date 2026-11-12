@@ -222,8 +222,33 @@ impl ContentIndex {
     /// incomplete (search as you type): `factur` finds „factura”. Several
     /// words in this order rank higher.
     pub fn search(&self, text: &str, limit: usize) -> tantivy::Result<Hits> {
-        let Some(query) = self.build_query(text) else {
-            return Ok(Hits { keys: Vec::new(), total: 0 });
+        self.search_any(text, &[], limit)
+    }
+
+    /// Like `search`, and for each list in `any` the text must also have one
+    /// of its entries at least (`content:a | content:b`). Each entry is
+    /// looked for as `text` is: all its words, the last one maybe incomplete.
+    pub fn search_any(&self, text: &str, any: &[Vec<String>], limit: usize) -> tantivy::Result<Hits> {
+        let nothing = Ok(Hits { keys: Vec::new(), total: 0 });
+        let mut parts: Vec<(Occur, Box<dyn Query>)> = Vec::new();
+        match self.build_query(text) {
+            Some(q) => parts.push((Occur::Must, q)),
+            // words that cannot be searched are not left out of the question
+            None if !tokenize(text, false).is_empty() => return nothing,
+            None => {}
+        }
+        for group in any {
+            let entries: Vec<(Occur, Box<dyn Query>)> =
+                group.iter().filter_map(|t| self.build_query(t)).map(|q| (Occur::Should, q)).collect();
+            if !entries.is_empty() {
+                parts.push((Occur::Must, Box::new(BooleanQuery::new(entries))));
+            }
+        }
+        let query: Box<dyn Query> = match parts.len() {
+            0 => return nothing,
+            // the words alone: scored as they always were
+            1 => parts.remove(0).1,
+            _ => Box::new(BooleanQuery::new(parts)),
         };
         let searcher = self.reader.searcher();
         let (top, total) = searcher.search(&*query, &(TopDocs::with_limit(limit.max(1)).order_by_score(), Count))?;
@@ -375,6 +400,28 @@ mod tests {
 
     fn ok(size: u64) -> Indexed {
         Indexed { size, modified: 100, status: Status::Ok }
+    }
+
+    #[test]
+    fn one_of_several_words_is_enough_where_asked() {
+        let idx = ContentIndex::in_memory().unwrap();
+        idx.put(key('C', 1), ok(1), "Factură pentru chirie, luna iulie").unwrap();
+        idx.put(key('C', 2), ok(2), "Contract de închiriere").unwrap();
+        idx.put(key('C', 3), ok(3), "Ofertă de preț pentru chirie").unwrap();
+        idx.commit().unwrap();
+        let keys = |text: &str, any: &[&[&str]]| {
+            let any: Vec<Vec<String>> = any.iter().map(|g| g.iter().map(|s| s.to_string()).collect()).collect();
+            let mut k: Vec<u64> = idx.search_any(text, &any, 10).unwrap().keys.into_iter().map(|k| k.0).collect();
+            k.sort_unstable();
+            k
+        };
+        assert_eq!(keys("", &[&["factura", "contract"]]), [key('C', 1), key('C', 2)]);
+        assert_eq!(keys("chirie", &[&["factura", "contract"]]), [key('C', 1)], "the words, and one of the list");
+        assert_eq!(keys("", &[&["factura", "oferta"], &["iulie", "pret"]]), [key('C', 1), key('C', 3)], "one of each list");
+        assert_eq!(keys("", &[&["factura pentru", "nimic"]]), [key('C', 1)], "an entry of several words needs them all");
+        assert!(keys("", &[&["nimic", "altceva"]]).is_empty());
+        assert!(keys("", &[]).is_empty() && keys("", &[&[" ,. "]]).is_empty());
+        assert_eq!(keys("chirie", &[]), keys("chirie", &[&[]]), "an empty list asks for nothing");
     }
 
     #[test]

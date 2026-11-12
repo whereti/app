@@ -129,6 +129,9 @@ pub struct WheretiApp {
     /// The user moved in the list (arrows, Page keys, a click) since the
     /// last edit of the search text: Delete then acts on the selected file.
     list_moved: bool,
+    /// The search text was edited since the window last came up: Delete in
+    /// a box emptied that way is not for the first file of the list.
+    typed_since_shown: bool,
     /// A file on a drive without a Recycle Bin, waiting for "Delete
     /// permanently?".
     confirm_delete: Option<String>,
@@ -238,6 +241,7 @@ impl WheretiApp {
             meaning_start: None,
             dupe_sets: Vec::new(),
             list_moved: false,
+            typed_since_shown: false,
             confirm_delete: None,
             grid_page: 1,
             renaming: None,
@@ -406,6 +410,7 @@ impl WheretiApp {
         ctx.send_viewport_cmd(ViewportCommand::Focus);
         self.visible = true;
         self.focus_search = true;
+        self.typed_since_shown = false;
         // the welcome page of a start in the tray waits to be seen
         if self.page != Page::Welcome {
             self.page = Page::Search;
@@ -958,9 +963,10 @@ impl WheretiApp {
         let selected_text = range.is_some_and(|r| !r.is_empty());
         let at_end = range.is_none_or(|r| r.primary.index.0 >= self.query.chars().count());
         // Delete acts on the file only when the list is what the user is in:
-        // the box is empty, or they moved in the list since they last typed.
-        // Never with Shift, Ctrl or Alt held.
-        let list_focus = self.query.is_empty() || self.list_moved;
+        // they moved in the list since they last typed, or the box is empty
+        // and was not typed in since the window came up (a box just emptied
+        // with Delete is still the box). Never with Shift, Ctrl or Alt held.
+        let list_focus = delete_is_for_list(self.query.is_empty(), self.list_moved, self.typed_since_shown);
         let (rename, delete, copy) = ctx.input_mut(|i| {
             let copy = !selected_text && i.events.iter().any(|e| matches!(e, egui::Event::Copy));
             if copy {
@@ -968,7 +974,7 @@ impl WheretiApp {
             }
             (
                 i.consume_key(Modifiers::NONE, Key::F2),
-                list_focus && !selected_text && at_end && i.modifiers.is_none() && i.consume_key(Modifiers::NONE, Key::Delete),
+                list_focus && !selected_text && at_end && i.modifiers.is_none() && pressed_once(i, Key::Delete),
                 copy,
             )
         });
@@ -1382,6 +1388,7 @@ impl WheretiApp {
                 if resp.changed() {
                     self.history_pos = None;
                     self.list_moved = false;
+                    self.typed_since_shown = true;
                     if self.page == Page::Welcome {
                         crate::welcome::finish(self);
                     }
@@ -2940,6 +2947,21 @@ impl WheretiApp {
 }
 
 /// Windows' "Animation effects" setting (Accessibility, Visual effects).
+/// Whether Delete is meant for the selected file and not for the search
+/// text: the user moved in the list since they last typed, or the box is
+/// empty and they did not type in it since the window came up.
+fn delete_is_for_list(box_empty: bool, list_moved: bool, typed_since_shown: bool) -> bool {
+    list_moved || (box_empty && !typed_since_shown)
+}
+
+/// `key` was just pressed, not held down: its repeats are taken with it and
+/// count for nothing (a held Delete must not go from file to file).
+fn pressed_once(i: &mut egui::InputState, key: Key) -> bool {
+    let fresh = i.events.iter().any(|e| matches!(e, egui::Event::Key { key: k, pressed: true, repeat: false, .. } if *k == key));
+    i.consume_key(Modifiers::NONE, key);
+    fresh
+}
+
 fn animations_on() -> bool {
     use windows_sys::Win32::UI::WindowsAndMessaging::{SystemParametersInfoW, SPI_GETCLIENTAREAANIMATION};
     let mut on: i32 = 1;
@@ -3253,6 +3275,8 @@ fn type_color(ext: &str, dark: bool) -> Color32 {
 fn highlight_needles(query: &str) -> Vec<String> {
     query
         .split_whitespace()
+        // each word of a list (`factura|chitanta`, `content:a|content:b`)
+        .flat_map(|w| w.split('|'))
         .map(|w| {
             ["content:", "contains:", "c:", "loc:", "location:", "place:"].iter().find_map(|p| w.strip_prefix(p)).unwrap_or(w)
         })
@@ -3434,6 +3458,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn delete_is_for_the_file_only_when_the_user_is_in_the_list() {
+        // a window just opened on the recent files
+        assert!(delete_is_for_list(true, false, false));
+        // a box emptied by typing (Delete held down, Ctrl+A then Delete): still the box
+        assert!(!delete_is_for_list(true, false, true));
+        // text in the box, the list not touched
+        assert!(!delete_is_for_list(false, false, false));
+        // an arrow key or a click since the last letter
+        assert!(delete_is_for_list(false, true, true));
+        assert!(delete_is_for_list(true, true, true));
+    }
+
+    #[test]
+    fn a_held_key_counts_once() {
+        let key = |repeat| egui::Event::Key { key: Key::Delete, physical_key: None, pressed: true, repeat, modifiers: Modifiers::NONE };
+        let mut held = egui::InputState::default();
+        held.events = vec![key(true), key(true)];
+        assert!(!pressed_once(&mut held, Key::Delete));
+        assert!(held.events.is_empty(), "the repeats do not reach the search box");
+        let mut pressed = egui::InputState::default();
+        pressed.events = vec![key(false), key(true)];
+        assert!(pressed_once(&mut pressed, Key::Delete));
+    }
+
+    #[test]
     fn english_is_the_default() {
         let _guard = crate::i18n::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         crate::i18n::set(crate::i18n::Lang::En);
@@ -3510,6 +3559,10 @@ mod tests {
     #[test]
     fn needles_skip_syntax() {
         assert_eq!(highlight_needles("Mașină ext:pdf !tmp *.doc raport"), vec!["masina", "raport"]);
+        // the words of a list, written with or without spaces
+        assert_eq!(highlight_needles("content:chirie|content:rata"), vec!["chirie", "rata"]);
+        assert_eq!(highlight_needles("loc:roma | loc:paris"), vec!["roma", "paris"]);
+        assert_eq!(highlight_needles("factura|chitanta ext:pdf|!tmp"), vec!["factura", "chitanta"]);
     }
 
     #[test]

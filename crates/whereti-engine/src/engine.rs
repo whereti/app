@@ -339,10 +339,12 @@ impl Engine {
                         flags: idx.flags(i),
                     })
                     .collect();
+                let mut warnings = res.warnings;
+                warnings.extend(crate::content::not_applied(&query));
                 Response::Search(SearchReply {
                     total: res.total as u64,
                     rows,
-                    warnings: res.warnings,
+                    warnings,
                     micros: t.elapsed().as_micros() as u64,
                     close: res.close as u64,
                     groups: Vec::new(),
@@ -1729,12 +1731,11 @@ fn validate_exclusions(paths: &[String]) -> Result<Vec<String>, String> {
         let p = p.trim_end_matches(SEP as char).to_string();
         let b = p.as_bytes();
         let any_depth = Exclusions::is_valid_any_depth(&p);
-        let ok = p.len() < 1024
-            && (any_depth
-                || (b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == SEP)
-                || (b.len() >= 2 && b[0] == SEP && b[1] != SEP));
-        if !ok {
-            return Err(format!(r"not a valid path to exclude: {p:?} (use C:\Folder or \Folder)"));
+        // a path is one folder or file: `*` stands for nothing in it
+        let path = !p.contains('*')
+            && ((b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == SEP) || (b.len() >= 2 && b[0] == SEP && b[1] != SEP));
+        if !(p.len() < 1024 && (any_depth || path)) {
+            return Err(format!(r"not a valid path to exclude: {p:?} (use C:\Folder, \Folder or **\name)"));
         }
         if !out.contains(&p) {
             out.push(p);
@@ -1754,6 +1755,11 @@ mod tests {
         assert!(validate_exclusions(&["Windows".into()]).is_err());
         assert!(validate_exclusions(&[r"\\server\share".into()]).is_err());
         assert!(validate_exclusions(&[String::new()]).is_err());
+        // a name at any depth is a rule; a `*` inside a path is not
+        assert!(validate_exclusions(&[r"**\node_modules".into()]).is_ok());
+        for bad in [r"C:\**", r"\**", r"C:\**\foo\bar", r"C:\Users\*\AppData"] {
+            assert!(validate_exclusions(&[bad.into()]).is_err(), "{bad}");
+        }
     }
 
     fn results(hits: &[u32], close: usize, total: usize) -> SearchResults {

@@ -900,8 +900,8 @@ fn pdf(bytes: &[u8], out: &mut Out) -> Result<usize, ExtractError> {
     }
     // The PDF parser may panic on malformed files; the worker process is the
     // real isolation, this keeps an in-process caller alive too.
-    let text = std::panic::catch_unwind(|| pdf_extract::extract_text_from_mem(bytes))
-        .map_err(|_| ExtractError::Damaged("the PDF parser failed".into()))?
+    let text = whereti_guard::guarded(|| pdf_extract::extract_text_from_mem(bytes))
+        .ok_or_else(|| ExtractError::Damaged("the PDF parser failed".into()))?
         .map_err(|e| {
             let msg = e.to_string();
             if msg.to_ascii_lowercase().contains("encrypt") {

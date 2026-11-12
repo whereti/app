@@ -5449,6 +5449,7 @@ dependencies = [
  "serde_json",
  "tray-icon",
  "whereti-extract",
+ "whereti-guard",
  "whereti-i18n",
  "whereti-ipc",
  "whereti-net",
@@ -5467,6 +5468,7 @@ dependencies = [
  "whereti-core",
  "whereti-engine",
  "whereti-extract",
+ "whereti-guard",
  "whereti-ipc",
  "whereti-ntfs",
  "whereti-query",
@@ -5509,6 +5511,7 @@ dependencies = [
  "whereti-content",
  "whereti-core",
  "whereti-extract",
+ "whereti-guard",
  "whereti-ipc",
  "whereti-net",
  "whereti-ntfs",
@@ -5534,11 +5537,16 @@ dependencies = [
  "quick-xml 0.42.0",
  "sevenz-rust2",
  "tokenizers",
+ "whereti-guard",
  "whereti-query",
  "windows",
  "windows-sys 0.61.2",
  "zip",
 ]
+
+[[package]]
+name = "whereti-guard"
+version = "1.0.1"
 
 [[package]]
 name = "whereti-i18n"
@@ -5577,6 +5585,7 @@ version = "1.0.1"
 dependencies = [
  "flate2",
  "kamadak-exif",
+ "whereti-guard",
 ]
 
 [[package]]
@@ -5592,6 +5601,7 @@ name = "whereti-service"
 version = "1.0.1"
 dependencies = [
  "whereti-engine",
+ "whereti-guard",
  "whereti-ipc",
  "windows-service",
  "winresource",
@@ -5602,6 +5612,7 @@ name = "whereti-setup"
 version = "1.0.1"
 dependencies = [
  "eframe",
+ "whereti-guard",
  "whereti-i18n",
  "windows",
  "windows-service",

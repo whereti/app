@@ -113,6 +113,8 @@ fn serve(args: ServeArgs) -> Result<(), String> {
 }
 
 fn main() -> ExitCode {
+    // a panic stops the program at once, except in a guarded parser
+    whereti_guard::stop_on_panic();
     let cli = Cli::parse();
     // daylight saving rules, so a summer date searched in winter is right
     whereti_query::set_tz_rules(whereti_query::local_tz_rules());

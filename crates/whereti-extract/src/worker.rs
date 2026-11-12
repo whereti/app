@@ -190,8 +190,8 @@ pub fn serve_stdio() -> i32 {
     if std::io::stdin().lock().read_to_end(&mut bytes).is_err() {
         return EXIT_DAMAGED;
     }
-    let result = std::panic::catch_unwind(|| extract(&ext, &bytes, max))
-        .unwrap_or_else(|_| Err(ExtractError::Damaged("the parser failed".into())));
+    let result =
+        whereti_guard::guarded(|| extract(&ext, &bytes, max)).unwrap_or_else(|| Err(ExtractError::Damaged("the parser failed".into())));
     answer(result)
 }
 
@@ -309,7 +309,7 @@ fn serve_tags(model: Model) -> i32 {
         if input.read_exact(&mut bytes).is_err() {
             return EXIT_DAMAGED;
         }
-        let answer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let answer = whereti_guard::guarded(|| {
             if let Some(e) = &failed {
                 return Err(e.clone());
             }
@@ -323,8 +323,8 @@ fn serve_tags(model: Model) -> i32 {
                 }
             }
             tagger.as_mut().map_or(Err("no model".to_string()), |t| t.tags(&bytes))
-        }))
-        .unwrap_or_else(|_| Err("the model failed".into()));
+        })
+        .unwrap_or_else(|| Err("the model failed".into()));
         let line = match answer {
             Ok(tags) => format!("ok\t{}\n", tags.iter().map(|(i, s)| format!("{i}:{s:.3}")).collect::<Vec<_>>().join(",")),
             Err(e) => format!("err\t{}\n", e.replace(['\n', '\r', '\t'], " ")),
@@ -341,11 +341,11 @@ fn serve_mailbox(handle: usize, max: usize) -> i32 {
     use std::os::windows::io::FromRawHandle;
     // SAFETY: the service duplicated a valid file handle, opened for reading, into this process
     let file = unsafe { std::fs::File::from_raw_handle(handle as std::os::windows::io::RawHandle) };
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let result = whereti_guard::guarded(|| {
         let mut out = crate::Out::new(max);
         crate::mailbox::mailbox(|| file.try_clone(), &mut out).map(|_| out.finish())
-    }))
-    .unwrap_or_else(|_| Err(ExtractError::Damaged("the mailbox reader failed".into())));
+    })
+    .unwrap_or_else(|| Err(ExtractError::Damaged("the mailbox reader failed".into())));
     answer(result)
 }
 
@@ -372,7 +372,7 @@ fn serve_embed(model: Model, tokenizer: Model) -> i32 {
             return EXIT_DAMAGED;
         }
         let text = String::from_utf8_lossy(&bytes).into_owned();
-        let answer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let answer = whereti_guard::guarded(|| {
             if let Some(e) = &failed {
                 return Err(e.clone());
             }
@@ -390,8 +390,8 @@ fn serve_embed(model: Model, tokenizer: Model) -> i32 {
                 }
             }
             embedder.as_mut().map_or(Err("no model".to_string()), |e| e.embed(&text))
-        }))
-        .unwrap_or_else(|_| Err("the model failed".into()));
+        })
+        .unwrap_or_else(|| Err("the model failed".into()));
         let line = match answer {
             Ok(v) => format!("ok\t{}\n", crate::meaning::quantize(&v).iter().map(|b| format!("{:02x}", *b as u8)).collect::<String>()),
             Err(e) => format!("err\t{}\n", e.replace(['\n', '\r', '\t'], " ")),
@@ -652,8 +652,8 @@ fn sandbox_check(exe: &Path, wait: bool) -> (bool, String) {
 /// Probes the worker and keeps the verdict for `sandbox_check`, waking
 /// those who wait for it.
 fn probe_and_keep(exe: &Path, meanwhile: bool) -> (bool, String) {
-    let (ok, report, again) = std::panic::catch_unwind(|| probe_sandbox(exe))
-        .unwrap_or_else(|_| (meanwhile, "restricted token: the check failed".into(), Some(std::time::Instant::now() + PROBE_AGAIN)));
+    let (ok, report, again) = whereti_guard::guarded(|| probe_sandbox(exe))
+        .unwrap_or_else(|| (meanwhile, "restricted token: the check failed".into(), Some(std::time::Instant::now() + PROBE_AGAIN)));
     let mut checks = CHECKS.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((_, check)) = checks.iter_mut().find(|(p, _)| p == exe) {
         *check = Check::Done { ok, report: report.clone(), again };
