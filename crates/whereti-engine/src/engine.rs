@@ -247,6 +247,7 @@ impl Engine {
                 };
                 let found = crate::dupes::verify(candidates, DUPES_BUDGET, r.limit.min(MAX_LIMIT) as usize, caller);
                 let mut warnings = Vec::new();
+                // the app translates this text (whereti-i18n, screens/search.rs): change both together
                 if crate::dupes::unsupported(&query) {
                     warnings.push("dupe: compares files by name, size and content; content: and loc: are not applied to it".to_string());
                 }

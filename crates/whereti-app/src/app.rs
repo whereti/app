@@ -86,6 +86,9 @@ fn service_text(msg: &str) -> String {
         whereti_i18n::tr_both("too many connections to the whereti service from this account"),
         whereti_i18n::tr_both("service not running"),
         whereti_i18n::tr_both("connection to the service was lost"),
+        // warnings under the results
+        whereti_i18n::tr_both("content: and loc: cannot be negated (!) or be one of several choices with other kinds of words; that part of the search is not applied"),
+        whereti_i18n::tr_both("dupe: compares files by name, size and content; content: and loc: are not applied to it"),
     ];
     known.iter().fold(msg.to_string(), |text, (en, local)| text.replace(en, local))
 }
@@ -554,7 +557,7 @@ impl WheretiApp {
                     self.meaning_start = None;
                     self.copies.clear();
                     self.round_trip = round_trip;
-                    self.warnings = reply.warnings;
+                    self.warnings = reply.warnings.iter().map(|w| service_text(w)).collect();
                     self.selected = 0;
                     self.scroll_offset = 0.0;
                     self.scroll_to_selected = true;
@@ -3553,6 +3556,7 @@ mod tests {
             "Nu s-au putut salva excluderile: doar un administrator al acestui PC poate schimba această setare"
         );
         assert_eq!(service_text("something else"), "something else");
+        assert!(service_text("dupe: compares files by name, size and content; content: and loc: are not applied to it").starts_with("dupe: compară"));
         crate::i18n::set(crate::i18n::Lang::En);
     }
 

@@ -1842,8 +1842,9 @@ pub fn not_applied(query: &Query) -> Option<String> {
         let one_kind = all_of(&c.any_of, content_word).is_some() || c.any_of.iter().all(|t| matches!(t, Term::Place(_)));
         c.any_of.iter().any(in_text) && (c.negated || !one_kind)
     };
+    // the app translates this text (whereti-i18n, screens/search.rs): change both together
     query.clauses.iter().any(left_out).then(|| {
-        "content: and loc: cannot be negated (!) or put in a | list with other kinds of words; that part of the search is not applied"
+        "content: and loc: cannot be negated (!) or be one of several choices with other kinds of words; that part of the search is not applied"
             .to_string()
     })
 }
