@@ -5438,7 +5438,7 @@ checksum = "a28ac98ddc8b9274cb41bb4d9d4d5c425b6020c50c46f25559911905610b4a88"
 
 [[package]]
 name = "whereti-app"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "base64 0.23.1",
  "ed25519-dalek",
@@ -5462,7 +5462,7 @@ dependencies = [
 
 [[package]]
 name = "whereti-cli"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "clap",
  "whereti-core",
@@ -5477,7 +5477,7 @@ dependencies = [
 
 [[package]]
 name = "whereti-content"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "parking_lot 0.13.0",
  "tantivy",
@@ -5487,7 +5487,7 @@ dependencies = [
 
 [[package]]
 name = "whereti-core"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "aho-corasick",
  "bytemuck",
@@ -5501,7 +5501,7 @@ dependencies = [
 
 [[package]]
 name = "whereti-engine"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "imagesize",
  "kamadak-exif",
@@ -5524,7 +5524,7 @@ dependencies = [
 
 [[package]]
 name = "whereti-extract"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "calamine",
  "cfb",
@@ -5546,18 +5546,18 @@ dependencies = [
 
 [[package]]
 name = "whereti-guard"
-version = "1.0.2"
+version = "1.0.3"
 
 [[package]]
 name = "whereti-i18n"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "whereti-ipc"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "postcard",
  "serde",
@@ -5566,14 +5566,14 @@ dependencies = [
 
 [[package]]
 name = "whereti-net"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "whereti-ntfs"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "crossbeam-channel",
  "windows-sys 0.61.2",
@@ -5581,7 +5581,7 @@ dependencies = [
 
 [[package]]
 name = "whereti-places"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "flate2",
  "kamadak-exif",
@@ -5590,7 +5590,7 @@ dependencies = [
 
 [[package]]
 name = "whereti-query"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "unicode-normalization",
  "windows-sys 0.61.2",
@@ -5598,7 +5598,7 @@ dependencies = [
 
 [[package]]
 name = "whereti-service"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "whereti-engine",
  "whereti-guard",
@@ -5609,7 +5609,7 @@ dependencies = [
 
 [[package]]
 name = "whereti-setup"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "eframe",
  "whereti-guard",
