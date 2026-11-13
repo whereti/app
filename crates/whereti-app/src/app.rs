@@ -1637,7 +1637,7 @@ impl WheretiApp {
                 list.push(Item::Section(labels.len() - 1));
             }
             if self.network_start == Some(i) {
-                labels.push(trn!("ON THE NETWORK · {n}|ON THE NETWORK · {n}", (self.rows.len() - i - content_start.map_or(0, |c| self.rows.len() - c)) as u64));
+                labels.push(self.network_section_label(i));
                 list.push(Item::Section(labels.len() - 1));
             }
             if close_start == Some(i) && i > 0 {
@@ -1850,8 +1850,7 @@ impl WheretiApp {
         };
         add(self.close_start, tr("CLOSE MATCHES").to_string());
         if let Some(s) = self.network_start {
-            let end = self.content_start.unwrap_or(n);
-            add(Some(s), trn!("ON THE NETWORK · {n}|ON THE NETWORK · {n}", end.saturating_sub(s) as u64));
+            add(Some(s), self.network_section_label(s));
         }
         if self.content_start != self.meaning_start {
             add(self.content_start, self.content_section_label());
@@ -2170,6 +2169,24 @@ impl WheretiApp {
                 });
             });
         ui.add_space(4.0);
+    }
+
+    /// "ON THE NETWORK · 12", or the drives only this account sees,
+    /// "GOOGLE DRIVE (G:) · 12", or both.
+    fn network_section_label(&self, start: usize) -> String {
+        let end = self.content_start.unwrap_or(self.rows.len());
+        let rows = &self.rows[start.min(end)..end];
+        let own = crate::network::own_drives();
+        let on = |root: &str, path: &str| path.get(..root.len()).is_some_and(|p| p.eq_ignore_ascii_case(root));
+        let names: Vec<String> =
+            own.iter().filter(|d| rows.iter().any(|r| on(&d.root, &r.path))).map(|d| d.name.to_uppercase()).collect();
+        let network = rows.iter().any(|r| !own.iter().any(|d| on(&d.root, &r.path)));
+        let n = rows.len() as u64;
+        match (names.is_empty(), network) {
+            (false, false) => format!("{} · {n}", names.join(", ")),
+            (false, true) => format!("{} · {}", names.join(", "), trn!("ON THE NETWORK · {n}|ON THE NETWORK · {n}", n)),
+            _ => trn!("ON THE NETWORK · {n}|ON THE NETWORK · {n}", n),
+        }
     }
 
     /// "GĂSIT ÎN CONȚINUT · 12" (+ indexing progress while it runs).

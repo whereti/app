@@ -359,6 +359,19 @@ fn general(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette, ctx: &egui::Con
     });
 }
 
+/// How the last walk of a network folder or of a drive went.
+fn walk_line(ui: &mut egui::Ui, p: &Palette, folder: &str, s: &crate::network::FolderState) {
+    let text = if s.walking {
+        trf!("{folder}: looking through it…", folder = folder)
+    } else if let Some(e) = &s.error {
+        trf!("{folder}: not reachable ({error})", folder = folder, error = e)
+    } else {
+        crate::trn!("{folder}: {n} file|{folder}: {n} files", s.files, folder = folder)
+    };
+    let color = if s.error.is_some() { p.warn } else { p.text3 };
+    ui.label(egui::RichText::new(text).size(12.0).color(color));
+}
+
 fn search(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
     heading(
         ui,
@@ -560,15 +573,27 @@ fn search(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
             }
             // how each one went
             for (folder, s) in crate::network::states().into_iter().filter(|(f, _)| folders.contains(f)) {
-                let text = if s.walking {
-                    trf!("{folder}: looking through it…", folder = folder)
-                } else if let Some(e) = &s.error {
-                    trf!("{folder}: not reachable ({error})", folder = folder, error = e)
-                } else {
-                    crate::trn!("{folder}: {n} file|{folder}: {n} files", s.files, folder = folder)
-                };
-                let color = if s.error.is_some() { p.warn } else { p.text3 };
-                ui.label(egui::RichText::new(text).size(12.0).color(color));
+                walk_line(ui, p, &folder, &s);
+            }
+            ui.add_space(10.0);
+        }
+        // drives only this account sees (Google Drive's G:), by themselves
+        let own: Vec<_> =
+            crate::network::own_drives().into_iter().filter(|d| !folders.iter().any(|f| f.eq_ignore_ascii_case(&d.root))).collect();
+        if !own.is_empty() {
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(tr("Drives only your Windows account sees, like Google Drive's, are looked through the same way, without being added."))
+                        .size(12.5)
+                        .color(p.text2),
+                )
+                .wrap(),
+            );
+            ui.add_space(4.0);
+            let states = crate::network::states();
+            for d in &own {
+                let s = states.iter().find(|(f, _)| f.eq_ignore_ascii_case(&d.root)).map(|(_, s)| s.clone());
+                walk_line(ui, p, &d.name, &s.unwrap_or(crate::network::FolderState { walking: true, ..Default::default() }));
             }
             ui.add_space(10.0);
         }

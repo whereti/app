@@ -450,6 +450,82 @@ pub fn is_local_drive(path: &str) -> bool {
     matches!(kind, REMOVABLE | FIXED | CDROM | RAMDISK)
 }
 
+/// A drive only this account sees, which the service (SYSTEM) cannot: the
+/// drive of Google Drive for desktop, and others like it, are made in the
+/// user's own session. `name` is its label and letter, "Google Drive (G:)".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnDrive {
+    pub root: String,
+    pub name: String,
+}
+
+/// Should a drive seen only in this session be walked as the user? Not a
+/// `subst` letter (`\??\C:\…`, a folder searched already), not a shared
+/// folder of the network (Settings has a place for those), not a CD.
+fn walk_as_user(kind: u32, target: &str, network_share: bool) -> bool {
+    const REMOVABLE: u32 = 2;
+    const FIXED: u32 = 3;
+    const REMOTE: u32 = 4;
+    const RAMDISK: u32 = 6;
+    if target.starts_with(r"\??\") {
+        return false;
+    }
+    match kind {
+        REMOVABLE | FIXED | RAMDISK => true,
+        REMOTE => !network_share,
+        _ => false,
+    }
+}
+
+/// The drives this account sees and the service does not: the letters of
+/// this session only (none under `Global\`), ready now.
+pub fn own_drives() -> Vec<OwnDrive> {
+    use windows::core::PWSTR;
+    use windows::Win32::NetworkManagement::WNet::WNetGetConnectionW;
+    use windows::Win32::Storage::FileSystem::{GetDriveTypeW, GetLogicalDrives, GetVolumeInformationW, QueryDosDeviceW};
+    let text = |b: &[u16]| String::from_utf16_lossy(&b[..b.iter().position(|&c| c == 0).unwrap_or(b.len())]);
+    // SAFETY: no arguments.
+    let mask = unsafe { GetLogicalDrives() };
+    let mut out = Vec::new();
+    for i in 0..26u8 {
+        if mask & (1 << i) == 0 {
+            continue;
+        }
+        let letter = (b'A' + i) as char;
+        let device = HSTRING::from(format!("{letter}:"));
+        let mut target = [0u16; 1024];
+        let mut scratch = [0u16; 1024];
+        // SAFETY: NUL-terminated names and buffers of their stated length.
+        let mine = unsafe { QueryDosDeviceW(&device, Some(&mut target)) } != 0;
+        let global = unsafe { QueryDosDeviceW(&HSTRING::from(format!(r"Global\{letter}:")), Some(&mut scratch)) } != 0;
+        if !mine || global {
+            continue;
+        }
+        let root = format!(r"{letter}:\");
+        let wide_root = HSTRING::from(root.as_str());
+        // SAFETY: a NUL-terminated root path.
+        let kind = unsafe { GetDriveTypeW(&wide_root) };
+        let mut remote = [0u16; 1024];
+        let mut len = remote.len() as u32;
+        // SAFETY: a NUL-terminated name and a buffer of `len` characters.
+        let share = unsafe { WNetGetConnectionW(&device, Some(PWSTR(remote.as_mut_ptr())), &mut len) };
+        // connected, or remembered while the network is away
+        let network_share = matches!(share.0, 0 | 234 | 1201);
+        if !walk_as_user(kind, &text(&target), network_share) {
+            continue;
+        }
+        let mut label = [0u16; 261];
+        // SAFETY: the root path and a buffer of its stated length.
+        if unsafe { GetVolumeInformationW(&wide_root, Some(&mut label), None, None, None, None) }.is_err() {
+            continue; // not ready
+        }
+        let label = text(&label);
+        let name = if label.trim().is_empty() { format!("{letter}:") } else { format!("{} ({letter}:)", label.trim()) };
+        out.push(OwnDrive { root, name });
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -462,5 +538,22 @@ mod tests {
         assert!(!is_local_drive(r"\\nas\photos"));
         assert!(is_network_path(r"\\nas\photos"));
         assert!(!is_local_drive("photos"));
+    }
+
+    #[test]
+    fn drives_walked_as_the_user() {
+        // Google Drive's own device, as a disk or as a network drive
+        assert!(walk_as_user(3, r"\Device\GoogleDriveFS", false));
+        assert!(walk_as_user(4, r"\Device\GoogleDriveFS", false));
+        // a mapped share, a subst letter, a CD
+        assert!(!walk_as_user(4, r"\Device\LanmanRedirector\;Z:0000\nas\photos", true));
+        assert!(!walk_as_user(3, r"\??\C:\Users\me\Work", false));
+        assert!(!walk_as_user(5, r"\Device\CdRom0", false));
+    }
+
+    #[test]
+    fn the_drives_of_every_account_are_not_our_own() {
+        let windows = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into());
+        assert!(!own_drives().iter().any(|d| d.root.eq_ignore_ascii_case(&format!(r"{windows}\"))));
     }
 }

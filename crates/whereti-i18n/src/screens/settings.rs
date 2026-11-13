@@ -1140,6 +1140,17 @@ pub const ENTRIES: &[Entry] = &[
         ro: "Foldere partajate, un NAS sau o unitate mapată (\\\\nas\\photos, Z:\\). whereti le parcurge o dată pe oră, în numele tău, și le găsește după nume.",
     },
     Entry {
+        en: "Drives only your Windows account sees, like Google Drive's, are looked through the same way, without being added.",
+        note: "Settings > Search > Network folders: shown when a drive exists that only the user's account sees (the drive of Google Drive for desktop, usually G:); whereti walks it like a network folder, as the user, with no need to add it. The drives follow, one line each.",
+        de: "Laufwerke, die nur Ihr Windows-Konto sieht, wie das von Google Drive, werden genauso durchsucht, ohne dass Sie sie hinzufügen.",
+        es: "Las unidades que solo ve tu cuenta de Windows, como la de Google Drive, se recorren igual, sin tener que añadirlas.",
+        fr: "Les lecteurs que seul votre compte Windows voit, comme celui de Google Drive, sont parcourus de la même façon, sans que vous ayez à les ajouter.",
+        it: "Le unità che vede solo il tuo account Windows, come quella di Google Drive, vengono scorse allo stesso modo, senza doverle aggiungere.",
+        pl: "Dyski, które widzi tylko twoje konto Windows, jak dysk Google Drive, są przeglądane tak samo, bez dodawania.",
+        pt_br: "As unidades que só a sua conta do Windows vê, como a do Google Drive, são percorridas do mesmo jeito, sem precisar adicioná-las.",
+        ro: "Unitățile pe care le vede doar contul tău Windows, ca aceea a Google Drive, sunt parcurse la fel, fără să le adaugi.",
+    },
+    Entry {
         en: "This folder is on this PC, and whereti searches it already. Add folders on the network or a NAS.",
         note: "Brief notice (toast) in Settings > Search > Network folders when the folder chosen is on a disk of this PC, not on the network.",
         de: "Dieser Ordner ist auf diesem PC, whereti durchsucht ihn bereits. Fügen Sie Ordner im Netzwerk oder auf einem NAS hinzu.",

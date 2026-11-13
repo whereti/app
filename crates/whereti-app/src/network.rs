@@ -1,4 +1,6 @@
-//! Network folders and NAS (PLAN.md §64): `\\nas\photos`, a mapped `Z:\`.
+//! Network folders and NAS (PLAN.md §64): `\\nas\photos`, a mapped `Z:\`,
+//! and the drives only this account sees (Google Drive's `G:`), found by
+//! themselves.
 //!
 //! The service runs as SYSTEM: it cannot see the user's mapped drives and
 //! has no password for their NAS. So the app itself, as the user, walks the
@@ -40,6 +42,9 @@ pub struct FolderState {
 }
 
 static FOLDERS: RwLock<Vec<String>> = RwLock::new(Vec::new());
+/// Drives only this account sees (the service cannot), walked like the
+/// folders without being added.
+static OWN: RwLock<Vec<crate::win::OwnDrive>> = RwLock::new(Vec::new());
 static ENTRIES: RwLock<Vec<Entry>> = RwLock::new(Vec::new());
 static STATES: Mutex<Vec<(String, FolderState)>> = Mutex::new(Vec::new());
 static WAKE: (Mutex<bool>, Condvar) = (Mutex::new(false), Condvar::new());
@@ -58,6 +63,35 @@ fn cache_file() -> PathBuf {
 /// The folders the user added.
 pub fn folders() -> Vec<String> {
     FOLDERS.read().map(|f| f.clone()).unwrap_or_default()
+}
+
+/// The drives only this account sees, walked by themselves.
+pub fn own_drives() -> Vec<crate::win::OwnDrive> {
+    OWN.read().map(|o| o.clone()).unwrap_or_default()
+}
+
+/// What is walked: the folders added, then the drives only this account
+/// sees (one added by hand too is walked once).
+fn roots() -> Vec<String> {
+    let mut list = folders();
+    for d in own_drives() {
+        if !list.iter().any(|f| f.eq_ignore_ascii_case(&d.root)) {
+            list.push(d.root);
+        }
+    }
+    list
+}
+
+/// Looks at the drives again; true when they changed.
+fn look_at_drives() -> bool {
+    let now = crate::win::own_drives();
+    match OWN.write() {
+        Ok(mut o) if *o != now => {
+            *o = now;
+            true
+        }
+        _ => false,
+    }
 }
 
 /// How each folder's last walk went.
@@ -104,6 +138,7 @@ pub fn start(wake_ui: impl Fn() + Send + 'static) {
     std::thread::Builder::new()
         .name("network folders".into())
         .spawn(move || {
+            look_at_drives();
             // the cache can be large: read it here, not on the window's thread
             load_cache();
             wake_ui();
@@ -112,16 +147,18 @@ pub fn start(wake_ui: impl Fn() + Send + 'static) {
         .expect("a thread");
 }
 
-/// The user added network folders.
+/// There are network folders or drives only this account sees.
 pub fn has_folders() -> bool {
-    FOLDERS.read().is_ok_and(|f| !f.is_empty())
+    FOLDERS.read().is_ok_and(|f| !f.is_empty()) || OWN.read().is_ok_and(|o| !o.is_empty())
 }
 
 fn walker(wake_ui: impl Fn()) {
     let mut last = Instant::now() - EVERY;
     loop {
-        let folders = folders();
-        let woke = take_wake();
+        // Google Drive starts after whereti, or is closed: walked then
+        let drives_changed = look_at_drives();
+        let folders = roots();
+        let woke = take_wake() || drives_changed;
         if woke || (!folders.is_empty() && last.elapsed() >= EVERY) {
             last = Instant::now();
             walk_all(&folders);
@@ -286,7 +323,7 @@ fn save_cache() {
 fn load_cache() {
     use std::io::BufRead;
     let Ok(file) = std::fs::File::open(cache_file()) else { return };
-    let folders = folders();
+    let folders = roots();
     let inside = |p: &str| folders.iter().any(|f| p.starts_with(&format!("{}\\", f.trim_end_matches('\\'))));
     let entries: Vec<Entry> = std::io::BufReader::new(file)
         .lines()
