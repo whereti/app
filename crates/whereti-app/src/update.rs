@@ -14,6 +14,7 @@
 //! - Settings can turn the check off; then nothing is ever sent.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -78,6 +79,36 @@ static STATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 fn with_state<T>(f: impl FnOnce(&Path) -> T) -> T {
     let _one_at_a_time = STATE.lock().unwrap_or_else(|e| e.into_inner());
     f(&state_file())
+}
+
+/// Checking for updates is on (Settings), as `tick` last saw it.
+static CHECKS_ON: AtomicBool = AtomicBool::new(true);
+
+/// Hidden in the tray, the window draws nothing and `tick` never runs: this
+/// thread wakes it when the day's check is due, so an update is found
+/// without the window being opened. It only reads update.txt (nothing is
+/// sent), at most once an hour while no check is due.
+pub fn wake_when_due(ctx: egui::Context, enabled: bool) {
+    CHECKS_ON.store(enabled, Ordering::Relaxed);
+    let _ = std::thread::Builder::new().name("update-wake".into()).spawn(move || {
+        // after the first look, a minute after the start
+        std::thread::sleep(Duration::from_secs(61));
+        loop {
+            let last = with_state(|path| Saved::load(path).last_check);
+            let wait = match due(last, now_secs()) {
+                Ok(true) => {
+                    if CHECKS_ON.load(Ordering::Relaxed) {
+                        ctx.request_repaint();
+                    }
+                    LOOK_EVERY
+                }
+                Ok(false) => Duration::from_secs(last.map_or(0, |t| (t + DAY_SECS).saturating_sub(now_secs()))),
+                Err(_) => Duration::from_secs(DAY_SECS),
+            };
+            // looked at again within the hour: the PC may have slept
+            std::thread::sleep(wait.clamp(Duration::from_secs(60), Duration::from_secs(3600)));
+        }
+    });
 }
 
 /// The only installer whereti downloads: whereti's own GitHub release of
@@ -231,6 +262,7 @@ impl Updater {
 
     /// Called often; does real work only when a check is due.
     pub fn tick(&mut self, enabled: bool, ctx: &egui::Context) {
+        CHECKS_ON.store(enabled, Ordering::Relaxed);
         if !enabled || Instant::now() < self.next_look {
             return;
         }
@@ -244,7 +276,11 @@ impl Updater {
         let claimed = with_state(|path| {
             let mut saved = Saved::load(path);
             match due(saved.last_check, now) {
-                Ok(false) => return false,
+                // checked meanwhile by another window of this account
+                Ok(false) => {
+                    self.last_check = saved.last_check;
+                    return false;
+                }
                 Err(reset) => {
                     saved.last_check = Some(reset);
                     saved.save(path);

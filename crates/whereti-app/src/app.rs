@@ -230,6 +230,8 @@ impl WheretiApp {
             crate::network::start(move || ctx.request_repaint());
         }
         let settings = SettingsState::load();
+        // hidden in the tray, the day's update check still goes out
+        crate::update::wake_when_due(ctx.clone(), settings.updates);
         let wake_ctx = ctx.clone();
         let preview = Preview::start(settings.preview, move || wake_ctx.request_repaint());
         let accent = theme::system_accent();
