@@ -27,6 +27,9 @@ const ROW_HEIGHT: f32 = 52.0;
 /// Content results have a third line: the snippet.
 const CONTENT_ROW_HEIGHT: f32 = 72.0;
 const RESULT_LIMIT: u32 = 500;
+/// How long typing must stop before a word that looks like a wrong command
+/// is pointed out.
+const PROBLEM_DELAY: Duration = Duration::from_millis(800);
 const STATUS_EVERY: Duration = Duration::from_secs(2);
 /// While indexing, the status is asked for this often even with the window
 /// hidden, for the tray icon's progress. Once ready: never while hidden.
@@ -156,6 +159,12 @@ pub struct WheretiApp {
     content_pending: bool,
     round_trip: Duration,
     warnings: Vec<String>,
+    /// When the search text last changed: a word that looks like a wrong
+    /// command is pointed out only once typing stops (`PROBLEM_DELAY`), not
+    /// at every letter of `dm:tod…`.
+    typed_at: Instant,
+    /// The folders' list for "nothing found" was asked for once.
+    config_asked: bool,
     recent_mode: bool,
     selected: usize,
     scroll_to_selected: bool,
@@ -264,6 +273,8 @@ impl WheretiApp {
             content_pending: false,
             round_trip: Duration::ZERO,
             warnings: Vec::new(),
+            typed_at: Instant::now(),
+            config_asked: false,
             recent_mode: true,
             selected: 0,
             scroll_to_selected: false,
@@ -362,8 +373,45 @@ impl WheretiApp {
         (format!("{q} {}", self.filter.clause()), Sort::Relevance, false)
     }
 
+    /// Words of the search that look like commands and were searched as
+    /// text (`ora:12`, `size:mare`), said in the app's language; nothing
+    /// while the user is still typing.
+    fn query_problems(&self, ctx: &egui::Context) -> Vec<String> {
+        let waited = self.typed_at.elapsed();
+        if waited < PROBLEM_DELAY {
+            ctx.request_repaint_after(PROBLEM_DELAY - waited);
+            return Vec::new();
+        }
+        whereti_query::problems(&self.query)
+            .into_iter()
+            .map(|p| match p {
+                whereti_query::Problem::Unknown { name } => {
+                    trf!("whereti has no {name}: command, so it was searched as text. F1 lists the commands.", name)
+                }
+                whereti_query::Problem::BadValue { name, value } => {
+                    trf!("{name}: does not take “{value}”, so it was searched as text. F1 shows examples.", name, value)
+                }
+            })
+            .collect()
+    }
+
+    /// The folders whose text files are read, by their last name
+    /// ("Desktop, Documents, Downloads"), once Settings told us.
+    fn content_places(&self) -> Option<String> {
+        let folders = &self.settings.config.as_ref()?.content_folders;
+        let mut names: Vec<&str> = Vec::new();
+        for f in folders {
+            let name = f.trim_end_matches('\\').rsplit('\\').next().unwrap_or(f);
+            if !name.is_empty() && !names.iter().any(|n| n.eq_ignore_ascii_case(name)) {
+                names.push(name);
+            }
+        }
+        (!names.is_empty()).then(|| names.join(", "))
+    }
+
     pub(crate) fn run_search(&mut self) {
         self.generation += 1;
+        self.typed_at = Instant::now();
         let (query, sort, recent) = self.effective_query();
         self.recent_mode = recent;
         self.pending_launch =
@@ -1548,24 +1596,61 @@ impl WheretiApp {
             return;
         }
         if self.rows.is_empty() {
-            let (title, sub) = if self.query.trim().is_empty() && self.filter == Filter::All {
-(
-                    tr("Nothing opened recently"),
-                    tr("Files you open and download show up here.").to_string(),
-                )
-            } else {
+            let recent = self.query.trim().is_empty() && self.filter == Filter::All;
+            // say what was searched, and where text is not read: "nothing
+            // found" alone reads as "it is not on this PC"
+            let words = !highlight_needles(&self.query).is_empty();
+            if !recent && words && self.settings.config.is_none() && !self.config_asked {
+                self.config_asked = true;
+                self.searcher.ask_config();
+            }
+            let problems = if recent { Vec::new() } else { self.query_problems(ctx) };
+            let query = self.query.trim();
+            let (title, sub) = if recent {
+                (tr("Nothing opened recently"), tr("Files you open and download show up here.").to_string())
+            } else if !problems.is_empty() {
+                (tr("Nothing found"), problems.join("\n"))
+            } else if !words {
+                (tr("Nothing found"), trf!("No file matches “{query}”. Try:", query))
+            } else if let Some(s) = &self.status {
+                let names = whereti_i18n::number(s.entries);
+                let docs = whereti_i18n::number(s.content.files);
                 (
                     tr("Nothing found"),
-                    trf!("No file has “{query}” in its name or text. Try:", query = self.query.trim()),
+                    trf!("Searched the file names ({names}) and the text of the documents read ({docs}): none has “{query}”. Try:", names, docs, query),
                 )
+            } else {
+                (tr("Nothing found"), trf!("No file has “{query}” in its name or text. Try:", query))
             };
-            let icon = if self.query.trim().is_empty() && self.filter == Filter::All { Icon::Clock } else { Icon::Search };
+            let icon = if recent { Icon::Clock } else { Icon::Search };
             if let Some(example) = empty_state(ui, p, icon, p.text3, title, &sub, &[tr("invoice"), "ext:pdf", "dm:today", "*.jpg"]) {
                 self.query = example.to_string();
                 self.history_pos = None;
                 self.filter = Filter::All;
                 self.run_search();
                 self.focus_search = true;
+                return;
+            }
+            if !recent && words && problems.is_empty() {
+                if let Some(places) = self.content_places() {
+                    ui.add_space(18.0);
+                    let mut open = false;
+                    ui.vertical_centered(|ui| {
+                        let text = trf!(
+                            "The text of PDF and Office documents is read on every drive; that of text files, code and screenshots only in {places} (screenshots also in Pictures).",
+                            places
+                        );
+                        ui.set_max_width(520.0);
+                        ui.label(egui::RichText::new(text).size(12.0).color(p.text3));
+                        ui.add_space(4.0);
+                        open = ui.link(egui::RichText::new(tr("Choose folders")).size(12.0).color(p.accent)).clicked();
+                    });
+                    if open {
+                        self.settings.section = crate::settings::Section::Search;
+                        self.page = Page::Settings;
+                        self.searcher.ask_config();
+                    }
+                }
             }
             return;
         }
@@ -1605,7 +1690,7 @@ impl WheretiApp {
             ui.label(egui::RichText::new(header).size(11.0).color(p.text3).family(semibold()));
         });
         ui.add_space(6.0);
-        for w in self.warnings.clone() {
+        for w in self.warnings.clone().into_iter().chain(self.query_problems(ctx)) {
             ui.horizontal(|ui| {
                 ui.add_space(8.0);
                 ui.label(egui::RichText::new(w).size(12.0).color(p.warn));

@@ -157,7 +157,7 @@ fn parse_span(v: &str, ctx: &DateCtx, rules: Option<&TzRules>) -> Option<(u32, u
     let today = local_now.div_euclid(MINUTES_PER_DAY); // local day number since 1601
     let (y, m, _) = civil_from_day(today);
     let weekday = today.rem_euclid(7); // 1601-01-01 was a Monday -> 0 = Monday
-    let (first_day, last_day) = match v {
+    let (first_day, last_day) = match named_period(v).unwrap_or(v) {
         "today" => (today, today),
         "yesterday" => (today - 1, today - 1),
         "thisweek" => (today - weekday, today),
@@ -184,6 +184,53 @@ fn parse_span(v: &str, ctx: &DateCtx, rules: Option<&TzRules>) -> Option<(u32, u
     let start = to_utc(first_day).clamp(0, u32::MAX as i64) as u32;
     let end = (to_utc(last_day + 1) - 1).clamp(0, u32::MAX as i64) as u32;
     Some((start, end))
+}
+
+/// The periods by name, in the 8 languages of the app, written without
+/// spaces, accents or signs (`dm:azi`, `dm:letzte-woche`, `dm:aujourd'hui`,
+/// `dm:this_week` all work): the English name each one means.
+const PERIODS: &[(&str, &[&str])] = &[
+    ("today", &["today", "azi", "astazi", "heute", "hoy", "aujourdhui", "oggi", "dzis", "dzisiaj", "hoje"]),
+    ("yesterday", &["yesterday", "ieri", "gestern", "ayer", "hier", "wczoraj", "ontem"]),
+    (
+        "thisweek",
+        &[
+            "thisweek", "saptamanaasta", "saptamanaaceasta", "aceastasaptamana", "diesewoche", "estasemana",
+            "cettesemaine", "questasettimana", "tentydzien", "nestasemana",
+        ],
+    ),
+    (
+        "lastweek",
+        &[
+            "lastweek", "saptamanatrecuta", "letztewoche", "semanapasada", "semainederniere", "lasemainederniere",
+            "settimanascorsa", "zeszlytydzien", "semanapassada",
+        ],
+    ),
+    (
+        "thismonth",
+        &["thismonth", "lunaasta", "lunaaceasta", "aceastaluna", "diesenmonat", "diesermonat", "estemes", "cemois", "questomese", "tenmiesiac", "nestemes"],
+    ),
+    (
+        "lastmonth",
+        &["lastmonth", "lunatrecuta", "letztenmonat", "letztermonat", "mespasado", "elmespasado", "moisdernier", "lemoisdernier", "mesescorso", "ilmesescorso", "zeszlymiesiac", "mespassado"],
+    ),
+    (
+        "thisyear",
+        &["thisyear", "anulasta", "anulacesta", "anulaacesta", "acestan", "diesesjahr", "esteano", "cetteannee", "questanno", "tenrok", "nesteano"],
+    ),
+    (
+        "lastyear",
+        &["lastyear", "anultrecut", "letztesjahr", "anopasado", "elanopasado", "anneederniere", "lanneederniere", "annoscorso", "lannoscorso", "zeszlyrok", "anopassado"],
+    ),
+];
+
+/// The English name of a period typed in any of the app's languages.
+pub(crate) fn named_period(v: &str) -> Option<&'static str> {
+    let bare: String = crate::fold(v).chars().filter(|c| c.is_alphanumeric()).collect();
+    if bare.is_empty() || bare.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    PERIODS.iter().find(|(_, words)| words.contains(&bare.as_str())).map(|(name, _)| *name)
 }
 
 /// `2024`, `2024-03`, `2024-03-15`, `15.03.2024`, `15.03.24` -> (first day,
@@ -322,6 +369,28 @@ mod tests {
         let (s, e) = parse_range("today", &ctx()).unwrap();
         assert_eq!(s, at(2026, 10, 24, 0, 0, 180));
         assert_eq!(e, at(2026, 10, 24, 23, 59, 180));
+    }
+
+    #[test]
+    fn periods_in_every_language_of_the_app() {
+        let c = ctx();
+        let same = |a: &str, b: &str| assert_eq!(parse_range(a, &c), parse_range(b, &c), "{a} = {b}");
+        for w in ["azi", "astăzi", "Heute", "hoy", "aujourd'hui", "oggi", "dziś", "hoje"] {
+            same(w, "today");
+        }
+        for w in ["ieri", "gestern", "ayer", "hier", "wczoraj", "ontem"] {
+            same(w, "yesterday");
+        }
+        same("saptamana-asta", "thisweek");
+        same("letzte_woche", "lastweek");
+        same("luna-trecută", "lastmonth");
+        same("zeszły-rok", "lastyear");
+        same("this-week", "thisweek");
+        same("ieri..azi", "yesterday..today");
+        same(">ieri", ">yesterday");
+        // a word that is no period is still no date
+        assert_eq!(parse_range("mâine", &c), None);
+        assert_eq!(named_period("2024"), None);
     }
 
     #[test]

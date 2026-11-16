@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! raport 2024            AND (both in the name)
-//! raport | factura       OR          !tmp      NOT
+//! raport | factura       OR          !tmp  -tmp   NOT
 //! "nume exact.txt"       literal     *.pdf     wildcard (whole name)
 //! ext:pdf;docx           size:>10mb  size:1kb..1mb  size:10mb..  size:large
 //! dm:today  dm:lastweek  dm:2024-01..2024-06  dm:2024..
@@ -123,7 +123,7 @@ pub fn parse(input: &str, ctx: &DateCtx) -> Query {
         // (a AND NOT b, a narrower result than a OR NOT b).
         let mut negated_alts = Vec::new();
         for (i, mut alt) in token.alternatives.into_iter().enumerate() {
-            let bang = alt.quote_at != Some(0) && alt.text.len() > 1 && alt.text.starts_with('!');
+            let bang = alt.quote_at != Some(0) && alt.text.len() > 1 && negates(&alt.text);
             if bang {
                 alt.text.remove(0);
                 alt.quote_at = alt.quote_at.map(|q| q - 1);
@@ -241,6 +241,60 @@ fn lex(input: &str) -> Vec<Token> {
     }
     tokens.retain(|t| !t.alternatives.is_empty());
     tokens
+}
+
+/// `!tmp`, and `-tmp` as on the web: a dash before a letter. A dash before
+/// anything else (`-1`, `--`) is part of the word.
+fn negates(text: &str) -> bool {
+    text.starts_with('!') || (text.starts_with('-') && text[1..].starts_with(char::is_alphabetic))
+}
+
+/// The names `parse_function` knows (with and without a value).
+const FUNCTIONS: &[&str] = &[
+    "ext", "path", "size", "dm", "datemodified", "regex", "c", "content", "contains", "loc", "location", "place",
+    "taken", "dt", "datetaken", "width", "height", "duration", "length", "camera", "artist", "album", "author",
+    "mine", "dupe", "dupes", "duplicate", "duplicates", "folder", "file",
+];
+
+/// Something in a search that looks like a command and was searched as
+/// plain text instead. The search still runs; the app says what happened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Problem {
+    /// `ora:12`: no command has that name.
+    Unknown { name: String },
+    /// `size:mare`: the command does not take that value.
+    BadValue { name: String, value: String },
+}
+
+/// The `Problem`s of a search, in the order typed.
+pub fn problems(input: &str) -> Vec<Problem> {
+    let ctx = DateCtx { now: 0, tz_offset: 0 };
+    let mut out = Vec::new();
+    for token in lex(input) {
+        for mut alt in token.alternatives {
+            if alt.quote_at != Some(0) && alt.text.len() > 1 && negates(&alt.text) {
+                alt.text.remove(0);
+                alt.quote_at = alt.quote_at.map(|q| q - 1);
+            }
+            let unquoted_end = alt.quote_at.unwrap_or(alt.text.len());
+            let Some(colon) = alt.text[..unquoted_end].find(':') else { continue };
+            let (name, value) = (alt.text[..colon].to_ascii_lowercase(), &alt.text[colon + 1..]);
+            // `D:\x`, `C:`: a drive; `http://`, `12:30`, `a1:b`: not a command
+            if name.len() < 2 || name.len() > 12 || !name.bytes().all(|b| b.is_ascii_alphabetic()) || value.starts_with("//") {
+                continue;
+            }
+            // `path:` with nothing after it yet: still being typed
+            if value.is_empty() && FUNCTIONS.contains(&name.as_str()) {
+                continue;
+            }
+            if !FUNCTIONS.contains(&name.as_str()) {
+                out.push(Problem::Unknown { name });
+            } else if parse_function(&name, value, alt.quote_at.is_some(), &ctx).is_none() {
+                out.push(Problem::BadValue { name, value: value.to_string() });
+            }
+        }
+    }
+    out
 }
 
 fn parse_alternative(alt: &Alt, ctx: &DateCtx) -> Option<Term> {
@@ -635,6 +689,34 @@ mod tests {
         }
         let c = q("raport| factura 2024");
         assert_eq!(c.len(), 2);
+    }
+
+    #[test]
+    fn a_dash_before_a_letter_negates_like_a_bang() {
+        let c = q("whereti -setup");
+        assert_eq!(c.len(), 2);
+        assert!(c[1].negated);
+        assert_eq!(c[1].any_of, vec![Term::Text("setup".into())]);
+        assert_eq!(q("-ext:exe"), q("!ext:exe"));
+        // anything else after the dash is part of the word
+        assert_eq!(one("-1"), Term::Text("-1".into()));
+        assert_eq!(one("--"), Term::Text("--".into()));
+        assert_eq!(one("\"-setup\""), Term::Text("-setup".into()));
+        assert!(!q("raport-2024")[0].negated);
+    }
+
+    #[test]
+    fn words_that_look_like_commands_and_are_not() {
+        let unknown = |n: &str| Problem::Unknown { name: n.into() };
+        let bad = |n: &str, v: &str| Problem::BadValue { name: n.into(), value: v.into() };
+        assert_eq!(problems("whereti ora:12"), [unknown("ora")]);
+        assert_eq!(problems("size:mare dm:mâine"), [bad("size", "mare"), bad("dm", "mâine")]);
+        assert_eq!(problems("!size:mare"), [bad("size", "mare")]);
+        assert_eq!(problems("mine:x"), [bad("mine", "x")]);
+        // what is right, a drive, a time, an address or quoted text: nothing
+        for ok in ["dm:azi size:>10mb ext:pdf loc:roma", r"C:\Users D:", "12:30", "http://x.ro", "\"ora:12\"", "a1:b", "folder:", "path:"] {
+            assert_eq!(problems(ok), [], "{ok}");
+        }
     }
 
     #[test]

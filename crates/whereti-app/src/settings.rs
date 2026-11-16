@@ -49,7 +49,7 @@ pub struct SettingsState {
     pub photo_tags_asked: bool,
     /// The chosen language; `None` = the Windows display language.
     pub lang: Option<Lang>,
-    config: Option<ConfigReply>,
+    pub(crate) config: Option<ConfigReply>,
     exclusions: Vec<String>,
     /// The part of Settings shown.
     pub section: Section,
