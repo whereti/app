@@ -1506,8 +1506,8 @@ impl Content {
 /// How much the place, type, date and use of a document add to how well
 /// its text matches: the same signals as for names (PLAN.md §48-50).
 fn weight(importance: u8, flags: u16, used: Option<u8>) -> f32 {
-    // importance 0 (most) .. 31 (least): x1.64 .. x0.40
-    let mut f = 1.0 + (16.0 - importance as f32) * 0.04;
+    // importance 0 (most) .. 31 (least): x1.88 .. x0.64, x1 in the middle
+    let mut f = 1.0 + (whereti_core::search::IMPORTANCE_START as f32 - importance as f32) * 0.04;
     match used {
         Some(u) => f *= 1.0 + u as f32 * 0.15,
         None if flags & (FLAG_NOISE | FLAG_HIDDEN | FLAG_SYSTEM) != 0 => f *= 0.5,
@@ -2654,12 +2654,13 @@ mod tests {
     #[test]
     fn place_type_date_and_use_weigh_on_content_results() {
         // more important documents count more, files of tool folders less
-        assert!(weight(0, 0, None) > weight(16, 0, None));
-        assert!(weight(16, 0, None) > weight(31, 0, None));
-        assert_eq!(weight(16, FLAG_NOISE, None), 0.5);
+        let mid = whereti_core::search::IMPORTANCE_START as u8;
+        assert!(weight(0, 0, None) > weight(mid, 0, None));
+        assert!(weight(mid, 0, None) > weight(31, 0, None));
+        assert_eq!(weight(mid, FLAG_NOISE, None), 0.5);
         // a used file is never halved as noise, and counts more with use
-        assert!(weight(16, FLAG_NOISE, Some(1)) > weight(16, 0, None));
-        assert!(weight(16, 0, Some(12)) > weight(16, 0, Some(2)));
+        assert!(weight(mid, FLAG_NOISE, Some(1)) > weight(mid, 0, None));
+        assert!(weight(mid, 0, Some(12)) > weight(mid, 0, Some(2)));
     }
 
     fn split(q: &str) -> (String, usize) {

@@ -464,6 +464,70 @@ fn where_the_user_works_lately_counts() {
 }
 
 #[test]
+fn any_separator_finds_any_other() {
+    let c = scan(vec![
+        d(5, 5, "."),
+        d(20, 5, "docs"),
+        f(40, 20, "analiza-buguri-2026.md"),
+        f(41, 20, "raport_2024.pdf"),
+        f(42, 20, "raport 2024 final.docx"),
+        f(43, 20, "raport final 2024.docx"),
+        f(44, 20, "whereti-setup-1.0.3.exe"),
+    ]);
+    let vols = vec![VolumeScan { letter: 'C', serial: 1, journal_id: 10, next_usn: 100, scan: c }];
+    let idx = build(vols, &Exclusions::default()).0;
+    let names = |q: &str| -> Vec<String> {
+        let mut v: Vec<String> = find(&idx, q).into_iter().map(|p| p.rsplit('\\').next().unwrap().to_string()).collect();
+        v.sort();
+        v
+    };
+    // a line, an underscore, a space in quotes: the same thing
+    for q in ["analiza_buguri", "analiza-buguri", "\"analiza buguri\"", "ANALIZA_Buguri"] {
+        assert_eq!(names(q), ["analiza-buguri-2026.md"], "{q}");
+    }
+    // the words still next to each other: "raport final 2024" is not "raport-2024"
+    assert_eq!(names("raport-2024"), ["raport 2024 final.docx", "raport_2024.pdf"]);
+    assert_eq!(names("\"raport 2024\""), ["raport 2024 final.docx", "raport_2024.pdf"]);
+    // dots are not separators: a version stays a version
+    assert_eq!(names("setup_1.0.3"), ["whereti-setup-1.0.3.exe"]);
+    assert!(names("setup-1_0_3").is_empty());
+    // and the spelling typed ranks like the one written: "raport-2024" is
+    // raport_2024.pdf exactly, then a name that starts with it
+    let r = idx.search(&parse("raport-2024", &ctx()), &SearchOptions { limit: 10, sort: SortBy::Relevance });
+    let order: Vec<&str> = r.hits.iter().map(|&i| idx.name(i)).collect();
+    assert_eq!(order, ["raport_2024.pdf", "raport 2024 final.docx"]);
+    assert_eq!(crate::search::spellings("a b").len(), 3);
+    assert_eq!(crate::search::spellings("a-b-c-d-e-f").len(), 81);
+}
+
+#[test]
+fn the_newest_comes_first_where_the_user_works_most() {
+    // the user's own folder, pictures, where they work: every point off, and
+    // still the screenshot of today before the one of three weeks ago
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let at = |secs_ago: u64| (now - secs_ago + 11_644_473_600) * 10_000_000;
+    let c = scan(vec![
+        d(5, 5, "."),
+        d(20, 5, "Users"),
+        d(21, 20, "ana"),
+        d(22, 21, "Pictures"),
+        d(23, 22, "Screenshots"),
+        E { modified: at(21 * 86_400), ..f(40, 23, "Screenshot 2026-11-01 094824.png") },
+        E { modified: at(3_600), ..f(41, 23, "Screenshot 2026-11-16 075330.png") },
+    ]);
+    let vols = vec![VolumeScan { letter: 'C', serial: 1, journal_id: 10, next_usn: 100, scan: c }];
+    let idx = build(vols, &Exclusions::default()).0;
+    let folder = (0..idx.len() as u32).find(|&i| idx.full_path(i) == r"C:\Users\ana\Pictures\Screenshots").unwrap();
+    let mut active = vec![0u8; idx.len()];
+    active[folder as usize] = 8;
+    let q = parse("screenshot", &ctx());
+    let opts = SearchOptions { limit: 10, sort: SortBy::Relevance };
+    let r = idx.search_ranked(&q, &opts, &[], std::sync::Arc::new(active));
+    let names: Vec<&str> = r.hits.iter().map(|&i| idx.name(i)).filter(|n| n.ends_with(".png")).collect();
+    assert_eq!(names, ["Screenshot 2026-11-16 075330.png", "Screenshot 2026-11-01 094824.png"]);
+}
+
+#[test]
 fn files_a_program_makes_are_not_work() {
     use crate::build::looks_generated;
     assert!(looks_generated("945d0bda-b0c0-4d90-99ee-d6bb23acfd51.sslo"));

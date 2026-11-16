@@ -86,6 +86,8 @@ fn close_words(query: &Query) -> Vec<(usize, &str)> {
 
 enum Matcher {
     Text(Box<Finder<'static>>),
+    /// A word written with separators: any of its spellings (see `spellings`).
+    AnyText(Vec<Finder<'static>>),
     Glob(String),
     Regex(regex::Regex),
     /// Indexed by extension id.
@@ -284,27 +286,30 @@ impl NameIndex {
             return Vec::new();
         }
 
-        // Driver: the longest plain word of a clause that is a single positive term.
-        let mut driver: Option<(usize, String, bool)> = None; // (clause, needle, clause fully covered)
+        // Driver: the longest plain word of a clause that is a single positive
+        // term (a word with separators: every spelling of it, in one pass).
+        let mut driver: Option<(usize, Vec<String>, bool)> = None; // (clause, needles, clause fully covered)
         for (ci, c) in query.clauses.iter().enumerate() {
             if c.negated || c.any_of.len() != 1 {
                 continue;
             }
-            let (needle, covered) = match &c.any_of[0] {
-                Term::Text(t) => (t.clone(), true),
-                Term::Glob(g) => (longest_literal(g).to_string(), false),
+            let (needles, covered) = match &c.any_of[0] {
+                Term::Text(t) => (spellings(t), true),
+                Term::Glob(g) => (vec![longest_literal(g).to_string()], false),
                 _ => continue,
             };
-            if !needle.is_empty() && driver.as_ref().is_none_or(|d| needle.len() > d.1.len()) {
-                driver = Some((ci, needle, covered));
+            let len = needles[0].len();
+            if len > 0 && driver.as_ref().is_none_or(|d| len > d.1[0].len()) {
+                driver = Some((ci, needles, covered));
             }
         }
         let t_compile = t0.elapsed();
-        let candidates: Option<Vec<u32>> = driver.as_ref().map(|(ci, needle, covered)| {
+        let candidates: Option<Vec<u32>> = driver.as_ref().map(|(ci, needles, covered)| {
             if *covered {
                 clauses.remove(*ci);
             }
-            self.scan_names(needle)
+            let refs: Vec<&str> = needles.iter().map(String::as_str).collect();
+            self.scan_names_any(&refs)
         });
 
         let t_scan = t0.elapsed();
@@ -345,7 +350,14 @@ impl NameIndex {
 
     fn compile(&self, term: &Term, warnings: &mut Vec<String>) -> Matcher {
         match term {
-            Term::Text(t) => Matcher::Text(Box::new(Finder::new(t.as_bytes()).into_owned())),
+            Term::Text(t) => {
+                let all = spellings(t);
+                if all.len() == 1 {
+                    Matcher::Text(Box::new(Finder::new(t.as_bytes()).into_owned()))
+                } else {
+                    Matcher::AnyText(all.iter().map(|v| Finder::new(v.as_bytes()).into_owned()).collect())
+                }
+            }
             Term::Glob(g) => Matcher::Glob(g.clone()),
             Term::Regex(r) => match regex::RegexBuilder::new(r).case_insensitive(true).build() {
                 Ok(re) => Matcher::Regex(re),
@@ -383,6 +395,10 @@ impl NameIndex {
         let iu = i as usize;
         match m {
             Matcher::Text(f) => f.find(self.folded_name(i, &mut s.name)).is_some(),
+            Matcher::AnyText(fs) => {
+                let name = self.folded_name(i, &mut s.name);
+                fs.iter().any(|f| f.find(name).is_some())
+            }
             Matcher::Glob(g) => {
                 let name = self.folded_name(i, &mut s.name);
                 glob_match(g, std::str::from_utf8(name).unwrap_or(""))
@@ -419,6 +435,7 @@ impl NameIndex {
     }
 
     /// Every entry whose folded name contains `needle`, in index order.
+    #[cfg(test)]
     fn scan_names(&self, needle: &str) -> Vec<u32> {
         self.scan_names_any(&[needle])
     }
@@ -689,7 +706,7 @@ impl NameIndex {
     pub fn importance(&self, i: u32, w: &Weigher) -> u8 {
         let iu = i as usize;
         let f = self.flags[iu];
-        let mut score: i32 = 16;
+        let mut score: i32 = IMPORTANCE_START;
         if f & FLAG_HOME != 0 {
             score -= 6;
         }
@@ -738,9 +755,9 @@ impl NameIndex {
             self.base_name(i)
         };
         let n = needle.len();
-        let score = if name.eq_ignore_ascii_case(needle) {
+        let score = if loose_eq(name, needle) {
             0
-        } else if name.len() >= n && name[..n].eq_ignore_ascii_case(needle) {
+        } else if name.len() >= n && loose_eq(&name[..n], needle) {
             // "readme" is README.md exactly: the name without its extension
             if name.get(n) == Some(&b'.') && !name[n + 1..].contains(&b'.') {
                 0
@@ -748,7 +765,7 @@ impl NameIndex {
                 1
             }
         } else if (1..name.len().saturating_sub(n) + 1)
-            .any(|p| !name[p - 1].is_ascii_alphanumeric() && name[p..p + n].eq_ignore_ascii_case(needle))
+            .any(|p| !name[p - 1].is_ascii_alphanumeric() && loose_eq(&name[p..p + n], needle))
         {
             2
         } else {
@@ -757,6 +774,47 @@ impl NameIndex {
         score + penalty
     }
 }
+
+/// Characters people put between words in a name, any of which they may
+/// type for another: `analiza_buguri`, `analiza-buguri` and `"analiza
+/// buguri"` all find `analiza-buguri.md`.
+const SEPARATORS: [u8; 3] = *b" -_";
+/// Separators in one word that get every spelling (3^4 = 81 at most);
+/// past them, the rest is taken as typed.
+const MAX_SPELLED: usize = 4;
+
+/// Every spelling of a folded word, each separator in it written as any of
+/// `SEPARATORS`. One spelling (the word itself) when it has none.
+pub(crate) fn spellings(word: &str) -> Vec<String> {
+    let at: Vec<usize> = word.bytes().enumerate().filter(|(_, b)| SEPARATORS.contains(b)).map(|(i, _)| i).take(MAX_SPELLED).collect();
+    let mut out = vec![word.as_bytes().to_vec()];
+    for &pos in &at {
+        out = out
+            .into_iter()
+            .flat_map(|v| {
+                SEPARATORS.iter().map(move |&sep| {
+                    let mut v = v.clone();
+                    v[pos] = sep;
+                    v
+                })
+            })
+            .collect();
+    }
+    // only ASCII bytes were swapped for ASCII bytes: still UTF-8
+    out.into_iter().map(|v| String::from_utf8(v).unwrap_or_default()).collect()
+}
+
+/// Same bytes, ignoring ASCII case, with any separator equal to any other.
+fn loose_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b).all(|(x, y)| x.eq_ignore_ascii_case(y) || (SEPARATORS.contains(x) && SEPARATORS.contains(y)))
+}
+
+/// Where `importance` starts: high enough that a file losing every point
+/// (the user's own folder, a document, where they work, changed today) is
+/// still above 0. Below it, files would all be 0 and fall back to
+/// alphabetical order, the newest last in the folders used most.
+pub const IMPORTANCE_START: i32 = 22;
 
 pub struct Weigher {
     /// Minutes since 1601, like `mtime`.
