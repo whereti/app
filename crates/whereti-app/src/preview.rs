@@ -209,17 +209,20 @@ impl Preview {
                 Some(Content::Text { text, .. } | Content::Picture { text, .. }) => !text.trim().is_empty(),
                 _ => false,
             };
-            if shows_text && !info.text_read && reading_done && !row.is_dir {
+            // why, as the service knows it ("" from a service that does not say)
+            let why = match info.text_why.as_str() {
+                "encrypted" => Some(tr("This file is encrypted by Windows (EFS): only your account can open it, so whereti cannot read its text and a search does not find it.")),
+                "skipped" => Some(tr("whereti does not read the text of hidden files, files only in the cloud, or files in program, cache and build folders, so a search does not find it.")),
+                "unreadable" => Some(tr("whereti could not read the text of this file, so a search does not find it.")),
+                "folder" => Some(tr("whereti has not read the text of this file, so a search does not find it. Text files, code and screenshots are read only in some folders.")),
+                _ => None,
+            };
+            if let Some(why) = why.filter(|_| shows_text && !info.text_read && reading_done && !row.is_dir) {
                 ui.add_space(6.0);
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(tr("whereti has not read the text of this file, so a search does not find it. Text files, code and screenshots are read only in some folders."))
-                            .size(12.0)
-                            .color(p.warn),
-                    )
-                    .wrap(),
-                );
-                self.choose_folders |= ui.link(egui::RichText::new(tr("Choose folders")).size(12.0).color(p.accent)).clicked();
+                ui.add(egui::Label::new(egui::RichText::new(why).size(12.0).color(p.warn)).wrap());
+                if info.text_why == "folder" {
+                    self.choose_folders |= ui.link(egui::RichText::new(tr("Choose folders")).size(12.0).color(p.accent)).clicked();
+                }
             }
         }
         ui.add_space(10.0);

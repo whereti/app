@@ -231,6 +231,13 @@ pub struct FileInfo {
     /// The content index has read this file: its text can be searched.
     #[serde(default)]
     pub text_read: bool,
+    /// When it has not, why: "folder" (a text file or screenshot outside
+    /// the folders read), "encrypted" (EFS: only its owner can open it),
+    /// "skipped" (hidden, system, cloud-only, or in a program, cache or
+    /// build folder), "unreadable" (a document that could not be read, or
+    /// not yet). Empty when read, or not known.
+    #[serde(default)]
+    pub text_why: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

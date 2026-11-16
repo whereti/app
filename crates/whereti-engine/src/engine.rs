@@ -476,10 +476,16 @@ impl Engine {
                         .find(|&e| idx.full_path(e).eq_ignore_ascii_case(&path))
                         .and_then(|e| {
                         let record = idx.records_of(&[e]).into_iter().next().flatten()?;
-                        Some(whereti_content::key(idx.volume_of(e).letter(), record))
+                        Some((whereti_content::key(idx.volume_of(e).letter(), record), idx.flags(e)))
                     })
                 };
-                Response::FileInfo(key.map(|k| self.content.file_info(k)).unwrap_or_default())
+                Response::FileInfo(
+                    key.map(|(k, flags)| whereti_ipc::FileInfo {
+                        text_why: self.content.text_why(k, &path, flags).to_string(),
+                        ..self.content.file_info(k)
+                    })
+                    .unwrap_or_default(),
+                )
             }
             Request::SetMeaning { on } => match self.content.set_meaning(on) {
                 Ok(()) => Response::Ok,

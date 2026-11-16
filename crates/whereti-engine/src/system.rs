@@ -191,6 +191,15 @@ pub fn process_private_bytes() -> u64 {
 }
 
 /// True when running on battery (PLAN.md §6.6: no indexing then).
+/// Encrypted with EFS: only its owner's account can read it (not SYSTEM).
+pub fn is_encrypted(path: &str) -> bool {
+    use windows_sys::Win32::Storage::FileSystem::{GetFileAttributesW, FILE_ATTRIBUTE_ENCRYPTED, INVALID_FILE_ATTRIBUTES};
+    let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+    // SAFETY: a NUL-terminated path.
+    let a = unsafe { GetFileAttributesW(wide.as_ptr()) };
+    a != INVALID_FILE_ATTRIBUTES && a & FILE_ATTRIBUTE_ENCRYPTED != 0
+}
+
 pub fn on_battery() -> bool {
     battery().is_some()
 }

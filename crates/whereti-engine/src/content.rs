@@ -1779,6 +1779,7 @@ impl Content {
         let Some(p) = self.props.lock().get(key).cloned() else { return whereti_ipc::FileInfo { text_read, ..Default::default() } };
         whereti_ipc::FileInfo {
             text_read,
+            text_why: String::new(),
             taken: p.taken,
             width: p.width,
             height: p.height,
@@ -1788,6 +1789,22 @@ impl Content {
             album: p.album,
             author: p.author,
             tags: p.tags,
+        }
+    }
+
+    /// Why the text of a file was not read (`FileInfo::text_why`), given
+    /// its path and its flags in the name index; "" when it was.
+    pub fn text_why(&self, key: u64, path: &str, flags: u16) -> &'static str {
+        if self.known_keys.read().contains_key(&key) {
+            ""
+        } else if system::is_encrypted(path) {
+            "encrypted"
+        } else if flags & SKIP != 0 {
+            "skipped"
+        } else if EVERYWHERE.contains(&ext_of(path).as_str()) {
+            "unreadable"
+        } else {
+            "folder"
         }
     }
 
