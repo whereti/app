@@ -11,6 +11,7 @@ use memchr::memmem::Finder;
 use rayon::prelude::*;
 use whereti_query::{fold, glob_match, longest_literal, Query, Term};
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::index::*;
@@ -134,15 +135,26 @@ impl NameIndex {
         let mut warnings = Vec::new();
         let hits = self.matching_entries(query, &mut warnings);
         let t_eval = t0.elapsed();
-        let rank_needle = query.clauses.iter().find_map(|c| match (&c.negated, c.any_of.as_slice()) {
-            (false, [Term::Text(t)]) => Some(t.clone()),
-            _ => None,
-        });
-        let total = hits.len();
+        let needles = plain_words(query);
+        let mut total = hits.len();
         let used = if opts.sort == SortBy::Relevance { self.usage_positions(&hits, usage) } else { Vec::new() };
-        // (a copy only when close matches will be looked for)
-        let exact = if total < FEW_HITS { hits.clone() } else { Vec::new() };
-        let mut hits = self.top(hits, opts, rank_needle.as_deref(), &used, active.clone());
+        // (a copy only when more is looked for after them)
+        let mut exact = if total < opts.limit { hits.clone() } else { Vec::new() };
+        let mut hits = self.top(hits, opts, &needles, &used, active.clone());
+        // "contract popescu": contract.docx in a folder named popescu,
+        // after the files with every word in their name
+        if hits.len() < opts.limit && needles.len() >= 2 {
+            exact.sort_unstable();
+            let in_folders = self.folder_entries(query, &exact);
+            if !in_folders.is_empty() {
+                total += in_folders.len();
+                let rest = SearchOptions { limit: opts.limit - hits.len(), ..*opts };
+                let used = if opts.sort == SortBy::Relevance { self.usage_positions(&in_folders, usage) } else { Vec::new() };
+                exact.extend_from_slice(&in_folders);
+                exact.sort_unstable();
+                hits.extend(self.top(in_folders, &rest, &needles, &used, active.clone()));
+            }
+        }
         let mut close = 0;
         if total < FEW_HITS && hits.len() < opts.limit {
             let (starts, inside) = self.close_entries(query, &exact);
@@ -162,7 +174,7 @@ impl NameIndex {
                 }
                 let rest = SearchOptions { limit: opts.limit - hits.len(), ..*opts };
                 let used = if opts.sort == SortBy::Relevance { self.usage_positions(&near, usage) } else { Vec::new() };
-                let near = self.top(near, &rest, None, &used, active.clone());
+                let near = self.top(near, &rest, &[], &used, active.clone());
                 close += near.len();
                 hits.extend(near);
             }
@@ -188,6 +200,86 @@ impl NameIndex {
             }
         }
         Default::default()
+    }
+
+    /// Entries with at least one plain word of `query` in their name and
+    /// each of the others in their name or in a folder above them, every
+    /// other condition as typed; in index order, without those of `exact`
+    /// (sorted). Only for 2 to 8 plain words: one word alone would bring
+    /// every file of a folder of that name.
+    fn folder_entries(&self, query: &Query, exact: &[u32]) -> Vec<u32> {
+        let plain: Vec<(usize, &str)> = query
+            .clauses
+            .iter()
+            .enumerate()
+            .filter_map(|(ci, c)| match (c.negated, c.any_of.as_slice()) {
+                (false, [Term::Text(t)]) => Some((ci, t.as_str())),
+                _ => None,
+            })
+            .collect();
+        if plain.len() < 2 || plain.len() > 8 || self.is_empty() {
+            return Vec::new();
+        }
+        let mut warnings = Vec::new();
+        let mut clauses = self.compile_clauses(query, &mut warnings);
+        let words: Vec<Matcher> = plain.iter().map(|&(_, w)| self.compile(&Term::Text(w.to_string()), &mut warnings)).collect();
+        for &(ci, _) in plain.iter().rev() {
+            clauses.remove(ci);
+        }
+        let all: Vec<String> = plain.iter().flat_map(|&(_, w)| spellings(w)).collect();
+        let refs: Vec<&str> = all.iter().map(String::as_str).collect();
+        let full: u8 = ((1u16 << words.len()) - 1) as u8;
+        self.scan_names_any(&refs)
+            .par_chunks(8192)
+            .map(|chunk| {
+                let mut s = Scratch::default();
+                // folder -> which words are in it or in a folder above it
+                let mut above: HashMap<u32, u8> = HashMap::new();
+                let mut out = Vec::new();
+                for &i in chunk {
+                    if exact.binary_search(&i).is_ok() || !(clauses.is_empty() || self.eval(&clauses, i, &mut s)) {
+                        continue;
+                    }
+                    let own = self.word_mask(&words, i, &mut s);
+                    if own == 0 || own == full {
+                        continue;
+                    }
+                    let folders = self.parent(i).map_or(0, |p| self.folders_mask(&words, p, &mut above, &mut s));
+                    if own | folders == full {
+                        out.push(i);
+                    }
+                }
+                out
+            })
+            .collect::<Vec<_>>()
+            .concat()
+    }
+
+    /// Bit k set: word k is in the name of entry `i`.
+    fn word_mask(&self, words: &[Matcher], i: u32, s: &mut Scratch) -> u8 {
+        words.iter().enumerate().fold(0u8, |m, (k, w)| if self.matches(w, i, s) { m | 1 << k } else { m })
+    }
+
+    /// The words in the name of folder `f` or of any folder above it,
+    /// remembered per folder (the files of one folder ask the same).
+    fn folders_mask(&self, words: &[Matcher], f: u32, above: &mut HashMap<u32, u8>, s: &mut Scratch) -> u8 {
+        // up to the first folder already known (or the root), then down
+        let mut chain = Vec::new();
+        let mut at = Some(f);
+        let mut known = 0u8;
+        while let Some(d) = at {
+            if let Some(&m) = above.get(&d) {
+                known = m;
+                break;
+            }
+            chain.push(d);
+            at = self.parent(d).filter(|&p| p != d);
+        }
+        for &d in chain.iter().rev() {
+            known |= self.word_mask(words, d, s);
+            above.insert(d, known);
+        }
+        known
     }
 
     fn close_for_word(&self, query: &Query, exact: &[u32], ci: usize, word: &str) -> (Vec<u32>, Vec<u32>) {
@@ -242,13 +334,10 @@ impl NameIndex {
             .collect();
         hits.sort_unstable();
         hits.dedup();
-        let rank_needle = query.clauses.iter().find_map(|c| match (&c.negated, c.any_of.as_slice()) {
-            (false, [Term::Text(t)]) => Some(t.clone()),
-            _ => None,
-        });
+        let needles = plain_words(query);
         let total = hits.len();
         let used = if opts.sort == SortBy::Relevance { self.usage_positions(&hits, usage) } else { Vec::new() };
-        let hits = self.top(hits, opts, rank_needle.as_deref(), &used, active);
+        let hits = self.top(hits, opts, &needles, &used, active);
         SearchResults { total, hits, warnings, close: 0 }
     }
 
@@ -571,7 +660,7 @@ impl NameIndex {
 
     /// `used`: positions in `hits` of files the user opens often or lately,
     /// with their weight (Relevance only).
-    fn top(&self, hits: Vec<u32>, opts: &SearchOptions, needle: Option<&str>, used: &[(usize, u8)], active: Arc<Vec<u8>>) -> Vec<u32> {
+    fn top(&self, hits: Vec<u32>, opts: &SearchOptions, needles: &[String], used: &[(usize, u8)], active: Arc<Vec<u8>>) -> Vec<u32> {
         let limit = opts.limit.min(hits.len());
         if limit == 0 {
             return Vec::new();
@@ -584,13 +673,13 @@ impl NameIndex {
                 // of its rank, count the buckets, and fully order only the
                 // hits in the buckets that can reach the top `limit` -
                 // thousands, not millions.
-                let needle = needle.map(str::as_bytes);
+                let needles: Vec<&[u8]> = needles.iter().map(|n| n.as_bytes()).collect();
                 let relevance = opts.sort == SortBy::Relevance;
                 let weigh = relevance.then(|| self.weigher_with(active));
                 let shift = (32 - (self.len().max(1) as u32).leading_zeros()).saturating_sub(7);
                 let bucket = |i: u32| -> u16 {
                     let key = match &weigh {
-                        Some(w) => (self.relevance(i, needle) as u16) << 5 | self.importance(i, w) as u16,
+                        Some(w) => (self.best_relevance(i, &needles) as u16) << 5 | self.importance(i, w) as u16,
                         None => 0,
                     };
                     (key << 7) | (rank(i) >> shift).min(127) as u16
@@ -603,7 +692,7 @@ impl NameIndex {
                         // yesterday beats an old one that only starts with
                         // the word), and more important by its weight
                         let i = hits[pos];
-                        let level = (self.relevance(i, needle) & 3).saturating_sub(weight / 4) as u16;
+                        let level = (self.best_relevance(i, &needles) & 3).saturating_sub(weight / 4) as u16;
                         let imp = self.importance(i, w).saturating_sub(weight) as u16;
                         buckets[pos] = (level << 5 | imp) << 7 | (rank(i) >> shift).min(127) as u16;
                     }
@@ -736,6 +825,23 @@ impl NameIndex {
         score.clamp(0, 31) as u8
     }
 
+    /// `relevance` by every word typed: the first as it is, the others one
+    /// level lower, so the name that starts with the first word still comes
+    /// first, and the order typed matters less. "2025 raport": "raport
+    /// x2025.pdf" (starts with a word typed) before "a x2025 raport.pdf".
+    fn best_relevance(&self, i: u32, needles: &[&[u8]]) -> u8 {
+        match needles {
+            [] => self.relevance(i, None),
+            [first, rest @ ..] => {
+                let mut best = self.relevance(i, Some(first));
+                for n in rest {
+                    best = best.min(self.relevance(i, Some(n)) + 1);
+                }
+                best
+            }
+        }
+    }
+
     /// 0 = exact name (with or without its extension), 1 = name starts with the word, 2 = a word in the name
     /// starts with it, 3 = anywhere; +4 hidden/system, +8 cache/build folder.
     /// Compares in place (no copy): the needle is folded, ASCII names are
@@ -773,6 +879,19 @@ impl NameIndex {
         };
         score + penalty
     }
+}
+
+/// The plain words of a query (positive, alone in their clause), which
+/// rank names: `raport !draft ext:pdf` -> ["raport"].
+fn plain_words(query: &Query) -> Vec<String> {
+    query
+        .clauses
+        .iter()
+        .filter_map(|c| match (c.negated, c.any_of.as_slice()) {
+            (false, [Term::Text(t)]) => Some(t.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Characters people put between words in a name, any of which they may
@@ -1153,7 +1272,7 @@ mod tests {
                 for limit in [1, 2, 3, 7, 50, 100_000] {
                     let want: Vec<u32> = all.iter().take(limit).map(|k| k.2).collect();
                     let opts = SearchOptions { limit, sort: SortBy::Relevance };
-                    assert_eq!(idx.top(hits.clone(), &opts, Some(needle), &[], Arc::new(Vec::new())), want, "seed {seed}, {needle:?}, limit {limit}");
+                    assert_eq!(idx.top(hits.clone(), &opts, &[needle.to_string()], &[], Arc::new(Vec::new())), want, "seed {seed}, {needle:?}, limit {limit}");
                 }
             }
             // no word to rank by (e.g. a path or ext: query), and alphabetical order
@@ -1181,7 +1300,8 @@ mod tests {
                 for limit in [1, 5, 33, 100_000] {
                     let want: Vec<u32> = all.iter().take(limit).map(|k| k.2).collect();
                     let opts = SearchOptions { limit, sort };
-                    assert_eq!(idx.top(hits.clone(), &opts, needle, &[], Arc::new(Vec::new())), want, "seed {seed}, {sort:?}, limit {limit}");
+                    let needles: Vec<String> = needle.iter().map(|n| n.to_string()).collect();
+                    assert_eq!(idx.top(hits.clone(), &opts, &needles, &[], Arc::new(Vec::new())), want, "seed {seed}, {sort:?}, limit {limit}");
                 }
             }
         }

@@ -464,6 +464,49 @@ fn where_the_user_works_lately_counts() {
 }
 
 #[test]
+fn a_word_may_be_in_a_folder_above_when_another_is_in_the_name() {
+    let c = scan(vec![
+        d(5, 5, "."),
+        d(20, 5, "firma"),
+        d(21, 20, "contracte"),
+        d(22, 21, "popescu"),
+        f(40, 22, "contract.docx"),
+        d(23, 21, "altul"),
+        f(41, 23, "contract.docx"),
+        d(24, 5, "docs"),
+        f(42, 24, "contract popescu.md"),
+        f(43, 22, "notes.txt"),
+        d(25, 22, "anexe"),
+        f(44, 25, "contract anexa 1.pdf"),
+        f(45, 24, "raport x2025.pdf"),
+        f(46, 24, "a x2025 raport.pdf"),
+    ]);
+    let vols = vec![VolumeScan { letter: 'C', serial: 1, journal_id: 10, next_usn: 100, scan: c }];
+    let idx = build(vols, &Exclusions::default()).0;
+    // every word in the name first, then a word in a folder above (even
+    // two folders up; the folder popescu too, inside "contracte"); a file
+    // with none of the words in its name, never
+    assert_eq!(
+        find(&idx, "contract popescu"),
+        [
+            r"C:\docs\contract popescu.md",
+            r"C:\firma\contracte\popescu\contract.docx",
+            r"C:\firma\contracte\popescu\anexe\contract anexa 1.pdf",
+            r"C:\firma\contracte\popescu",
+        ]
+    );
+    assert_eq!(find(&idx, "popescu contract").len(), 4);
+    // one word alone is still about names: not every file in a folder popescu
+    assert_eq!(find(&idx, "popescu"), [r"C:\firma\contracte\popescu", r"C:\docs\contract popescu.md"]);
+    // the other conditions still apply
+    assert_eq!(find(&idx, "contract popescu ext:pdf"), [r"C:\firma\contracte\popescu\anexe\contract anexa 1.pdf"]);
+    assert!(find(&idx, "contract popescu !anexa").iter().all(|p| !p.contains("anexa")));
+    // ranked by every word typed, not only the first: a name that starts
+    // with the second one comes before a name that only holds both
+    assert_eq!(find(&idx, "2025 raport"), [r"C:\docs\raport x2025.pdf", r"C:\docs\a x2025 raport.pdf"]);
+}
+
+#[test]
 fn any_separator_finds_any_other() {
     let c = scan(vec![
         d(5, 5, "."),
