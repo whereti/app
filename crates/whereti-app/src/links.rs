@@ -6,6 +6,8 @@ pub const PRIVACY: &str = "https://whereti.com/privacy/";
 pub const HELP: &str = "https://whereti.com/faq/";
 pub const SOURCE: &str = "https://github.com/whereti/app";
 pub const SUPPORTER: &str = "https://whereti.com/supporter/";
+/// The company that makes whereti (Settings > About).
+pub const COMPANY: &str = "https://softwarehive.ro";
 /// Personal goes straight to its Lemon Squeezy checkout. Business goes to the
 /// website first: the checkout cannot change how many PCs, so the page asks.
 pub const BUY_PERSONAL: &str = "https://whereti.lemonsqueezy.com/checkout/buy/ff4058f3-60ea-495b-8ea3-3a8a3f92d2ff";

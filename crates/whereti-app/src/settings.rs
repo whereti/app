@@ -808,13 +808,26 @@ fn about(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
                         .color(p.text2),
                 );
                 ui.add_space(6.0);
-                // who builds it, in plain sight
-                ui.label(
-                    egui::RichText::new(format!("{} · © 2026", trf!("Made by {company}", company = "Software Hive S.R.L.")))
-                        .size(12.5)
-                        .family(crate::app::medium())
-                        .color(p.text),
-                );
+                // who builds it, in plain sight; the company's name opens its site
+                let made_by = tr("Made by {company}");
+                let (before, after) = made_by.split_once("{company}").unwrap_or((made_by, ""));
+                let text = |s: &str| egui::RichText::new(s).size(12.5).family(crate::app::medium()).color(p.text);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 0.0;
+                    if !before.is_empty() {
+                        ui.label(text(before));
+                    }
+                    let company = ui
+                        .add(egui::Label::new(text("Software Hive S.R.L.").color(p.accent)).sense(Sense::click()))
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .on_hover_text(crate::links::COMPANY);
+                    if company.clicked() {
+                        if let Err(e) = shell::open(crate::links::COMPANY) {
+                            app.flash(e);
+                        }
+                    }
+                    ui.label(text(&format!("{after} · © 2026")));
+                });
             });
         });
         ui.add_space(14.0);
