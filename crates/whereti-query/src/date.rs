@@ -388,6 +388,15 @@ mod tests {
         same("this-week", "thisweek");
         same("ieri..azi", "yesterday..today");
         same(">ieri", ">yesterday");
+        // the words the "?" panel shows in each language (whereti-i18n,
+        // "Changed on a day: also …")
+        for w in [
+            "gestern", "diese-woche", "letzter-monat", "ayer", "esta-semana", "mes-pasado", "hier", "cette-semaine",
+            "mois-dernier", "ieri", "questa-settimana", "mese-scorso", "wczoraj", "ten-tydzień", "zeszły-miesiąc", "ontem",
+            "mês-passado", "săptămâna-asta", "luna-trecută",
+        ] {
+            assert!(named_period(w).is_some(), "{w}");
+        }
         // a word that is no period is still no date
         assert_eq!(parse_range("mâine", &c), None);
         assert_eq!(named_period("2024"), None);
