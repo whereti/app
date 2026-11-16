@@ -270,4 +270,15 @@ pub const ENTRIES: &[Entry] = &[
         pt_br: "A leitura do arquivo parou: {e}",
         ro: "Citirea fișierului s-a oprit: {e}",
     },
+    Entry {
+        en: "whereti has not read the text of this file, so a search does not find it. Text files, code and screenshots are read only in some folders.",
+        note: "Under the preview of a file whose text is shown but was not read into the index (so searching for it finds nothing). A link 'Choose folders' follows.",
+        de: "whereti hat den Text dieser Datei nicht gelesen, daher findet eine Suche ihn nicht. Textdateien, Code und Bildschirmfotos werden nur in bestimmten Ordnern gelesen.",
+        es: "whereti no ha leído el texto de este archivo, así que una búsqueda no lo encuentra. Los archivos de texto, el código y las capturas solo se leen en algunas carpetas.",
+        fr: "whereti n'a pas lu le texte de ce fichier, une recherche ne le trouve donc pas. Les fichiers texte, le code et les captures d'écran ne sont lus que dans certains dossiers.",
+        it: "whereti non ha letto il testo di questo file, quindi una ricerca non lo trova. File di testo, codice e screenshot vengono letti solo in alcune cartelle.",
+        pl: "whereti nie przeczytał tekstu tego pliku, więc wyszukiwanie go nie znajdzie. Pliki tekstowe, kod i zrzuty ekranu są czytane tylko w niektórych folderach.",
+        pt_br: "O whereti não leu o texto deste arquivo, então uma pesquisa não o encontra. Arquivos de texto, código e capturas de tela só são lidos em algumas pastas.",
+        ro: "whereti nu a citit textul acestui fișier, așa că o căutare nu îl găsește. Fișierele text, codul și capturile de ecran sunt citite doar în anumite foldere.",
+    },
 ];

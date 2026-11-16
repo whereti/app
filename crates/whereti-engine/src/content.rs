@@ -1753,8 +1753,10 @@ impl Content {
 impl Content {
     /// What was read from the file with this key (props.rs).
     pub fn file_info(&self, key: u64) -> whereti_ipc::FileInfo {
-        let Some(p) = self.props.lock().get(key).cloned() else { return Default::default() };
+        let text_read = self.known_keys.read().contains_key(&key);
+        let Some(p) = self.props.lock().get(key).cloned() else { return whereti_ipc::FileInfo { text_read, ..Default::default() } };
         whereti_ipc::FileInfo {
+            text_read,
             taken: p.taken,
             width: p.width,
             height: p.height,

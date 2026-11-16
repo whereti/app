@@ -551,6 +551,61 @@ fn search(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
     });
     ui.add_space(14.0);
 
+    // ---- folders whose text files, code and screenshots are read
+    card(ui, p, |ui| {
+        ui.add_space(12.0);
+        ui.label(egui::RichText::new(tr("Text files, code and screenshots")).size(14.5).family(semibold()).color(p.text));
+        ui.add_space(2.0);
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(tr("PDF and Office documents are read on every drive. Notes, code, CSV, web pages, archives and screenshots have their text read only in these folders."))
+                    .size(12.5)
+                    .color(p.text2),
+            )
+            .wrap(),
+        );
+        ui.add_space(10.0);
+        // only once the service told us its list: sending a list made up
+        // here would replace it
+        let Some((folders, defaults)) = app.settings.config.as_ref().map(|c| (c.content_folders.clone(), c.default_content_folders.clone())) else {
+            ui.add_space(2.0);
+            return;
+        };
+        let mut list = folders.clone();
+        if !folders.is_empty() {
+            if let Some(i) = path_list(ui, p, &folders, &mut app.file_icons) {
+                list.remove(i);
+            }
+            ui.add_space(10.0);
+        }
+        let same_as_start = folders.len() == defaults.len() && folders.iter().all(|f| defaults.iter().any(|d| d.eq_ignore_ascii_case(f)));
+        ui.horizontal(|ui| {
+            if button(ui, p, tr("Add a folder…"), false).clicked() {
+                if let Some(path) = app.hwnd.and_then(crate::win::pick_folder) {
+                    // the service reads as SYSTEM: a network folder, or a
+                    // drive only this account sees (Google Drive's G:), it cannot
+                    let own = crate::network::own_drives().iter().any(|d| path.to_ascii_lowercase().starts_with(&d.root.to_ascii_lowercase()));
+                    if !crate::win::is_local_drive(&path) || own || path.starts_with("\\\\") {
+                        app.flash(tr("Only folders on this PC's drives can be read this way."));
+                    } else if !list.iter().any(|x| x.eq_ignore_ascii_case(&path)) {
+                        list.push(path);
+                    }
+                }
+            }
+            if !same_as_start && button(ui, p, tr("Back to Desktop, Documents and Downloads"), false).clicked() {
+                list = defaults.clone();
+            }
+        });
+        if list != folders {
+            if let Some(c) = app.settings.config.as_mut() {
+                c.content_folders = list.clone();
+            }
+            app.searcher.set_content_folders(list);
+        }
+        ui.add_space(12.0);
+    });
+    ui.add_space(14.0);
+
     // ---- network folders and NAS
     card(ui, p, |ui| {
         ui.add_space(12.0);

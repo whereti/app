@@ -63,6 +63,7 @@ enum Msg {
     Status,
     Config,
     SetExclusions(Vec<String>),
+    SetContentFolders(Vec<String>),
     SetPhotoTags(bool),
     SetWorkFolders(bool),
     SetMeaning(bool),
@@ -106,6 +107,11 @@ impl Searcher {
         let _ = self.tx.send(Msg::SetExclusions(paths));
     }
 
+    /// The folders whose text files, code, archives and screenshots are read.
+    pub fn set_content_folders(&self, paths: Vec<String>) {
+        let _ = self.tx.send(Msg::SetContentFolders(paths));
+    }
+
     /// Objects and animals in photos on or off (the service downloads the
     /// model the first time).
     pub fn set_photo_tags(&self, on: bool) {
@@ -141,6 +147,7 @@ struct Pending {
     status: bool,
     config: bool,
     exclusions: Option<Vec<String>>,
+    content_folders: Option<Vec<String>>,
     photo_tags: Option<bool>,
     work_folders: Option<bool>,
     meaning: Option<bool>,
@@ -151,11 +158,13 @@ const BIT_EXCLUSIONS: u8 = 1;
 const BIT_TAGS: u8 = 2;
 const BIT_WORK: u8 = 4;
 const BIT_MEANING: u8 = 8;
+const BIT_CONTENT: u8 = 16;
 
 /// Which change of settings a message is (for "answered already").
 fn setting_bit(m: &Msg) -> u8 {
     match m {
         Msg::SetExclusions(_) => BIT_EXCLUSIONS,
+        Msg::SetContentFolders(_) => BIT_CONTENT,
         Msg::SetPhotoTags(_) => BIT_TAGS,
         Msg::SetWorkFolders(_) => BIT_WORK,
         Msg::SetMeaning(_) => BIT_MEANING,
@@ -206,6 +215,10 @@ fn worker(jobs: Receiver<Msg>, out: Sender<Update>, wake: impl Fn()) {
                 p.exclusions = Some(e);
                 p.config = true;
             }
+            Msg::SetContentFolders(f) => {
+                p.content_folders = Some(f);
+                p.config = true;
+            }
             Msg::SetPhotoTags(on) => {
                 p.photo_tags = Some(on);
                 p.status = true;
@@ -235,6 +248,7 @@ fn worker(jobs: Receiver<Msg>, out: Sender<Update>, wake: impl Fn()) {
         // when the service cannot be reached (it restarts after an update)
         let settings: Vec<Msg> = [
             p.exclusions.clone().map(Msg::SetExclusions),
+            p.content_folders.clone().map(Msg::SetContentFolders),
             p.photo_tags.map(Msg::SetPhotoTags),
             p.work_folders.map(Msg::SetWorkFolders),
             p.meaning.map(Msg::SetMeaning),
@@ -255,6 +269,7 @@ fn worker(jobs: Receiver<Msg>, out: Sender<Update>, wake: impl Fn()) {
                 for m in left.into_iter().rev() {
                     let again = match m {
                         Msg::SetExclusions(v) => Msg::SetExclusions(v.clone()),
+                        Msg::SetContentFolders(v) => Msg::SetContentFolders(v.clone()),
                         Msg::SetPhotoTags(on) => Msg::SetPhotoTags(*on),
                         Msg::SetWorkFolders(on) => Msg::SetWorkFolders(*on),
                         Msg::SetMeaning(on) => Msg::SetMeaning(*on),
@@ -329,6 +344,16 @@ fn worker(jobs: Receiver<Msg>, out: Sender<Update>, wake: impl Fn()) {
                 let msg = match r {
                     Response::Ok => crate::i18n::tr("Exclusions saved. The index is being rebuilt.").to_string(),
                     Response::Error(e) => crate::trf!("Could not save the exclusions: {e}", e),
+                    _ => crate::i18n::tr("Unexpected reply from the service").to_string(),
+                };
+                let _ = out.send(Update::Done(msg));
+            }
+            if let Some(paths) = p.content_folders {
+                let r = call(c, &Request::SetContentFolders { paths })?;
+                done(BIT_CONTENT);
+                let msg = match r {
+                    Response::Ok => crate::i18n::tr("Folders saved. whereti reads their files in the background.").to_string(),
+                    Response::Error(e) => crate::trf!("Could not save the folders: {e}", e),
                     _ => crate::i18n::tr("Unexpected reply from the service").to_string(),
                 };
                 let _ = out.send(Update::Done(msg));

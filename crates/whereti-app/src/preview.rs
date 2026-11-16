@@ -94,6 +94,8 @@ pub struct Preview {
     picture: Option<(Key, egui::TextureHandle)>,
     /// Chinese, Japanese or Korean text was read (the fonts for it are loaded then).
     pub saw_cjk: bool,
+    /// "Choose folders" was clicked under a text a search cannot find.
+    pub choose_folders: bool,
 }
 
 impl Preview {
@@ -104,7 +106,7 @@ impl Preview {
             .name("preview".into())
             .spawn(move || worker(jobs, out, wake))
             .expect("preview thread");
-        Preview { open, tx, rx, current: None, cache: VecDeque::new(), job: None, scroll_to_match: false, picture: None, saw_cjk: false }
+        Preview { open, tx, rx, current: None, cache: VecDeque::new(), job: None, scroll_to_match: false, picture: None, saw_cjk: false, choose_folders: false }
     }
 
     /// Call every frame with the selected row; starts loading when it changed.
@@ -155,6 +157,7 @@ impl Preview {
         needles: &[String],
         tz: i32,
         info: Option<&whereti_ipc::FileInfo>,
+        reading_done: bool,
     ) {
         let icon = row.and_then(|r| icons.get(ui.ctx(), &r.path, r.is_dir));
         let icon = icon.as_ref();
@@ -200,6 +203,24 @@ impl Preview {
         ui.label(egui::RichText::new(facts.join("  ·  ")).size(12.0).color(p.text3));
         if let Some(info) = info {
             details(ui, p, info, tz);
+            // text shown here that a search cannot find: say so, once the
+            // service has read everything it is going to read
+            let shows_text = match self.loaded().map(|l| &l.content) {
+                Some(Content::Text { text, .. } | Content::Picture { text, .. }) => !text.trim().is_empty(),
+                _ => false,
+            };
+            if shows_text && !info.text_read && reading_done && !row.is_dir {
+                ui.add_space(6.0);
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(tr("whereti has not read the text of this file, so a search does not find it. Text files, code and screenshots are read only in some folders."))
+                            .size(12.0)
+                            .color(p.warn),
+                    )
+                    .wrap(),
+                );
+                self.choose_folders |= ui.link(egui::RichText::new(tr("Choose folders")).size(12.0).color(p.accent)).clicked();
+            }
         }
         ui.add_space(10.0);
 

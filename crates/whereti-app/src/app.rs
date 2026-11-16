@@ -2529,8 +2529,14 @@ impl eframe::App for WheretiApp {
                     ui.painter().vline(r.left() - 16.0, r.y_range().expand(12.0), Stroke::new(1.0, p.line));
                     let row = if self.is_launch(self.selected) { None } else { self.rows.get(self.selected) };
                     let info = row.and_then(|r| self.file_info.1.as_ref().filter(|(p, _)| p == &r.path).map(|(_, i)| i.clone()));
-                    self.preview.show(ui, &p, row, &mut self.file_icons, &needles, self.tz, info.as_ref())
+                    let reading_done = self.status.as_ref().is_some_and(|s| s.content.queued == 0 && s.content.state == "ready");
+                    self.preview.show(ui, &p, row, &mut self.file_icons, &needles, self.tz, info.as_ref(), reading_done)
                 });
+            if std::mem::take(&mut self.preview.choose_folders) {
+                self.settings.section = crate::settings::Section::Search;
+                self.page = Page::Settings;
+                self.searcher.ask_config();
+            }
         }
         egui::CentralPanel::default()
             .frame(Frame::NONE.fill(p.bg).inner_margin(Margin { left: 12, right: 12, top: 0, bottom: 0 }))

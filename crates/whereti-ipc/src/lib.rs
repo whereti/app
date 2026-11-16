@@ -226,6 +226,9 @@ pub struct FileInfo {
     pub author: String,
     /// What the photo model saw: label numbers (whereti_extract::tags::labels).
     pub tags: Vec<u16>,
+    /// The content index has read this file: its text can be searched.
+    #[serde(default)]
+    pub text_read: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
