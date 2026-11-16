@@ -163,6 +163,8 @@ pub struct WheretiApp {
     /// command is pointed out only once typing stops (`PROBLEM_DELAY`), not
     /// at every letter of `dm:tod…`.
     typed_at: Instant,
+    /// How the results of a typed search are ordered (the menu above them).
+    order: Sort,
     /// The folders' list for "nothing found" was asked for once.
     config_asked: bool,
     recent_mode: bool,
@@ -274,6 +276,7 @@ impl WheretiApp {
             round_trip: Duration::ZERO,
             warnings: Vec::new(),
             typed_at: Instant::now(),
+            order: Sort::Relevance,
             config_asked: false,
             recent_mode: true,
             selected: 0,
@@ -370,7 +373,7 @@ impl WheretiApp {
             // only a filter: the newest of the user's own files of that kind
             return (format!("{} mine:", self.filter.clause()), Sort::Modified, false);
         }
-        (format!("{q} {}", self.filter.clause()), Sort::Relevance, false)
+        (format!("{q} {}", self.filter.clause()), self.order, false)
     }
 
     /// Words of the search that look like commands and were searched as
@@ -636,6 +639,7 @@ impl WheretiApp {
                         }
                         extra.push(r);
                     }
+                    sort_rows(&mut extra, self.order);
                     if !extra.is_empty() {
                         self.content_start = Some(self.rows.len());
                         self.rows.extend(extra);
@@ -647,7 +651,8 @@ impl WheretiApp {
                         continue;
                     }
                     let shown: std::collections::HashSet<String> = self.rows.iter().map(|r| r.path.to_lowercase()).collect();
-                    let extra: Vec<Row> = rows.into_iter().filter(|r| !shown.contains(&r.path.to_lowercase())).collect();
+                    let mut extra: Vec<Row> = rows.into_iter().filter(|r| !shown.contains(&r.path.to_lowercase())).collect();
+                    sort_rows(&mut extra, self.order);
                     if !extra.is_empty() {
                         // after the names (and their close matches), before what came from contents
                         let at = self.content_start.unwrap_or(self.rows.len());
@@ -1685,10 +1690,34 @@ impl WheretiApp {
         } else {
             trn!("{n} RESULT|{n} RESULTS", self.total)
         };
+        // the order, for a typed search (recent files and filters alone are
+        // newest first; identical files come by the space they free)
+        let can_order = !self.recent_mode && self.dupe_sets.is_empty() && !self.query.trim().is_empty();
+        let mut picked = None;
         ui.horizontal(|ui| {
             ui.add_space(12.0);
             ui.label(egui::RichText::new(header).size(11.0).color(p.text3).family(semibold()));
+            if can_order {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add_space(8.0);
+                    egui::ComboBox::from_id_salt("order")
+                        .selected_text(egui::RichText::new(order_label(self.order)).size(11.5).color(p.text2))
+                        .show_ui(ui, |ui| {
+                            for o in [Sort::Relevance, Sort::Modified, Sort::Size, Sort::Name] {
+                                if ui.selectable_label(self.order == o, order_label(o)).clicked() {
+                                    picked = Some(o);
+                                }
+                            }
+                        })
+                        .response
+                        .on_hover_text(tr("Order of the results"));
+                });
+            }
         });
+        if let Some(o) = picked.filter(|&o| o != self.order) {
+            self.order = o;
+            self.run_search();
+        }
         ui.add_space(6.0);
         for w in self.warnings.clone().into_iter().chain(self.query_problems(ctx)) {
             ui.horizontal(|ui| {
@@ -2777,6 +2806,27 @@ pub(crate) fn key_hint(ui: &mut egui::Ui, p: &Palette, keys: &str) {
 }
 
 /// Centered icon, title, text and optional example chips (returns the clicked one).
+/// The name of an order in the menu above the results.
+fn order_label(o: Sort) -> &'static str {
+    match o {
+        Sort::Relevance => tr("Best match"),
+        Sort::Modified => tr("Newest first"),
+        Sort::Size => tr("Largest first"),
+        Sort::Name => tr("By name"),
+    }
+}
+
+/// Rows that come after the names (from contents, from network folders)
+/// in the order picked; by relevance they stay as they came, best first.
+fn sort_rows(rows: &mut [Row], order: Sort) {
+    match order {
+        Sort::Relevance => {}
+        Sort::Modified => rows.sort_by_key(|r| std::cmp::Reverse(r.modified)),
+        Sort::Size => rows.sort_by_key(|r| std::cmp::Reverse(r.size)),
+        Sort::Name => rows.sort_by_cached_key(|r| r.path.rsplit('\\').next().unwrap_or(&r.path).to_lowercase()),
+    }
+}
+
 fn empty_state(
     ui: &mut egui::Ui,
     p: &Palette,
