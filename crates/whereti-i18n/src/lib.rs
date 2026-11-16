@@ -18,7 +18,7 @@ use std::fmt::Display;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::OnceLock;
 
-pub use locales::{Lang, Locale, LOCALES};
+pub use locales::{windows_languages, Lang, Locale, LOCALES};
 pub use plural::form_index;
 
 /// One text: the English (the key), a note for translators, every language.

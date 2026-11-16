@@ -153,7 +153,7 @@ impl Lang {
 }
 
 /// The user's display languages in order of preference, e.g. ["ro-RO", "en-US"].
-fn windows_languages() -> Vec<String> {
+pub fn windows_languages() -> Vec<String> {
     use windows_sys::Win32::Globalization::{GetUserPreferredUILanguages, MUI_LANGUAGE_NAME};
     let (mut count, mut len) = (0u32, 0u32);
     // SAFETY: the first call asks for the size, the second fills a buffer of

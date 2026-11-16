@@ -28,7 +28,7 @@ use windows_sys::Win32::System::Pipes::{
 };
 
 pub const PIPE_NAME: &str = r"\\.\pipe\whereti";
-pub const PROTOCOL_VERSION: u32 = 12;
+pub const PROTOCOL_VERSION: u32 = 13;
 const MAX_MESSAGE: usize = 64 << 20;
 /// What the service reads from a client in one request: requests are small
 /// (500 exclusion paths fit easily), so no client makes it hold 64 MB.
@@ -103,7 +103,9 @@ pub enum Request {
     /// What the user is doing, as seen from their session: `busy` = a
     /// full-screen game or video, or a presentation; `away` = screen locked
     /// or screen saver. Background work pauses or speeds up accordingly.
-    Hint { busy: bool, away: bool },
+    /// `languages`: the user's display languages in order ("ro-RO",
+    /// "en-US"), for reading the text in pictures (OCR).
+    Hint { busy: bool, away: bool, languages: Vec<String> },
     /// Look inside the documents the content index has not read yet (while
     /// it is still working), one step of about `budget_ms` at a time; call
     /// again with `skip = next` until `done`.

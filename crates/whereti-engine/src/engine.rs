@@ -440,8 +440,9 @@ impl Engine {
                 let budget = Duration::from_millis(r.budget_ms.clamp(200, 5000) as u64);
                 Response::Scan(self.content.scan_run(&plan, r.skip, budget, r.limit.clamp(1, 500) as usize, caller))
             }
-            Request::Hint { busy, away } => {
+            Request::Hint { busy, away, languages } => {
                 self.content.hint(busy, away);
+                self.content.set_ocr_languages(&languages);
                 Response::Ok
             }
             Request::SetWorkFolders { on } => {

@@ -154,6 +154,13 @@ struct Pending {
     file_info: Option<String>,
 }
 
+/// The user's display languages, read once: the service reads the text in
+/// pictures in them (it runs as SYSTEM, whose language may be another).
+fn user_languages() -> Vec<String> {
+    static LANGS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    LANGS.get_or_init(whereti_i18n::windows_languages).clone()
+}
+
 const BIT_EXCLUSIONS: u8 = 1;
 const BIT_TAGS: u8 = 2;
 const BIT_WORK: u8 = 4;
@@ -446,7 +453,7 @@ fn worker(jobs: Receiver<Msg>, out: Sender<Update>, wake: impl Fn()) {
             }
             if p.status {
                 let (busy, away) = crate::shell::user_state();
-                call(c, &Request::Hint { busy, away })?;
+                call(c, &Request::Hint { busy, away, languages: user_languages() })?;
                 if let Response::Status(s) = call(c, &Request::Status)? {
                     let _ = out.send(Update::Status(s));
                 }

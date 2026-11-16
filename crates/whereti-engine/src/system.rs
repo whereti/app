@@ -192,11 +192,19 @@ pub fn process_private_bytes() -> u64 {
 
 /// True when running on battery (PLAN.md §6.6: no indexing then).
 pub fn on_battery() -> bool {
+    battery().is_some()
+}
+
+/// On battery: how full it is, 0-100 (0 when Windows does not know). `None`
+/// on mains power, and on desktops.
+pub fn battery() -> Option<u8> {
     use windows_sys::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
     // SAFETY: zeroed out-parameter.
     let mut s: SYSTEM_POWER_STATUS = unsafe { std::mem::zeroed() };
     // ACLineStatus: 0 = offline (battery), 1 = online, 255 = unknown (desktops)
-    unsafe { GetSystemPowerStatus(&mut s) != 0 && s.ACLineStatus == 0 }
+    let ok = unsafe { GetSystemPowerStatus(&mut s) } != 0;
+    // BatteryLifePercent: 255 = unknown
+    (ok && s.ACLineStatus == 0).then_some(if s.BatteryLifePercent > 100 { 0 } else { s.BatteryLifePercent })
 }
 
 /// How busy the whole PC's CPU was since the last call, without this

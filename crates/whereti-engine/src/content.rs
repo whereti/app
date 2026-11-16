@@ -128,6 +128,9 @@ pub struct Content {
     exts: HashSet<&'static str>,
     /// Recent hints from the user sessions: (when, busy, away).
     hints: Mutex<Vec<(Instant, bool, bool)>>,
+    /// The languages of the user's Windows, for the text in pictures; kept
+    /// on disk, so photos read before anyone signs in use them too.
+    ocr_languages: Mutex<Vec<String>>,
     /// Content hashes for grouping identical copies, so a file is read
     /// again only after it changes.
     hashes: HashCache,
@@ -263,6 +266,7 @@ impl Content {
             known_keys: RwLock::new(known),
             exts: whereti_extract::extensions().into_iter().collect(),
             hints: Mutex::new(Vec::new()),
+            ocr_languages: Mutex::new(load_ocr_languages()),
             hashes: Arc::new(Mutex::new(HashMap::new())),
             tags_on: AtomicBool::new(std::fs::read_to_string(dir.join("photo-tags.txt")).is_ok_and(|s| s.trim() == "on")),
             tags_state: Mutex::new("off".into()),
@@ -305,6 +309,19 @@ impl Content {
         hints.push((Instant::now(), busy, away));
     }
 
+    /// The user's display languages (from the app), checked and kept.
+    pub fn set_ocr_languages(&self, languages: &[String]) {
+        let clean = clean_languages(languages);
+        if clean.is_empty() {
+            return;
+        }
+        let mut current = self.ocr_languages.lock();
+        if *current != clean {
+            let _ = system::ensure_data_dir().and_then(|_| std::fs::write(ocr_languages_file(), clean.join("\n")));
+            *current = clean;
+        }
+    }
+
     /// (busy, away) from the recent hints: busy when any session says so
     /// (a game in full screen), away only when every one does.
     fn recent_hint(&self) -> (bool, bool) {
@@ -313,7 +330,7 @@ impl Content {
 
     /// Why indexing should wait now, if it should (PLAN.md §6.6).
     fn pause_reason(&self, cpu: &mut system::CpuMeter) -> Option<&'static str> {
-        if system::on_battery() {
+        if battery_low() {
             return Some("battery");
         }
         if self.recent_hint().0 {
@@ -923,6 +940,10 @@ impl Content {
                 // what changes from now on asks for the next round
                 self.dirty.store(false, Ordering::Relaxed);
                 last_round = Instant::now();
+                // the text in pictures in the user's languages (they may have come since)
+                if let Some(s) = sandbox.as_mut() {
+                    s.ocr_languages = self.ocr_languages.lock().clone();
+                }
                 // the extractor back (reinstalled, out of quarantine): what waited for it, now
                 if sandbox.is_none() {
                     sandbox = new_sandbox();
@@ -1154,7 +1175,7 @@ impl Content {
                 let mut reason = if measured {
                     last_cpu_check = Instant::now();
                     self.pause_reason(&mut cpu)
-                } else if system::on_battery() {
+                } else if battery_low() {
                     Some("battery")
                 } else if self.recent_hint().0 {
                     Some("fullscreen")
@@ -1366,8 +1387,9 @@ impl Content {
             }
             // Rest at least as long as the file took; a quarter of that
             // while nobody is at the PC (locked, screen saver), four times
-            // that while the CPU stays busy. A stop or a new plan ends it.
-            let rest = if slow {
+            // that while the CPU stays busy or on battery. A stop or a new
+            // plan ends it.
+            let rest = if slow || system::on_battery() {
                 took * 4
             } else if self.recent_hint().1 {
                 took / 4
@@ -2489,6 +2511,36 @@ fn extract(
 }
 
 /// The extractor next to the service, with the indexing's limits.
+/// On battery, documents are read while it is at least this full: slowly
+/// (four times the rest), newest first, so what was just saved is found
+/// the same day on a laptop that is never plugged in. Below it, they wait.
+const BATTERY_KEEP_READING: u8 = 50;
+
+fn battery_low() -> bool {
+    system::battery().is_some_and(|p| p < BATTERY_KEEP_READING)
+}
+
+fn ocr_languages_file() -> PathBuf {
+    system::data_dir().join("ocr-languages.txt")
+}
+
+fn load_ocr_languages() -> Vec<String> {
+    let text = std::fs::read_to_string(ocr_languages_file()).unwrap_or_default();
+    clean_languages(&text.lines().map(String::from).collect::<Vec<_>>())
+}
+
+/// Language tags as Windows writes them ("ro-RO", "zh-Hans-CN"): at most 8,
+/// letters, digits and dashes only (they become a command line argument).
+fn clean_languages(languages: &[String]) -> Vec<String> {
+    languages
+        .iter()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty() && l.len() <= 20 && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'))
+        .take(8)
+        .map(String::from)
+        .collect()
+}
+
 fn new_sandbox() -> Option<Sandbox> {
     Sandbox::beside_current_exe().map(|mut s| {
         s.timeout = Duration::from_secs(30);
