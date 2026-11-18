@@ -82,9 +82,34 @@ fn roots() -> Vec<String> {
     list
 }
 
-/// Looks at the drives again; true when they changed.
+/// The drives the service indexed, from its last status; `None` before it.
+static INDEXED: RwLock<Option<Vec<char>>> = RwLock::new(None);
+
+/// Told by each status of the service: what it indexed.
+pub fn service_drives(letters: Vec<char>) {
+    let changed = match INDEXED.write() {
+        Ok(mut i) if i.as_ref() != Some(&letters) => {
+            *i = Some(letters);
+            true
+        }
+        _ => false,
+    };
+    // a drive of every account the service did not index: walked now
+    if changed && STARTED.load(Ordering::SeqCst) {
+        refresh();
+    }
+}
+
+/// Looks at the drives again; true when they changed. A drive every account
+/// sees is the service's when it indexed it, else ours (not before the
+/// service has said: no drive is listed twice).
 fn look_at_drives() -> bool {
-    let now = crate::win::own_drives();
+    let indexed = INDEXED.read().ok().and_then(|i| i.clone());
+    let ours = |d: &crate::win::OwnDrive| {
+        let letter = d.root.chars().next().unwrap_or(' ').to_ascii_uppercase();
+        !d.system_wide || indexed.as_ref().is_some_and(|i| !i.iter().any(|l| l.to_ascii_uppercase() == letter))
+    };
+    let now: Vec<_> = crate::win::own_drives().into_iter().filter(ours).collect();
     match OWN.write() {
         Ok(mut o) if *o != now => {
             *o = now;

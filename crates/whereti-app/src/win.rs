@@ -457,6 +457,16 @@ pub fn is_local_drive(path: &str) -> bool {
 pub struct OwnDrive {
     pub root: String,
     pub name: String,
+    /// Seen by every account too, though made by a program and not a disk
+    /// (Google Drive since 2026 mounts its drive so): walked only when the
+    /// service could not index it, which it cannot as SYSTEM.
+    pub system_wide: bool,
+}
+
+/// A volume made by a program (Google Drive, WinFsp and Dokan drives), not
+/// a partition of a disk (`\Device\HarddiskVolume3`).
+fn made_by_a_program(target: &str) -> bool {
+    target.starts_with(r"\Device\Volume{")
 }
 
 /// Should a drive seen only in this session be walked as the user? Not a
@@ -477,8 +487,9 @@ fn walk_as_user(kind: u32, target: &str, network_share: bool) -> bool {
     }
 }
 
-/// The drives this account sees and the service does not: the letters of
-/// this session only (none under `Global\`), ready now.
+/// The drives this account sees and the service may not: the letters of
+/// this session only, and the ones of every account made by a program,
+/// ready now.
 pub fn own_drives() -> Vec<OwnDrive> {
     use windows::core::PWSTR;
     use windows::Win32::NetworkManagement::WNet::WNetGetConnectionW;
@@ -498,7 +509,7 @@ pub fn own_drives() -> Vec<OwnDrive> {
         // SAFETY: NUL-terminated names and buffers of their stated length.
         let mine = unsafe { QueryDosDeviceW(&device, Some(&mut target)) } != 0;
         let global = unsafe { QueryDosDeviceW(&HSTRING::from(format!(r"Global\{letter}:")), Some(&mut scratch)) } != 0;
-        if !mine || global {
+        if !mine || (global && !made_by_a_program(&text(&target))) {
             continue;
         }
         let root = format!(r"{letter}:\");
@@ -521,7 +532,7 @@ pub fn own_drives() -> Vec<OwnDrive> {
         }
         let label = text(&label);
         let name = if label.trim().is_empty() { format!("{letter}:") } else { format!("{} ({letter}:)", label.trim()) };
-        out.push(OwnDrive { root, name });
+        out.push(OwnDrive { root, name, system_wide: global });
     }
     out
 }
@@ -549,6 +560,13 @@ mod tests {
         assert!(!walk_as_user(4, r"\Device\LanmanRedirector\;Z:0000\nas\photos", true));
         assert!(!walk_as_user(3, r"\??\C:\Users\me\Work", false));
         assert!(!walk_as_user(5, r"\Device\CdRom0", false));
+    }
+
+    #[test]
+    fn google_drive_of_every_account_is_made_by_a_program() {
+        assert!(made_by_a_program(r"\Device\Volume{042dcf0d-1a8b-3c45-87b7-1a3469d2a54b}"));
+        assert!(!made_by_a_program(r"\Device\HarddiskVolume3"));
+        assert!(!made_by_a_program(r"\Device\CdRom0"));
     }
 
     #[test]

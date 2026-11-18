@@ -455,6 +455,7 @@ fn worker(jobs: Receiver<Msg>, out: Sender<Update>, wake: impl Fn()) {
                 let (busy, away) = crate::shell::user_state();
                 call(c, &Request::Hint { busy, away, languages: user_languages() })?;
                 if let Response::Status(s) = call(c, &Request::Status)? {
+                    crate::network::service_drives(s.volumes.iter().map(|v| v.letter).collect());
                     let _ = out.send(Update::Status(s));
                 }
             }
