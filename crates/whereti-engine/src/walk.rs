@@ -121,13 +121,19 @@ fn made_by_a_program(target: &str) -> bool {
 
 /// Walks every folder of a drive. Junctions and other reparse points are
 /// listed but not entered, so a loop can never make it walk forever.
-pub fn walk(drive: &Drive) -> io::Result<VolumeScan> {
-    let scan = walk_tree(&format!(r"\\?\{}:", drive.letter))?;
+/// Stopped (`ErrorKind::Interrupted`) as soon as `keep_going` says no.
+pub fn walk(drive: &Drive, keep_going: &dyn Fn() -> bool) -> io::Result<VolumeScan> {
+    let scan = walk_tree_until(&format!(r"\\?\{}:", drive.letter), keep_going)?;
     Ok(VolumeScan { letter: drive.letter, serial: drive.serial, journal_id: WALKED, next_usn: 0, scan })
 }
 
 /// Walks the tree under `root` (no trailing backslash) into an MFT-shaped scan.
+#[cfg(test)]
 fn walk_tree(root: &str) -> io::Result<MftScan> {
+    walk_tree_until(root, &|| true)
+}
+
+fn walk_tree_until(root: &str, keep_going: &dyn Fn() -> bool) -> io::Result<MftScan> {
     use windows_sys::Win32::Foundation::{GetLastError, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::Storage::FileSystem::{
         FindClose, FindExInfoBasic, FindExSearchNameMatch, FindFirstFileExW, FindNextFileW, FIND_FIRST_EX_LARGE_FETCH,
@@ -141,6 +147,9 @@ fn walk_tree(root: &str) -> io::Result<MftScan> {
     let mut stack: Vec<(String, u64)> = vec![(root.to_string(), ROOT_RECORD)];
     let mut root_ok = false;
     while let Some((dir, record)) = stack.pop() {
+        if !keep_going() {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "stopped"));
+        }
         let pattern = wide(&format!(r"{dir}\*"));
         // SAFETY: an all-zero WIN32_FIND_DATAW is valid; the API fills it.
         let mut data: WIN32_FIND_DATAW = unsafe { std::mem::zeroed() };
@@ -290,6 +299,19 @@ mod tests {
     fn the_system_drive_is_listed() {
         let sys = std::env::var("SystemDrive").unwrap_or("C:".into()).chars().next().unwrap();
         assert!(drives().iter().any(|d| d.letter.eq_ignore_ascii_case(&sys) && !d.removable));
+    }
+
+    #[test]
+    fn a_walk_stops_when_told() {
+        let root = tree("stop");
+        let asked = std::cell::Cell::new(0);
+        // a drive left out after two folders: the walk ends there
+        let r = walk_tree_until(root.to_str().unwrap(), &|| {
+            asked.set(asked.get() + 1);
+            asked.get() <= 2
+        });
+        assert_eq!(r.err().map(|e| e.kind()), Some(io::ErrorKind::Interrupted));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

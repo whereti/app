@@ -111,6 +111,13 @@ impl Drives {
         out
     }
 
+    /// Is this drive still to be searched? A scan asks it as it goes: a
+    /// drive left out meanwhile stops being read at once.
+    pub fn wanted(&self, d: &Drive) -> bool {
+        let serial = d.serial as u32;
+        d.by_program || self.inner.lock().known.iter().find(|k| k.serial == serial).is_none_or(|k| k.choice == DriveChoice::Search)
+    }
+
     /// Search a drive (`true`) or leave it out. The system drive is always
     /// searched.
     pub fn set(&self, serial: u32, search: bool) -> Result<(), String> {
@@ -251,6 +258,11 @@ mod tests {
         assert!(away.iter().any(|e| e.serial == 3 && !e.connected && e.choice == DriveChoice::LeaveOut));
         drives.set(3, true).unwrap();
         assert_eq!(letters(&drives.usable(vec![drive('C', 1, ""), drive('E', 3, "")])), "CE");
+        // a scan going on asks as it reads
+        assert!(drives.wanted(&drive('E', 3, "")));
+        drives.set(3, false).unwrap();
+        assert!(!drives.wanted(&drive('E', 3, "")));
+        assert!(drives.wanted(&drive('Z', 42, "never seen")));
         let _ = std::fs::remove_file(&path);
     }
 

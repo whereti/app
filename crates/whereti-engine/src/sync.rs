@@ -157,6 +157,11 @@ pub fn read_since(info: &VolumeInfo, vol: &Volume, open: &mut HashSet<u64>) -> R
 
 /// Full MFT scan of one volume. `Ok(None)` if it is not NTFS.
 pub fn scan_volume(letter: char, threads: usize) -> Result<Option<VolumeScan>, String> {
+    scan_volume_until(letter, threads, &|| true)
+}
+
+/// `scan_volume`, stopped as soon as `keep_going` says no.
+fn scan_volume_until(letter: char, threads: usize, keep_going: &(dyn Fn() -> bool + Sync)) -> Result<Option<VolumeScan>, String> {
     let vol = match Volume::open(letter, true) {
         Ok(v) => v,
         Err(e) if e.kind() == io::ErrorKind::Unsupported => return Ok(None),
@@ -164,7 +169,7 @@ pub fn scan_volume(letter: char, threads: usize) -> Result<Option<VolumeScan>, S
     };
     // Journal position BEFORE the scan: replay starts here (PLAN.md §4.1).
     let journal = vol.query_usn_journal().ok();
-    let scan = mft::scan(&vol, threads).map_err(|e| format!("{letter}: scan failed: {e}"))?;
+    let scan = mft::scan_until(&vol, threads, keep_going).map_err(|e| format!("{letter}: scan failed: {e}"))?;
     let (journal_id, next_usn) = journal_position(journal.map(|j| (j.usn_journal_id, j.next_usn)));
     Ok(Some(VolumeScan { letter, serial: vol.ntfs.volume_serial_number as u64, journal_id, next_usn, scan }))
 }
@@ -178,16 +183,20 @@ fn journal_position(journal: Option<(u64, i64)>) -> (u64, i64) {
 
 /// Scans any drive: through the MFT when it is NTFS, else by walking its
 /// folders (crate::walk). An NTFS drive whose MFT cannot be read is walked too.
-pub fn scan_any(drive: &crate::walk::Drive, threads: usize) -> Result<VolumeScan, String> {
+/// Stopped as soon as `keep_going` says no (the drive was left out).
+pub fn scan_any(drive: &crate::walk::Drive, threads: usize, keep_going: &(dyn Fn() -> bool + Sync)) -> Result<VolumeScan, String> {
     if drive.is_ntfs() {
-        match scan_volume(drive.letter, threads) {
+        match scan_volume_until(drive.letter, threads, keep_going) {
             Ok(Some(scan)) => return Ok(scan),
             Ok(None) => {}
             Err(e) if e.starts_with("access denied") => return Err(e),
             Err(_) => {} // e.g. a BitLocker or damaged volume: walk it instead
         }
     }
-    crate::walk::walk(drive).map_err(|e| format!("{}: cannot read the drive: {e}", drive.letter))
+    if !keep_going() {
+        return Err(format!("{}: stopped", drive.letter));
+    }
+    crate::walk::walk(drive, keep_going).map_err(|e| format!("{}: cannot read the drive: {e}", drive.letter))
 }
 
 pub fn open_volumes(index: &NameIndex) -> Result<Vec<Volume>, String> {

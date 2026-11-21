@@ -1153,6 +1153,12 @@ impl Worker {
                         self.retry.remove(&l);
                         fresh.push(s);
                     }
+                    // left out while it was read: the next drive check takes it out
+                    Err(_) if !self.shared.drives.wanted(d) => {
+                        self.retry.remove(&l);
+                        self.log(format!("{l}: left out while it was read"));
+                        let _ = self.tx.send(Msg::CheckDrives);
+                    }
                     Err(e) => self.failed(l, &e),
                 },
                 None => gone.push(l),
@@ -1428,7 +1434,8 @@ impl Worker {
     /// Scans one drive (MFT or walk) and remembers walks for `walk_due`.
     fn scan(&mut self, d: &Drive) -> Result<VolumeScan, String> {
         let t = Instant::now();
-        let s = sync::scan_any(d, self.cfg.threads)?;
+        let shared = self.shared.clone();
+        let s = sync::scan_any(d, self.cfg.threads, &|| shared.drives.wanted(d))?;
         if s.journal_id == WALKED {
             self.walks.insert(d.letter, (Instant::now(), t.elapsed(), walk::fingerprint(&s)));
         } else {

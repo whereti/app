@@ -106,6 +106,13 @@ struct ChunkResult {
 }
 
 pub fn scan(vol: &Volume, threads: usize) -> io::Result<MftScan> {
+    scan_until(vol, threads, &|| true)
+}
+
+/// `scan`, stopped (`ErrorKind::Interrupted`) as soon as `keep_going` says
+/// no: a large USB disk's MFT takes minutes to read, and the user may leave
+/// the drive out meanwhile.
+pub fn scan_until(vol: &Volume, threads: usize, keep_going: &(dyn Fn() -> bool + Sync)) -> io::Result<MftScan> {
     let rs = vol.ntfs.bytes_per_file_record_segment as usize;
     let cs = vol.ntfs.bytes_per_cluster as u64;
     let ss = vol.ntfs.bytes_per_sector as usize;
@@ -161,7 +168,7 @@ pub fn scan(vol: &Volume, threads: usize) -> io::Result<MftScan> {
         drop(rx);
 
         let started = Instant::now();
-        let read = read_mft(vol, &data.runs, mft_size, chunk_bytes, &tx);
+        let read = read_mft(vol, &data.runs, mft_size, chunk_bytes, &tx, keep_going);
         drop(tx);
         stats.read_time = started.elapsed();
 
@@ -296,6 +303,7 @@ fn read_mft(
     mft_size: u64,
     chunk_bytes: usize,
     tx: &crossbeam_channel::Sender<Chunk>,
+    keep_going: &(dyn Fn() -> bool + Sync),
 ) -> io::Result<u64> {
     let rs = vol.ntfs.bytes_per_file_record_segment as u64;
     let cs = vol.ntfs.bytes_per_cluster as u64;
@@ -338,6 +346,9 @@ fn read_mft(
                 let base = lcn as u64 * cs;
                 let mut pos = 0u64;
                 while pos < take {
+                    if !keep_going() {
+                        return Err(io::Error::new(io::ErrorKind::Interrupted, "stopped"));
+                    }
                     let n = (chunk_bytes as u64).min(take - pos) as usize;
                     let read_len = round_up(n, ss);
                     let buf = &mut scratch.as_mut_slice()[..read_len];
