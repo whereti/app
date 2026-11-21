@@ -68,6 +68,8 @@ enum Msg {
     SetWorkFolders(bool),
     SetMeaning(bool),
     FileInfo(String),
+    /// Search a drive (`true`) or leave it out, by its serial number.
+    SetDrive(u32, bool),
 }
 
 pub struct Searcher {
@@ -134,6 +136,12 @@ impl Searcher {
         let _ = self.tx.send(Msg::SetWorkFolders(on));
     }
 
+    /// Search a drive or leave it out (Settings, or the question about a
+    /// new drive).
+    pub fn set_drive(&self, serial: u32, search: bool) {
+        let _ = self.tx.send(Msg::SetDrive(serial, search));
+    }
+
 
     pub fn updates(&self) -> impl Iterator<Item = Update> + '_ {
         std::iter::from_fn(|| self.rx.try_recv().ok())
@@ -152,6 +160,8 @@ struct Pending {
     work_folders: Option<bool>,
     meaning: Option<bool>,
     file_info: Option<String>,
+    /// Drives to search or leave out, the latest choice for each.
+    drives: Vec<(u32, bool)>,
 }
 
 /// The user's display languages, read once: the service reads the text in
@@ -166,6 +176,7 @@ const BIT_TAGS: u8 = 2;
 const BIT_WORK: u8 = 4;
 const BIT_MEANING: u8 = 8;
 const BIT_CONTENT: u8 = 16;
+const BIT_DRIVES: u8 = 32;
 
 /// Which change of settings a message is (for "answered already").
 fn setting_bit(m: &Msg) -> u8 {
@@ -175,6 +186,7 @@ fn setting_bit(m: &Msg) -> u8 {
         Msg::SetPhotoTags(_) => BIT_TAGS,
         Msg::SetWorkFolders(_) => BIT_WORK,
         Msg::SetMeaning(_) => BIT_MEANING,
+        Msg::SetDrive(..) => BIT_DRIVES,
         _ => 0,
     }
 }
@@ -239,6 +251,11 @@ fn worker(jobs: Receiver<Msg>, out: Sender<Update>, wake: impl Fn()) {
                 p.status = true;
             }
             Msg::FileInfo(path) => p.file_info = Some(path),
+            Msg::SetDrive(serial, search) => {
+                p.drives.retain(|(s, _)| *s != serial);
+                p.drives.push((serial, search));
+                p.status = true;
+            }
         };
         take(first);
         while let Some(m) = carried.pop_front() {
@@ -262,6 +279,7 @@ fn worker(jobs: Receiver<Msg>, out: Sender<Update>, wake: impl Fn()) {
         ]
         .into_iter()
         .flatten()
+        .chain(p.drives.iter().map(|&(serial, search)| Msg::SetDrive(serial, search)))
         .collect();
         // settings the service answered in this batch: never sent twice
         // (a second SetExclusions would rebuild the index again)
@@ -280,6 +298,7 @@ fn worker(jobs: Receiver<Msg>, out: Sender<Update>, wake: impl Fn()) {
                         Msg::SetPhotoTags(on) => Msg::SetPhotoTags(*on),
                         Msg::SetWorkFolders(on) => Msg::SetWorkFolders(*on),
                         Msg::SetMeaning(on) => Msg::SetMeaning(*on),
+                        Msg::SetDrive(serial, search) => Msg::SetDrive(*serial, *search),
                         _ => continue,
                     };
                     carried.push_front(again);
@@ -344,6 +363,14 @@ fn worker(jobs: Receiver<Msg>, out: Sender<Update>, wake: impl Fn()) {
                 if let Response::Error(e) = r {
                     let _ = out.send(Update::Done(e));
                 }
+            }
+            for &(serial, search) in &p.drives {
+                if let Response::Error(e) = call(c, &Request::SetDrive { serial, search })? {
+                    let _ = out.send(Update::Done(e));
+                }
+            }
+            if !p.drives.is_empty() {
+                done(BIT_DRIVES);
             }
             if let Some(paths) = p.exclusions {
                 let r = call(c, &Request::SetExclusions { paths })?;

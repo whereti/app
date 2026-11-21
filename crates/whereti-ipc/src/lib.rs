@@ -28,7 +28,7 @@ use windows_sys::Win32::System::Pipes::{
 };
 
 pub const PIPE_NAME: &str = r"\\.\pipe\whereti";
-pub const PROTOCOL_VERSION: u32 = 13;
+pub const PROTOCOL_VERSION: u32 = 14;
 const MAX_MESSAGE: usize = 64 << 20;
 /// What the service reads from a client in one request: requests are small
 /// (500 exclusion paths fit easily), so no client makes it hold 64 MB.
@@ -110,6 +110,9 @@ pub enum Request {
     /// it is still working), one step of about `budget_ms` at a time; call
     /// again with `skip = next` until `done`.
     ScanUnindexed(ScanRequest),
+    /// Search a drive or leave it out (`serial` from `StatusReply::drives`).
+    /// Left out, it leaves the index and its documents are not read.
+    SetDrive { serial: u32, search: bool },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -246,6 +249,33 @@ pub struct VolumeStatus {
     pub next_usn: i64,
 }
 
+/// What whereti does with a drive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum DriveChoice {
+    #[default]
+    Search,
+    LeaveOut,
+    /// Connected for the first time after whereti was set up: not read
+    /// until the user says.
+    Ask,
+}
+
+/// A drive whereti has seen.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DriveEntry {
+    /// Its volume serial number: the same drive under another letter.
+    pub serial: u32,
+    /// Where it was last seen.
+    pub letter: char,
+    pub label: String,
+    /// In bytes; 0 when not known.
+    pub size: u64,
+    pub connected: bool,
+    /// The drive Windows runs from: always searched.
+    pub system: bool,
+    pub choice: DriveChoice,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct StatusReply {
     /// "loading", "indexing", "catching up", "ready", "rescanning C:", …
@@ -262,6 +292,8 @@ pub struct StatusReply {
     /// Where the user works lately, hottest first (a few folders); `None`
     /// when learning it is off.
     pub work_folders: Option<Vec<String>>,
+    /// The drives connected now, and the ones left out while away.
+    pub drives: Vec<DriveEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

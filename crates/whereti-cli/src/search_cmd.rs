@@ -282,6 +282,15 @@ pub fn status(args: StatusArgs) -> Result<(), String> {
         Some(_) => outln!("works in       (nothing learnt yet)"),
         None => outln!("works in       off"),
     }
+    for d in &s.drives {
+        let choice = match d.choice {
+            whereti_ipc::DriveChoice::Search => "searched",
+            whereti_ipc::DriveChoice::LeaveOut => "left out",
+            whereti_ipc::DriveChoice::Ask => "new: waits for an answer in the search window",
+        };
+        let away = if d.connected { "" } else { " (not connected)" };
+        outln!("drive          {}: {} · {}{away} · {choice}", d.letter, if d.label.is_empty() { "-" } else { d.label.as_str() }, bytes(d.size));
+    }
     if args.log {
         outln!();
         for line in &s.recent_log {

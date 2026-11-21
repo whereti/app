@@ -6,6 +6,7 @@
 
 pub mod activity;
 pub mod content;
+pub mod drives;
 pub mod dupes;
 pub mod engine;
 pub mod log;

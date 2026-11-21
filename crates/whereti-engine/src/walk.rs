@@ -35,6 +35,13 @@ pub struct Drive {
     pub serial: u64,
     /// A USB stick or a memory card (not an external hard disk: those count as fixed).
     pub removable: bool,
+    /// Its name in Explorer ("Backup"); may be empty.
+    pub label: String,
+    /// In bytes; 0 when not known.
+    pub size: u64,
+    /// Made by a program, not a partition of a disk: Google Drive's drive,
+    /// WinFsp and Dokan drives (`\Device\Volume{…}`).
+    pub by_program: bool,
 }
 
 impl Drive {
@@ -50,7 +57,9 @@ fn wide(s: &str) -> Vec<u16> {
 /// Fixed and removable drives that are ready (a card reader without a card
 /// is left out). Network drives and CD/DVD drives are not indexed.
 pub fn drives() -> Vec<Drive> {
-    use windows_sys::Win32::Storage::FileSystem::{GetDriveTypeW, GetLogicalDrives, GetVolumeInformationW};
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetDiskFreeSpaceExW, GetDriveTypeW, GetLogicalDrives, GetVolumeInformationW, QueryDosDeviceW,
+    };
     // SAFETY: no arguments.
     let mask = unsafe { GetLogicalDrives() };
     let mut out = Vec::new();
@@ -67,12 +76,13 @@ pub fn drives() -> Vec<Drive> {
         }
         let mut serial = 0u32;
         let mut fs = [0u16; 64];
+        let mut label = [0u16; 261];
         // SAFETY: buffers and lengths match; unused outputs are null.
         let ok = unsafe {
             GetVolumeInformationW(
                 root.as_ptr(),
-                std::ptr::null_mut(),
-                0,
+                label.as_mut_ptr(),
+                label.len() as u32,
                 &mut serial,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
@@ -83,15 +93,30 @@ pub fn drives() -> Vec<Drive> {
         if ok == 0 {
             continue; // no media, or not ready
         }
-        let end = fs.iter().position(|&c| c == 0).unwrap_or(fs.len());
+        let text = |b: &[u16]| String::from_utf16_lossy(&b[..b.iter().position(|&c| c == 0).unwrap_or(b.len())]);
+        let mut size = 0u64;
+        // SAFETY: a NUL-terminated root; unused outputs are null.
+        unsafe { GetDiskFreeSpaceExW(root.as_ptr(), std::ptr::null_mut(), &mut size, std::ptr::null_mut()) };
+        let mut target = [0u16; 1024];
+        let device = wide(&format!("{letter}:"));
+        // SAFETY: a NUL-terminated name and a buffer of its stated length.
+        let found = unsafe { QueryDosDeviceW(device.as_ptr(), target.as_mut_ptr(), target.len() as u32) } != 0;
         out.push(Drive {
             letter,
-            fs: String::from_utf16_lossy(&fs[..end]),
+            fs: text(&fs),
             serial: serial as u64,
             removable: kind == DRIVE_REMOVABLE,
+            label: text(&label).trim().to_string(),
+            size,
+            by_program: found && made_by_a_program(&text(&target)),
         });
     }
     out
+}
+
+/// A volume made by a program, not a partition (`\Device\HarddiskVolume3`).
+fn made_by_a_program(target: &str) -> bool {
+    target.starts_with(r"\Device\Volume{")
 }
 
 /// Walks every folder of a drive. Junctions and other reparse points are

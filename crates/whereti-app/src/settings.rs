@@ -674,6 +674,51 @@ fn search(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
     });
     ui.add_space(14.0);
 
+    // ---- drives: a backup disk connected now and then can be left out
+    let drives: Vec<whereti_ipc::DriveEntry> = app.status.as_ref().map(|s| s.drives.clone()).unwrap_or_default();
+    if !drives.is_empty() {
+        card(ui, p, |ui| {
+            ui.add_space(12.0);
+            ui.label(egui::RichText::new(tr("Drives")).size(14.5).family(semibold()).color(p.text));
+            ui.add_space(2.0);
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(tr("A drive left out is not searched, and the text of its documents is not read. whereti knows it by itself, not by its letter, so it stays out when it comes back as another letter."))
+                        .size(12.5)
+                        .color(p.text2),
+                )
+                .wrap(),
+            );
+            ui.add_space(4.0);
+            for d in &drives {
+                use whereti_ipc::DriveChoice;
+                let title = crate::app::drive_name(d);
+                let text = match (d.system, d.connected, d.choice) {
+                    (true, ..) => tr("Windows runs from it: always searched."),
+                    (_, false, _) => tr("Left out. Not connected now."),
+                    (_, _, DriveChoice::Ask) => tr("New: not searched until you choose."),
+                    (_, _, DriveChoice::LeaveOut) => tr("Left out."),
+                    (_, _, DriveChoice::Search) => tr("Searched."),
+                };
+                let mut answer = None;
+                row(ui, p, &title, text, |ui| {
+                    if d.system {
+                        return;
+                    }
+                    let mut on = d.choice == DriveChoice::Search;
+                    if toggle(ui, p, &mut on, &title).clicked() {
+                        answer = Some(on);
+                    }
+                });
+                if let Some(search) = answer {
+                    app.set_drive(d.serial, search);
+                }
+            }
+            ui.add_space(8.0);
+        });
+        ui.add_space(14.0);
+    }
+
     // ---- folders to skip
     card(ui, p, |ui| {
         ui.add_space(12.0);
@@ -704,7 +749,7 @@ fn search(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
             if let Some(path) = app.hwnd.and_then(crate::win::pick_folder) {
                 // a drive's root (D:\): the service would refuse the whole list
                 if path.trim_end_matches('\\').len() <= 2 {
-                    app.flash(tr("A whole drive cannot be left out. Choose a folder on it."));
+                    app.flash(tr("To leave out a whole drive, turn it off under Drives."));
                 } else if !app.settings.exclusions.iter().any(|x| x.eq_ignore_ascii_case(&path)) {
                     app.settings.exclusions.push(path);
                     changed = true;

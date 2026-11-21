@@ -109,6 +109,8 @@ pub enum Msg {
     Release(char, Option<mpsc::Sender<()>>),
     /// The removal was cancelled: open the drive again.
     Reacquire(char),
+    /// A drive was put back or left out (Settings): look at the drives now.
+    CheckDrives,
     Stop,
 }
 
@@ -129,6 +131,8 @@ pub(crate) struct Shared {
     pub(crate) content: std::sync::OnceLock<Arc<Content>>,
     /// Where the user works lately (PLAN.md §56).
     pub(crate) activity: crate::activity::Activity,
+    /// The drives seen, and which are searched.
+    pub(crate) drives: crate::drives::Drives,
 }
 
 impl Shared {
@@ -158,6 +162,7 @@ impl Engine {
             content: std::sync::OnceLock::new(),
             // beside the index (ProgramData\whereti for the service)
             activity: crate::activity::Activity::open(cfg.index_path.parent().unwrap_or(std::path::Path::new("."))),
+            drives: crate::drives::Drives::open(cfg.index_path.with_extension("drives"), system_drive()),
         });
         let content_dir = if cfg.index_path == system::default_index_path() {
             // the content index then fails to open, and says so in its state
@@ -221,6 +226,7 @@ impl Engine {
                 | Request::SetPhotoTags { .. }
                 | Request::SetMeaning { .. }
                 | Request::SetWorkFolders { .. }
+                | Request::SetDrive { .. }
         );
         if for_everyone && !caller.is_admin() {
             return Response::Error("only an administrator of this PC can change this setting".into());
@@ -517,6 +523,14 @@ impl Engine {
                 }
                 Err(e) => Response::Error(e),
             },
+            Request::SetDrive { serial, search } => match self.shared.drives.set(serial, search) {
+                Ok(()) => {
+                    self.log(format!("drive {serial:08x} {} by a client", if search { "searched" } else { "left out" }));
+                    let _ = self.tx.send(Msg::CheckDrives);
+                    Response::Ok
+                }
+                Err(e) => Response::Error(e),
+            },
             Request::SetExclusions { paths } => match validate_exclusions(&paths) {
                 Ok(paths) => {
                     self.log(format!("exclusions changed by a client: {}", paths.join(" · ")));
@@ -558,6 +572,7 @@ impl Engine {
                         let ok = caller.can_list(&top);
                         top.into_iter().zip(ok).filter_map(|(f, ok)| ok.then_some(f)).collect()
                     }),
+                    drives: self.shared.drives.entries(),
                 })
             }
         }
@@ -658,6 +673,12 @@ impl Worker {
         self.shared.log.log(msg);
     }
 
+    /// The drives to index now: connected, and not left out (Settings) or
+    /// waiting for the user's answer.
+    fn present(&self) -> Vec<Drive> {
+        self.shared.drives.usable(walk::drives())
+    }
+
     fn run(mut self, rx: mpsc::Receiver<Msg>) {
         self.removal = Removal::start(self.tx.clone());
         if self.removal.is_none() {
@@ -699,6 +720,7 @@ impl Worker {
                 Ok(Msg::Reconfigure(paths)) => self.reconfigure(paths),
                 Ok(Msg::Release(letter, reply)) => self.release(letter, reply),
                 Ok(Msg::Reacquire(letter)) => self.reacquire(letter),
+                Ok(Msg::CheckDrives) => self.check_drives(),
                 Ok(Msg::Journal(first)) => {
                     let mut msgs = vec![first];
                     let deadline = Instant::now() + BATCH_WINDOW;
@@ -717,6 +739,10 @@ impl Worker {
                             Ok(Msg::Release(letter, reply)) => self.release(letter, reply),
                             Ok(Msg::Reacquire(letter)) => {
                                 let _ = self.tx.send(Msg::Reacquire(letter));
+                                break;
+                            }
+                            Ok(Msg::CheckDrives) => {
+                                let _ = self.tx.send(Msg::CheckDrives);
                                 break;
                             }
                             Err(_) => break,
@@ -789,14 +815,16 @@ impl Worker {
         let mut with_groups = index.exclusions().to_vec();
         with_groups.extend(add_groups.iter().cloned());
         // Drives that are gone (an external disk unplugged while the PC was
-        // off) leave the index; drives that are new get scanned below.
-        let present = walk::drives();
+        // off, or left out in Settings) leave the index; drives that are new
+        // get scanned below.
+        self.shared.drives.adopt(index.volumes().iter().map(|v| (v.letter(), v.serial)));
+        let present = self.present();
         let indexed: Vec<char> = index.volumes().iter().map(|v| v.letter()).collect();
         let gone: Vec<char> = indexed.iter().copied().filter(|l| !present.iter().any(|d| d.letter == *l)).collect();
         let index = if gone.is_empty() {
             index
         } else {
-            self.log(format!("{} no longer connected: left out of the index", letters_text(&gone)));
+            self.log(format!("{} not connected or left out: removed from the index", letters_text(&gone)));
             self.dirty = true;
             self.pool.install(|| index.rebuild(Vec::new(), &gone))
         };
@@ -931,7 +959,7 @@ impl Worker {
             if let Some(err) = mine.iter().find_map(|m| m.error.as_ref()) {
                 // stopped, not just forgotten: a newer reader must not run on unseen
                 self.stop_reader(letter);
-                if walk::drives().iter().any(|d| d.letter == letter) {
+                if self.present().iter().any(|d| d.letter == letter) {
                     self.log(format!("{err} → full rescan"));
                 } else {
                     self.log(format!("{letter}: disconnected"));
@@ -1113,7 +1141,7 @@ impl Worker {
             // its reader follows the old journal position (or another disk)
             self.stop_reader(l);
         }
-        let present = walk::drives();
+        let present = self.present();
         let mut fresh = Vec::new();
         let mut gone = Vec::new();
         for &l in letters {
@@ -1197,7 +1225,7 @@ impl Worker {
             self.stop_reader(l);
         }
         let mut scans = Vec::new();
-        let drives: Vec<Drive> = walk::drives()
+        let drives: Vec<Drive> = self.present()
             .into_iter()
             .filter(|d| letters.contains(&d.letter) && !self.released.contains_key(&d.letter))
             .collect();
@@ -1412,7 +1440,7 @@ impl Worker {
 
     /// Adds drives that appeared and drops drives that are gone.
     fn check_drives(&mut self) {
-        let present = walk::drives();
+        let present = self.present();
         let indexed: Vec<(char, u64)> = {
             let guard = self.shared.index.read();
             guard.as_ref().expect("index").volumes().iter().map(|v| (v.letter(), v.serial)).collect()
@@ -1531,7 +1559,7 @@ impl Worker {
             .map(|(l, _)| *l)
             .collect();
         for letter in due {
-            let Some(d) = walk::drives().into_iter().find(|d| d.letter == letter) else { continue };
+            let Some(d) = self.present().into_iter().find(|d| d.letter == letter) else { continue };
             if self.released.contains_key(&letter) || self.retry.contains_key(&letter) {
                 continue;
             }
@@ -1583,7 +1611,7 @@ impl Worker {
     fn build_fresh(&mut self) -> Result<NameIndex, String> {
         let t = Instant::now();
         let mut scans = Vec::new();
-        let drives = walk::drives();
+        let drives = self.present();
         for (k, d) in drives.iter().enumerate() {
             let letter = d.letter;
             // "indexing C: 1/2": the app shows it as progress on first start

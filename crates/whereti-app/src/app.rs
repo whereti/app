@@ -1575,6 +1575,7 @@ impl WheretiApp {
             return;
         }
         self.update_banner(ui, ctx, p);
+        self.drive_banner(ui, p);
         self.scan_strip(ui, p);
         if self.rows.is_empty() && self.content_pending {
             ui.add_space(30.0);
@@ -2287,6 +2288,90 @@ impl WheretiApp {
         ui.add_space(4.0);
     }
 
+    /// A drive connected for the first time since whereti was set up is not
+    /// read until the user says: asked here, once (Settings can change it).
+    fn drive_banner(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        let Some(d) = self
+            .status
+            .as_ref()
+            .and_then(|s| s.drives.iter().find(|d| d.connected && d.choice == whereti_ipc::DriveChoice::Ask))
+            .cloned()
+        else {
+            return;
+        };
+        let name = drive_name(&d);
+        ui.add_space(12.0);
+        let mut answer = None;
+        Frame::new()
+            .fill(p.accent_soft)
+            .stroke(Stroke::new(1.0, p.accent.gamma_multiply(0.45)))
+            .corner_radius(14.0)
+            .inner_margin(Margin { left: 16, right: 14, top: 14, bottom: 14 })
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    let (badge, _) = ui.allocate_exact_size(Vec2::splat(40.0), Sense::hover());
+                    ui.painter().circle_filled(badge.center(), 20.0, p.accent);
+                    crate::icons::paint(ui.painter(), badge.shrink(10.0), Icon::Plug, Color32::WHITE);
+                    ui.add_space(12.0);
+                    let buttons_w = 260.0;
+                    let text_w = (ui.available_width() - buttons_w).max(160.0);
+                    ui.vertical(|ui| {
+                        ui.set_width(text_w);
+                        ui.label(egui::RichText::new(trf!("New drive: {name}", name)).size(15.5).family(semibold()).color(p.text));
+                        ui.add_space(2.0);
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(tr(
+                                    "Search its files too? A backup drive you connect only now and then can be left out. You can change it in Settings, Search.",
+                                ))
+                                .size(12.5)
+                                .color(p.text2),
+                            )
+                            .wrap(),
+                        );
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                        let primary = ui
+                            .add(
+                                egui::Button::new(egui::RichText::new(tr("Search it")).size(14.0).family(semibold()).color(p.on_accent))
+                                    .fill(p.accent)
+                                    .corner_radius(10.0)
+                                    .min_size(Vec2::new(0.0, 36.0)),
+                            )
+                            .on_hover_cursor(egui::CursorIcon::PointingHand);
+                        if primary.clicked() {
+                            answer = Some(true);
+                        }
+                        let quiet = ui
+                            .add(
+                                egui::Button::new(egui::RichText::new(tr("Leave it out")).size(13.5).color(p.text2))
+                                    .fill(Color32::TRANSPARENT)
+                                    .stroke(Stroke::NONE)
+                                    .min_size(Vec2::new(0.0, 36.0)),
+                            )
+                            .on_hover_cursor(egui::CursorIcon::PointingHand);
+                        if quiet.clicked() {
+                            answer = Some(false);
+                        }
+                    });
+                });
+            });
+        ui.add_space(4.0);
+        if let Some(search) = answer {
+            self.set_drive(d.serial, search);
+        }
+    }
+
+    /// Search a drive or leave it out; shown at once, before the service's
+    /// next status says so.
+    pub(crate) fn set_drive(&mut self, serial: u32, search: bool) {
+        self.searcher.set_drive(serial, search);
+        if let Some(d) = self.status.as_mut().and_then(|s| s.drives.iter_mut().find(|d| d.serial == serial)) {
+            d.choice = if search { whereti_ipc::DriveChoice::Search } else { whereti_ipc::DriveChoice::LeaveOut };
+        }
+    }
+
     /// "ON THE NETWORK · 12", or the drives only this account sees,
     /// "GOOGLE DRIVE (G:) · 12", or both.
     fn network_section_label(&self, start: usize) -> String {
@@ -2553,6 +2638,16 @@ impl eframe::App for WheretiApp {
         }
         // the preview or a snippet may have just read such text
         self.load_cjk_fonts(&ctx);
+    }
+}
+
+/// "Backup (E:) · 14 TB", or "E: · 14 TB" for a drive without a name.
+pub(crate) fn drive_name(d: &whereti_ipc::DriveEntry) -> String {
+    let name = if d.label.is_empty() { format!("{}:", d.letter) } else { format!("{} ({}:)", d.label, d.letter) };
+    if d.size > 0 {
+        format!("{name} · {}", crate::shell::size(d.size))
+    } else {
+        name
     }
 }
 
