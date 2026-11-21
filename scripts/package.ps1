@@ -9,9 +9,7 @@
 #                                     certificate (scripts\sign-windows.ps1)
 #   .\scripts\package.ps1 -Release -Beta
 #                                     the same, for testers (0.9.x): signed
-#                                     and updatable, but the supporter key and
-#                                     checkout links may still be the
-#                                     development ones; no winget manifest
+#                                     and updatable; no winget manifest
 #
 # The installer carries the four programs inside it (packed when it is
 # compiled). So in production the order matters: the programs are signed
@@ -51,19 +49,7 @@ if ($Release) {
     $tag = & { $ErrorActionPreference = "Continue"; git -C $repoRoot describe --exact-match --tags HEAD 2>$null }
     if (-not $tag) { throw "HEAD is not tagged. Tag the release (e.g. git tag v$version) and build from the tag." }
     if ($tag -ne "v$version") { throw "The tag $tag does not match the version $version in Cargo.toml." }
-    # The supporter keys: a release must carry the production public key and
-    # real checkout links, never the development ones (license.rs, links.rs).
-    if ($Beta) {
-        Write-Host "Beta: the supporter key and checkout links are not checked (not for 1.0)." -ForegroundColor Yellow
-    } else {
-    $license = Get-Content (Join-Path $repoRoot "crates\whereti-app\src\license.rs") -Raw
-    $public = [regex]::Match($license, 'pub const PUBLIC_KEY_HEX: &str = "([0-9a-f]{64})"').Groups[1].Value
-    $dev = [regex]::Match($license, 'pub const DEV_PUBLIC_KEY_HEX: &str = "([0-9a-f]{64})"').Groups[1].Value
-    if (-not $public -or $public -eq $dev) { throw "license.rs still has the development public key. Run whereti.licenses/scripts/new-key.mjs and paste the production key." }
-    $links = Get-Content (Join-Path $repoRoot "crates\whereti-app\src\links.rs") -Raw
-    # Business goes to the website on purpose (the PC count is chosen there)
-    if ($links -notmatch 'BUY_PERSONAL: &str = "https://whereti\.lemonsqueezy\.com/checkout/buy/') { throw "links.rs has no Lemon Squeezy checkout for Personal. Paste the link." }
-    }    # Found now, not after ten minutes of compiling.
+    # Found now, not after ten minutes of compiling.
     $thumbprint = if ($env:WHERETI_SIGN_THUMBPRINT) { $env:WHERETI_SIGN_THUMBPRINT } else { "5DF397C236D87DA3DB0137E9CBFDF29319241E4A" }
     if (-not (Get-ChildItem Cert:\CurrentUser\My | Where-Object { $_.Thumbprint -eq $thumbprint })) {
         throw "The Authenticode certificate $thumbprint is not known to this machine. Plug the token in once with proCertum CardManager closed so Windows registers it."

@@ -7,17 +7,6 @@ use crate::Entry;
 
 pub const ENTRIES: &[Entry] = &[
     Entry {
-        en: "Support whereti",
-        note: "Settings > About, link to the page about the coming supporter license. Short.",
-        de: "whereti unterstützen",
-        es: "Apoyar whereti",
-        fr: "Soutenir whereti",
-        it: "Sostieni whereti",
-        pl: "Wesprzyj whereti",
-        pt_br: "Apoiar o whereti",
-        ro: "Susține whereti",
-    },
-    Entry {
         en: "The whereti service is not running",
         note: "Title of an error message card in the search window, shown when the background search service cannot be reached.",
         de: "Der whereti-Dienst wird nicht ausgeführt",

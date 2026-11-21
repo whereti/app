@@ -23,7 +23,6 @@ pub enum Icon {
     Lock,
     Plug,
     Sparkle,
-    Heart,
     /// A question mark in a circle (the search commands).
     Help,
 }
@@ -57,17 +56,6 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
     };
     use std::f32::consts::{FRAC_PI_2, PI, TAU};
     match icon {
-        Icon::Heart => {
-            // filled: two round lobes and a point, readable even at 14 px
-            let r = 4.6 * k;
-            painter.circle_filled(p(8.0, 9.2), r, color);
-            painter.circle_filled(p(16.0, 9.2), r, color);
-            painter.add(eframe::egui::Shape::convex_polygon(
-                vec![p(3.55, 10.6), p(20.45, 10.6), p(12.0, 20.0)],
-                color,
-                Stroke::NONE,
-            ));
-        }
         Icon::Help => {
             painter.circle_stroke(p(12.0, 12.0), 9.0 * k, s);
             line(&[(9.4, 9.6), (9.9, 8.2), (11.0, 7.4), (12.4, 7.3), (13.8, 7.9), (14.6, 9.1), (14.4, 10.5), (13.3, 11.5), (12.3, 12.3), (12.0, 13.6)]);

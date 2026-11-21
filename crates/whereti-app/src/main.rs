@@ -11,7 +11,6 @@ mod history;
 mod i18n;
 mod icons;
 mod launch;
-mod license;
 mod links;
 mod network;
 mod preview;
@@ -48,7 +47,6 @@ fn main() -> eframe::Result<()> {
     };
     // if Windows reopens whereti after a restart, it must come back hidden too
     shell::register_restart_hidden();
-    tray::set_supporter(license::load().is_some());
     let icon = egui::IconData { rgba: tray::logo_rgba_64(), width: 64, height: 64 };
     let options = eframe::NativeOptions {
         renderer: eframe::Renderer::Glow,

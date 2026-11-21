@@ -55,10 +55,6 @@ pub struct SettingsState {
     pub section: Section,
     /// Waiting for the keys of a new shortcut.
     pub recording: bool,
-    /// The supporter license, if one is activated (license.rs).
-    pub license: Option<crate::license::License>,
-    license_input: String,
-    license_error: Option<String>,
     logo: Option<egui::TextureHandle>,
 }
 
@@ -119,9 +115,6 @@ impl SettingsState {
             exclusions: Vec::new(),
             section: Section::General,
             recording: false,
-            license: crate::license::load(),
-            license_input: String::new(),
-            license_error: None,
             logo: None,
         };
         if let Some(text) = read_settings(&settings_file()) {
@@ -211,7 +204,6 @@ pub enum Section {
     General,
     Search,
     About,
-    Support,
 }
 
 /// The settings page: a menu on the left (like Windows Settings), the
@@ -243,7 +235,6 @@ pub fn show(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
         (Section::General, Icon::Settings, tr("General")),
         (Section::Search, Icon::Search, tr("Search")),
         (Section::About, Icon::Sparkle, tr("About")),
-        (Section::Support, Icon::Heart, tr("Support")),
     ] {
         if nav_item(&mut nav_ui, p, icon, label, app.settings.section == section).clicked() {
             app.settings.section = section;
@@ -259,7 +250,6 @@ pub fn show(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
             Section::General => general(app, ui, p, &ctx),
             Section::Search => search(app, ui, p),
             Section::About => about(app, ui, p),
-            Section::Support => support(app, ui, p),
         }
         ui.add_space(16.0);
     });
@@ -877,10 +867,6 @@ fn about(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
         });
         ui.add_space(14.0);
         line(ui, p);
-        let supporter_text = match &app.settings.license {
-            Some(l) => trf!("Thank you for your support, {name}.", name = l.name),
-            None => tr("Optional: one payment that pays for whereti's development. Nothing is locked without it.").to_string(),
-        };
         update_row(app, ui, p);
         line(ui, p);
         for (title, text) in [
@@ -891,10 +877,6 @@ fn about(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
             (tr("Open source"), tr("Free, under the MIT license.")),
             // GeoNames asks for this credit (CC BY 4.0)
             (tr("Places"), tr("Where your photos were taken is named with data from GeoNames (geonames.org, CC BY 4.0).")),
-            (
-                tr("Supporter license"),
-                supporter_text.as_str(),
-            ),
         ] {
             info_row(ui, p, title, text);
         }
@@ -908,7 +890,6 @@ fn about(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
                 (tr("Questions and help"), crate::links::HELP),
                 (tr("Privacy"), crate::links::PRIVACY),
                 (tr("Source code"), crate::links::SOURCE),
-                (tr("Support whereti"), crate::links::SUPPORTER),
             ] {
                 let link = ui
                     .add(egui::Label::new(egui::RichText::new(label).size(13.0).color(p.accent)).sense(Sense::click()))
@@ -924,180 +905,6 @@ fn about(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
         });
         ui.add_space(6.0);
     });
-}
-
-/// Support: the two licenses to buy, and the place to paste a key; or,
-/// once activated, a thank you.
-fn support(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
-    use crate::license::Plan;
-    heading(
-        ui,
-        p,
-        tr("Support whereti"),
-        tr("whereti is free, all of it. A supporter license pays for its development, and whereti thanks you by name."),
-    );
-    if let Some(l) = app.settings.license.clone() {
-        card(ui, p, |ui| {
-            ui.add_space(16.0);
-            ui.horizontal(|ui| {
-                let (badge, _) = ui.allocate_exact_size(Vec2::splat(44.0), Sense::hover());
-                let gold = crate::app::supporter_gold(p);
-                ui.painter().circle_filled(badge.center(), 22.0, crate::theme::with_alpha(gold, 0.16));
-                crate::icons::paint(ui.painter(), badge.shrink(11.0), Icon::Heart, gold);
-                ui.add_space(12.0);
-                ui.vertical(|ui| {
-                    ui.label(egui::RichText::new(trf!("Thank you, {name}!", name = l.name)).size(18.0).family(semibold()).color(p.text));
-                    let what = match l.plan {
-                        Plan::Personal => tr("Personal license, on all your PCs, for life.").to_string(),
-                        Plan::Business => crate::trn!("Business license for {n} PC, for life.|Business license for {n} PCs, for life.", l.seats),
-                    };
-                    ui.label(egui::RichText::new(what).size(13.0).color(p.text2));
-                });
-            });
-            ui.add_space(14.0);
-            line(ui, p);
-            row(ui, p, tr("Your key"), tr("Keep it: it works again after reinstalling Windows."), |ui| {
-                if button(ui, p, tr("Remove"), false).clicked() {
-                    crate::license::remove();
-                    app.settings.license = None;
-                    let ctx = ui.ctx().clone();
-                    app.supporter_changed(&ctx, false);
-                }
-                if button(ui, p, tr("Copy"), false).clicked() {
-                    ui.ctx().copy_text(l.key.clone());
-                    app.flash(tr("Key copied"));
-                }
-            });
-        });
-        return;
-    }
-
-    // the two licenses, side by side
-    let gap = 14.0;
-    let w = ((ui.available_width() - gap) / 2.0).floor().max(200.0);
-    ui.horizontal_top(|ui| {
-        ui.spacing_mut().item_spacing.x = gap;
-        let plans = [
-            (
-                tr("Personal"),
-                "$19",
-                tr("one payment"),
-                [tr("Yours for life, with every update"), tr("On all your PCs"), tr("Your name in whereti")],
-                tr("Buy for $19"),
-                crate::links::BUY_PERSONAL,
-                true,
-            ),
-            (
-                tr("Business"),
-                "$39",
-                tr("per PC, one payment"),
-                [tr("For life, with every update"), tr("An invoice with your company's details"), tr("As many PCs as you need")],
-                tr("Buy for business"),
-                crate::links::BUY_BUSINESS,
-                false,
-            ),
-        ];
-        for (name, price, per, points, cta, url, primary) in plans {
-            ui.allocate_ui_with_layout(Vec2::new(w, 0.0), egui::Layout::top_down(Align::Min), |ui| {
-                ui.set_width(w);
-                card(ui, p, |ui| {
-                    ui.add_space(16.0);
-                    ui.label(egui::RichText::new(name).size(14.0).family(semibold()).color(p.accent));
-                    ui.add_space(4.0);
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new(price).size(30.0).family(egui::FontFamily::Name("display".into())).color(p.text));
-                        ui.label(egui::RichText::new(per).size(12.5).color(p.text3));
-                    });
-                    ui.add_space(8.0);
-                    for pt in points {
-                        ui.horizontal(|ui| {
-                            check_mark(ui, p.ok);
-                            ui.add(egui::Label::new(egui::RichText::new(pt).size(13.0).color(p.text2)).wrap());
-                        });
-                    }
-                    ui.add_space(12.0);
-                    if button(ui, p, cta, primary).clicked() {
-                        if let Err(e) = shell::open(url) {
-                            app.flash(e);
-                        }
-                    }
-                    ui.add_space(16.0);
-                });
-            });
-        }
-    });
-    ui.add_space(8.0);
-    ui.add(
-        egui::Label::new(
-            egui::RichText::new(tr(
-                "Payment is handled by Lemon Squeezy, which also sends the invoice. Your key arrives by e-mail a minute later.",
-            ))
-            .size(12.0)
-            .color(p.text3),
-        )
-        .wrap(),
-    );
-    ui.add_space(14.0);
-
-    // a key received by e-mail
-    card(ui, p, |ui| {
-        ui.add_space(14.0);
-        ui.label(egui::RichText::new(tr("Already have a key?")).size(14.0).family(semibold()).color(p.text));
-        ui.add_space(2.0);
-        ui.label(egui::RichText::new(tr("Paste it from the e-mail. No internet is needed to activate it.")).size(12.5).color(p.text2));
-        ui.add_space(10.0);
-        ui.horizontal(|ui| {
-            // the field takes everything up to the button, at the button's
-            // height, so both end flush with the card
-            let gap = ui.spacing().item_spacing.x;
-            let width = (ui.available_width() - button_width(ui, tr("Activate")) - gap).max(160.0);
-            let field = egui::TextEdit::singleline(&mut app.settings.license_input)
-                .hint_text("WHERETI-…")
-                .font(FontId::monospace(12.5))
-                .align(egui::Align2::LEFT_CENTER)
-                .min_size(Vec2::new(width, BUTTON_HEIGHT))
-                .desired_width(width);
-            ui.add(field);
-            if button(ui, p, tr("Activate"), true).clicked() {
-                match crate::license::parse(&app.settings.license_input) {
-                    Ok(l) => match crate::license::save(&l) {
-                        Ok(()) => {
-                            app.flash(trf!("Thank you, {name}!", name = l.name));
-                            app.settings.license = Some(l);
-                            app.settings.license_input.clear();
-                            app.settings.license_error = None;
-                            let ctx = ui.ctx().clone();
-                            app.supporter_changed(&ctx, true);
-                        }
-                        Err(e) => app.settings.license_error = Some(e.to_string()),
-                    },
-                    Err(crate::license::LicenseError::Malformed) => {
-                        app.settings.license_error =
-                            Some(tr("This does not look like a whereti key. Copy all of it, from WHERETI- to the end.").into())
-                    }
-                    Err(crate::license::LicenseError::BadSignature) => {
-                        app.settings.license_error = Some(tr("This key is not valid. Write to contact@softwarehive.ro and we will sort it out.").into())
-                    }
-                }
-            }
-        });
-        if let Some(e) = &app.settings.license_error {
-            ui.add_space(6.0);
-            ui.label(egui::RichText::new(e).size(12.5).color(p.error));
-        }
-        ui.add_space(14.0);
-    });
-}
-
-/// A small green tick, drawn (fonts do not all have one).
-fn check_mark(ui: &mut egui::Ui, color: Color32) {
-    let (r, _) = ui.allocate_exact_size(Vec2::new(16.0, 16.0), Sense::hover());
-    let pts = [
-        egui::pos2(r.left() + 3.0, r.center().y + 0.5),
-        egui::pos2(r.left() + 6.5, r.center().y + 4.0),
-        egui::pos2(r.right() - 2.5, r.center().y - 4.0),
-    ];
-    ui.painter().add(egui::Shape::line(pts.to_vec(), Stroke::new(1.8, color)));
 }
 
 /// The update state in About: up to date, a new version to install, the
