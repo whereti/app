@@ -207,6 +207,10 @@ impl Setup {
                         ops::set_autostart(autostart);
                         // the app's first start keeps this answer
                         ops::note_autostart_asked();
+                    } else if ops::autostart_on() {
+                        // the install closed it: back next to the clock now,
+                        // not only at the next sign-in
+                        ops::reopen_hidden();
                     }
                 })
             };

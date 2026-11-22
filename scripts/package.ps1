@@ -10,6 +10,11 @@
 #   .\scripts\package.ps1 -Release -Beta
 #                                     the same, for testers (0.9.x): signed
 #                                     and updatable; no winget manifest
+#   -Headline "Drives can be left out"
+#                                     the one line the app shows about the
+#                                     new version (in latest.json)
+#   -Important                        a fix that should not wait: the app's
+#                                     note about it cannot be put off
 #
 # The installer carries the four programs inside it (packed when it is
 # compiled). So in production the order matters: the programs are signed
@@ -19,7 +24,9 @@
 
 param(
     [switch]$Release,
-    [switch]$Beta
+    [switch]$Beta,
+    [string]$Headline = "",
+    [switch]$Important
 )
 
 $ErrorActionPreference = "Stop"
@@ -228,11 +235,15 @@ Write-Host "`n$setup  ($size MB)" -ForegroundColor Green
 Write-Host "SHA-256 $hash"
 
 if ($Release) {
-    # The manifest for releases.whereti.com (whereti.releases: npm run
-    # publish:manifest). Publish it only after the GitHub release exists.
+    # latest.json, published only after the GitHub release exists:
+    # - whereti.website/public/latest.json, which whereti 1.3 and later read
+    #   (the version, the headline and `important`; nothing else);
+    # - releases.whereti.com (whereti.releases: npm run publish:manifest),
+    #   for earlier versions, while they still ask there.
     $manifest = [ordered]@{
         version   = $version
-        notes     = "See the release notes for v$version."
+        notes     = $Headline
+        important = [bool]$Important
         pub_date  = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
         platforms = [ordered]@{
             "windows-x86_64" = [ordered]@{
@@ -244,7 +255,7 @@ if ($Release) {
     }
     $json = $manifest | ConvertTo-Json -Depth 5
     [IO.File]::WriteAllText((Join-Path $dist "latest.json"), $json, (New-Object Text.UTF8Encoding $false))
-    Write-Host "dist\latest.json written: publish it with whereti.releases after the GitHub release."
+    Write-Host "dist\latest.json written: after the GitHub release, copy it to whereti.website\public\ and publish it with whereti.releases."
     if (-not $Beta) {
         & "$PSScriptRoot\winget.ps1" -Version $version -Sha256 $hash
     }

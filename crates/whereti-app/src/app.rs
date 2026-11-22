@@ -1556,7 +1556,7 @@ impl WheretiApp {
             );
             return;
         }
-        self.update_banner(ui, ctx, p);
+        self.update_banner(ui, p);
         self.drive_banner(ui, p);
         self.scan_strip(ui, p);
         if self.rows.is_empty() && self.content_pending {
@@ -2168,32 +2168,21 @@ impl WheretiApp {
     }
 
     /// A new version, shown big above the results until it is installed or
-    /// put off for a few days.
-    fn update_banner(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, p: &Palette) {
-        use crate::update::Phase;
+    /// put off for a week. Its button opens whereti.com, where it is
+    /// downloaded: the app itself downloads and installs nothing.
+    fn update_banner(&mut self, ui: &mut egui::Ui, p: &Palette) {
         if !self.updater.banner(self.settings.updates) {
             return;
         }
-        let phase = self.updater.phase();
-        let (title, text): (String, String) = match &phase {
-            Phase::Offered(o) => (
-                trf!("whereti {version} is ready", version = o.version),
-                o.notes.lines().next().filter(|l| !l.trim().is_empty()).map(str::to_string).unwrap_or_else(|| {
-                    tr("New features and fixes. It takes a minute, and your settings stay as they are.").to_string()
-                }),
-            ),
-            Phase::Downloading { version, .. } => (
-                trf!("Downloading whereti {version}…", version),
-                tr("You can keep searching meanwhile.").to_string(),
-            ),
-            Phase::Installing => (
-                tr("Installing the update").to_string(),
-                tr("Windows asks for permission, then whereti opens again.").to_string(),
-            ),
-            Phase::Failed(e) => (tr("The update did not install").to_string(), e.clone()),
-            Phase::Idle => return,
+        let Some(offer) = self.updater.offer() else { return };
+        let title = trf!("whereti {version} is out", version = offer.version);
+        let text = if offer.notes.is_empty() {
+            tr("New features and fixes. Download it from whereti.com: your settings and index stay as they are.").to_string()
+        } else {
+            offer.notes.clone()
         };
         ui.add_space(12.0);
+        let (mut open, mut later) = (false, false);
         Frame::new()
             .fill(p.accent_soft)
             .stroke(Stroke::new(1.0, p.accent.gamma_multiply(0.45)))
@@ -2207,67 +2196,55 @@ impl WheretiApp {
                     ui.painter().circle_filled(badge.center(), 20.0, p.accent);
                     crate::icons::paint(ui.painter(), badge.shrink(10.0), Icon::Sparkle, Color32::WHITE);
                     ui.add_space(12.0);
-                    let buttons_w = 260.0;
+                    let buttons_w = 280.0;
                     let text_w = (ui.available_width() - buttons_w).max(160.0);
                     ui.vertical(|ui| {
                         ui.set_width(text_w);
                         ui.label(egui::RichText::new(&title).size(15.5).family(semibold()).color(p.text));
                         ui.add_space(2.0);
                         ui.add(egui::Label::new(egui::RichText::new(&text).size(12.5).color(p.text2)).wrap());
-                        if let Phase::Downloading { done, total, .. } = &phase {
-                            ui.add_space(8.0);
-                            let f = if *total > 0 { *done as f32 / *total as f32 } else { 0.0 };
-                            ui.add(egui::ProgressBar::new(f).desired_height(6.0).fill(p.accent));
-                        }
                     });
                     ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                        let primary = |ui: &mut egui::Ui, label: &str| {
-                            ui.add(
-                                egui::Button::new(egui::RichText::new(label).size(14.0).family(semibold()).color(p.on_accent))
+                        let primary = ui
+                            .add(
+                                egui::Button::new(egui::RichText::new(tr("See what's new")).size(14.0).family(semibold()).color(p.on_accent))
                                     .fill(p.accent)
                                     .corner_radius(10.0)
                                     .min_size(Vec2::new(0.0, 36.0)),
                             )
                             .on_hover_cursor(egui::CursorIcon::PointingHand)
-                        };
-                        let quiet = |ui: &mut egui::Ui, label: &str| {
-                            ui.add(
-                                egui::Button::new(egui::RichText::new(label).size(13.5).color(p.text2))
-                                    .fill(Color32::TRANSPARENT)
-                                    .stroke(Stroke::NONE)
-                                    .min_size(Vec2::new(0.0, 36.0)),
-                            )
-                            .on_hover_cursor(egui::CursorIcon::PointingHand)
-                        };
-                        match &phase {
-                            Phase::Offered(_) => {
-                                if primary(ui, tr("Install update")).clicked() {
-                                    self.updater.install(ctx);
-                                }
-                                if quiet(ui, tr("Later")).clicked() {
-                                    self.updater.later();
-                                }
-                            }
-                            Phase::Failed(_) => {
-                                if primary(ui, tr("Try again")).clicked() {
-                                    self.updater.retry();
-                                    self.updater.install(ctx);
-                                }
-                                if quiet(ui, tr("Later")).clicked() {
-                                    self.updater.later();
-                                }
-                            }
-                            Phase::Downloading { done, total, .. } if *total > 0 => {
-                                ui.label(egui::RichText::new(format!("{} %", done * 100 / total)).size(13.0).color(p.text2));
-                            }
-                            _ => {
-                                ui.add(egui::Spinner::new().size(18.0).color(p.accent));
-                            }
+                            .on_hover_text(crate::links::DOWNLOAD);
+                        open = primary.clicked();
+                        // an important fix does not wait a week
+                        if !offer.important {
+                            let quiet = ui
+                                .add(
+                                    egui::Button::new(egui::RichText::new(tr("In a week")).size(13.5).color(p.text2))
+                                        .fill(Color32::TRANSPARENT)
+                                        .stroke(Stroke::NONE)
+                                        .min_size(Vec2::new(0.0, 36.0)),
+                                )
+                                .on_hover_cursor(egui::CursorIcon::PointingHand);
+                            later = quiet.clicked();
                         }
                     });
                 });
             });
         ui.add_space(4.0);
+        if open {
+            self.open_changes();
+        }
+        if later {
+            self.updater.later();
+        }
+    }
+
+    /// The download on whereti.com, with what is new: always that address,
+    /// never one from latest.json.
+    pub(crate) fn open_changes(&mut self) {
+        if let Err(e) = crate::shell::open(crate::links::DOWNLOAD) {
+            self.flash(e);
+        }
     }
 
     /// A drive connected for the first time since whereti was set up is not
@@ -2409,10 +2386,10 @@ impl WheretiApp {
         let room = rect.width() - right_w - 14.0 - 24.0;
         let mut left: Option<(String, Color32)> = None;
         let mut update_link = false;
-        if let crate::update::Phase::Offered(o) = self.updater.phase() {
+        if let Some(o) = self.updater.offer() {
             // the line instead of the banner, and like it only while checking is on
             if self.settings.updates && self.message.is_none() && self.page == Page::Search && !self.updater.banner(true) {
-                left = Some((trf!("whereti {version} is available · Install", version = o.version), p.accent));
+                left = Some((trf!("whereti {version} is out · See what's new", version = o.version), p.accent));
                 update_link = true;
             }
         }
@@ -2447,11 +2424,9 @@ impl WheretiApp {
             painter.galley(at, g, color);
             if update_link {
                 let r = ui.interact(hit, ui.scope_id().with("update-link"), egui::Sense::click());
-                r.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Link, true, tr("Install update")));
+                r.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Link, true, tr("See what's new")));
                 if r.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
-                    self.settings.section = crate::settings::Section::About;
-                    self.page = Page::Settings;
-                    self.searcher.ask_config();
+                    self.open_changes();
                 }
             }
         }

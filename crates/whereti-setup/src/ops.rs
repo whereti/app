@@ -778,6 +778,18 @@ pub fn set_autostart(on: bool) {
     }
 }
 
+/// whereti starts with Windows for this user (its Run entry is there).
+pub fn autostart_on() -> bool {
+    // SAFETY: valid key/value names; only whether the value is there is asked.
+    unsafe { RegGetValueW(HKEY_CURRENT_USER, RUN_KEY, w!("whereti"), RRF_RT_REG_SZ, None, None, None).is_ok() }
+}
+
+/// After an update: whereti back next to the clock, as it was before the
+/// install closed it (no window; "Open whereti" shows it).
+pub fn reopen_hidden() {
+    start_app("--hidden");
+}
+
 /// Notes in the user's settings that "Start whereti with Windows" was asked
 /// here: the app turns it on at its very first start unless it reads this,
 /// which would undo a box left unticked.

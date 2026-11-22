@@ -907,28 +907,16 @@ fn about(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
     });
 }
 
-/// The update state in About: up to date, a new version to install, the
-/// download, or what went wrong.
+/// The update state in About: up to date, or a new version to get from
+/// whereti.com.
 fn update_row(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
-    use crate::update::Phase;
-    let ctx = ui.ctx().clone();
-    let phase = app.updater.phase();
-    let (title, desc): (String, String) = match &phase {
-        Phase::Offered(o) => (
-            trf!("whereti {version} is available", version = o.version),
-            o.notes.lines().next().filter(|l| !l.trim().is_empty()).map(str::to_string)
-                .unwrap_or_else(|| tr("A new version is ready to install.").to_string()),
+    let offer = app.updater.offer();
+    let (title, desc): (String, String) = match &offer {
+        Some(o) => (
+            trf!("whereti {version} is out", version = o.version),
+            if o.notes.is_empty() { tr("Download it from whereti.com: your settings and index stay as they are.").to_string() } else { o.notes.clone() },
         ),
-        Phase::Downloading { done, total, .. } => (
-            tr("Downloading the update…").to_string(),
-            if *total > 0 { format!("{} %", done * 100 / total) } else { shell::size(*done) },
-        ),
-        Phase::Installing => (
-            tr("Installing the update").to_string(),
-            tr("Windows asks for permission, then whereti opens again.").to_string(),
-        ),
-        Phase::Failed(e) => (tr("The update did not install").to_string(), e.clone()),
-        Phase::Idle if app.settings.updates => (
+        None if app.settings.updates => (
             tr("whereti is up to date").to_string(),
             match app.updater.last_check() {
                 Some(t) => {
@@ -939,27 +927,20 @@ fn update_row(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
                 None => tr("Not checked yet. whereti checks once a day.").to_string(),
             },
         ),
-        Phase::Idle => (
+        None => (
             tr("Checking for updates is off").to_string(),
             tr("Turn it on in General, or get new versions from whereti.com.").to_string(),
         ),
     };
-    row(ui, p, &title, &desc, |ui| match phase {
-        Phase::Offered(_) => {
-            if button(ui, p, tr("Install update"), true).clicked() {
-                app.updater.install(&ctx);
-            }
+    let mut open = false;
+    row(ui, p, &title, &desc, |ui| {
+        if offer.is_some() && button(ui, p, tr("See what's new"), true).clicked() {
+            open = true;
         }
-        Phase::Failed(_) => {
-            if button(ui, p, tr("Try again"), false).clicked() {
-                app.updater.retry();
-            }
-        }
-        Phase::Downloading { .. } | Phase::Installing => {
-            ui.add(egui::Spinner::new().size(18.0).color(p.accent));
-        }
-        Phase::Idle => {}
     });
+    if open {
+        app.open_changes();
+    }
 }
 
 /// The shortcut row: the keys in use, "Change" to type new ones, and the
