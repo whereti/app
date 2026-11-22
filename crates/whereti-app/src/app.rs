@@ -2207,7 +2207,7 @@ impl WheretiApp {
                     ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
                         let primary = ui
                             .add(
-                                egui::Button::new(egui::RichText::new(tr("See what's new")).size(14.0).family(semibold()).color(p.on_accent))
+                                egui::Button::new(egui::RichText::new(tr("Get the latest version")).size(14.0).family(semibold()).color(p.on_accent))
                                     .fill(p.accent)
                                     .corner_radius(10.0)
                                     .min_size(Vec2::new(0.0, 36.0)),
@@ -2389,7 +2389,7 @@ impl WheretiApp {
         if let Some(o) = self.updater.offer() {
             // the line instead of the banner, and like it only while checking is on
             if self.settings.updates && self.message.is_none() && self.page == Page::Search && !self.updater.banner(true) {
-                left = Some((trf!("whereti {version} is out · See what's new", version = o.version), p.accent));
+                left = Some((trf!("whereti {version} is out · Get the latest version", version = o.version), p.accent));
                 update_link = true;
             }
         }
@@ -2424,7 +2424,7 @@ impl WheretiApp {
             painter.galley(at, g, color);
             if update_link {
                 let r = ui.interact(hit, ui.scope_id().with("update-link"), egui::Sense::click());
-                r.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Link, true, tr("See what's new")));
+                r.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Link, true, tr("Get the latest version")));
                 if r.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                     self.open_changes();
                 }

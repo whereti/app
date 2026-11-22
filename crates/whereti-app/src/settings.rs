@@ -934,7 +934,7 @@ fn update_row(app: &mut WheretiApp, ui: &mut egui::Ui, p: &Palette) {
     };
     let mut open = false;
     row(ui, p, &title, &desc, |ui| {
-        if offer.is_some() && button(ui, p, tr("See what's new"), true).clicked() {
+        if offer.is_some() && button(ui, p, tr("Get the latest version"), true).clicked() {
             open = true;
         }
     });
